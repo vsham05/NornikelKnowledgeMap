@@ -18,12 +18,22 @@ logger = logging.getLogger(__name__)
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 _PERSON_TWO_RE = re.compile(
-    r"\b([A-Z][a-z\u0400-\u04FF]{2,}\s+[A-Z][a-z\u0400-\u04FF]{2,})\b"
+    r"\b("
+    r"(?:[A-Z][a-z\u00C0-\u024F]{2,}\s+[A-Z][a-z\u00C0-\u024F]{2,})"
+    r"|"
+    r"(?:[А-ЯЁ][а-яё]{1,}\s+[А-ЯЁ][а-яё]{1,})"
+    r")\b"
 )
 _PERSON_THREE_RE = re.compile(
-    r"\b([A-Z][a-z\u0400-\u04FF]{2,}\s+"
-    r"[A-Z][a-z\u0400-\u04FF]{3,}(?:ovich|evich|ovna|evna|ич|на)\s+"
-    r"[A-Z][a-z\u0400-\u04FF]{2,})\b",
+    r"\b("
+    r"(?:[A-Z][a-z\u00C0-\u024F]{2,}\s+"
+    r"[A-Z][a-z\u00C0-\u04FF]{3,}(?:ovich|evich|ovna|evna)\s+"
+    r"[A-Z][a-z\u00C0-\u04FF]{2,})"
+    r"|"
+    r"(?:[А-ЯЁ][а-яё]{1,}\s+"
+    r"[А-ЯЁ][а-яё]{3,}(?:ович|евич|овна|евна|ич|на)\s+"
+    r"[А-ЯЁ][а-яё]{1,})"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -43,12 +53,18 @@ _LAST_NAME_STOP = frozenset({
     "Psychology", "Software", "Product", "Transparency", "Capacities",
     "Fluctuation", "Detection", "References", "Statistical", "Political",
     "Demand", "Homogenous", "Applied", "Market", "Production",
+    # Russian institutional / geographic false positives
+    "Российский", "Российская", "Российское", "Федерации", "Федерация",
+    "Области", "Регион", "Регионы", "Академии", "Университет",
 })
 
 _ROLE_HINTS = (
     "moderator", "soloist", "artist", "presenter", "journalist", "academician",
     "member", "organiser", "organizer", "author", "poet", "performed", "said",
     "noted", "people's artist", "people artist",
+    "модератор", "солист", "художник", "журналист", "академик", "автор", "поэт",
+    "сказал", "сказала", "отметил", "отметила", "заявил", "подчеркнул", "выступил",
+    "народный", "артист", "участник", "докладчик",
 )
 
 
@@ -72,8 +88,11 @@ def facts_address_question(question: str, facts: list[dict[str, Any]]) -> bool:
     if TEMPORAL_QUERY_RE.search(question) and not YEAR_RE.search(claims):
         return False
 
-    if any(term in question_lower for term in ("harm", "damage", "overcharge")):
-        if not any(term in claims_lower for term in ("harm", "damage", "overcharge", "%")):
+    if any(term in question_lower for term in ("harm", "damage", "overcharge", "вред", "ущерб", "переплат")):
+        if not any(
+            term in claims_lower
+            for term in ("harm", "damage", "overcharge", "%", "вред", "ущерб", "переплат")
+        ):
             return False
 
     terms = _question_terms(question)
@@ -156,10 +175,22 @@ def _is_likely_person(name: str) -> bool:
 
 def _normalize_text(text: str) -> str:
     text = re.sub(r"[\uFFFD\u00AD\xa0]", " ", text)
-    text = re.sub(r"(said|noted|shared|stated)([A-Z\u0400-\u04FF])", r"\1 \2", text, flags=re.I)
-    text = re.sub(r"([a-z\u0400-\u04FF])(said|noted|shared|stated)\b", r"\1 \2", text, flags=re.I)
-    text = re.sub(r"([a-z\u0400-\u04FF])(noted|said)\b", r"\1 \2", text, flags=re.I)
+    text = re.sub(
+        r"(said|noted|shared|stated|сказал|сказала|отметил|отметила|заявил|подчеркнул)"
+        r"([A-ZА-ЯЁ])",
+        r"\1 \2",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"([a-zа-яё])(said|noted|shared|stated|сказал|сказала|отметил|отметила)\b",
+        r"\1 \2",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(r"([a-zа-яё])(noted|said|отметил|сказал)\b", r"\1 \2", text, flags=re.I)
     text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"([а-яё])([А-ЯЁ])", r"\1 \2", text)
     return re.sub(r"\s+", " ", text)
 
 
@@ -167,7 +198,7 @@ def _has_person_context(text: str, name: str) -> bool:
     if _role_for_name(text, name):
         return True
     escaped = re.escape(name)
-    if re.search(rf"\b(?:said|stated)\s+{escaped}\b", text, re.I):
+    if re.search(rf"\b(?:said|stated|сказал|сказала|отметил|отметила)\s+{escaped}\b", text, re.I):
         return True
     if re.search(rf"\b{escaped}\s*,", text):
         return True
@@ -278,12 +309,14 @@ Rules:
 - If excerpts cannot answer the question, return {"facts": []}."""
 
 ANSWER_SYSTEM = """You are a precise research assistant answering from numbered document excerpts only.
+Documents may be in Russian or English — excerpts can be in either language.
 
 Rules:
 1. Read the QUESTION carefully — answer exactly what was asked (year, name, number, comparison, etc.).
-2. Use ONLY facts stated in the excerpts. Never invent data.
-3. Cite every factual claim with excerpt numbers like [1], [2].
-4. Prefer specific numbers, years, and quotes from the excerpts over vague summaries.
-5. If multiple excerpts conflict, mention the range and cite both.
-6. If excerpts lack the exact answer, give the closest supported facts (e.g. a date range or estimate) and cite them. Only say "not enough information" if even partial facts are absent.
-7. Keep answers concise: 1-4 sentences for simple questions; bullet list only when listing multiple items."""
+2. Reply in the SAME language as the user's question (Russian question → Russian answer; English → English).
+3. Use ONLY facts stated in the excerpts. Never invent data.
+4. Cite every factual claim with excerpt numbers like [1], [2].
+5. Prefer specific numbers, years, and quotes from the excerpts over vague summaries.
+6. If multiple excerpts conflict, mention the range and cite both.
+7. If excerpts lack the exact answer, give the closest supported facts (e.g. a date range or estimate) and cite them. Only say there is not enough information if even partial facts are absent.
+8. Keep answers concise: 1-4 sentences for simple questions; bullet list only when listing multiple items."""

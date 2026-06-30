@@ -7,6 +7,7 @@ from domain.dto.material import MaterialDTO
 from domain.dto.experiment import ExperimentDTO
 from domain.dto.document import DocumentDTO
 from settings import Settings
+from search.query_processing import extract_search_terms
 
 logger = logging.getLogger(__name__)
 
@@ -790,7 +791,7 @@ class GraphDB:
     
     def search_by_text(self, query: str, limit: int = 20) -> list[dict]:
         """Search nodes by string/list properties without coercing arrays via toString()."""
-        terms = [t for t in query.lower().split() if len(t) > 2]
+        terms = extract_search_terms(query, limit=12)
         with self.driver.session() as session:
             result = session.run("""
                 MATCH (n)
@@ -819,7 +820,7 @@ class GraphDB:
 
     def search_text_chunks(self, query: str, limit: int = 10) -> list[dict]:
         """Full-text search over stored document chunks in Neo4j."""
-        terms = [t for t in query.lower().split() if len(t) > 2]
+        terms = extract_search_terms(query, limit=12)
         with self.driver.session() as session:
             result = session.run("""
                 MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)

@@ -8,13 +8,15 @@ import math
 import re
 from dataclasses import dataclass, field
 
-from search.query_processing import YEAR_RE, QueryIntent, analyze_intent, significant_terms
+from search.query_processing import HARM_TERMS, YEAR_RE, QueryIntent, analyze_intent, significant_terms
 
 logger = logging.getLogger(__name__)
 
 RRF_K = 60
 RETRIEVAL_POOL = 50
-PROPER_NOUN_RE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b")
+PROPER_NOUN_RE = re.compile(
+    r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+|[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)+)\b"
+)
 
 
 @dataclass
@@ -60,7 +62,7 @@ def _harm_damage_score(intent: QueryIntent, text: str) -> float:
     if not intent.harm_related:
         return 0.0
     lower = text.lower()
-    hits = sum(1 for term in ("harm", "damage", "overcharge", "hurt", "loss") if term in lower)
+    hits = sum(1 for term in HARM_TERMS if term in lower)
     return min(1.0, hits / 3)
 
 
@@ -69,7 +71,10 @@ def _bibliography_penalty(text: str) -> float:
     lower = text.lower()
     head = lower[:400]
     penalty = 0.0
-    if "references" in head or "bibliography" in head:
+    if any(
+        marker in head
+        for marker in ("references", "bibliography", "литература", "библиограф", "источник")
+    ):
         penalty += 0.25
     if lower.count("doi") >= 2 or lower.count("ssrn") >= 1:
         penalty += 0.35

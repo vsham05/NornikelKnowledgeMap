@@ -29,6 +29,10 @@ HEDGE_PATTERNS = [
     r"based on the (?:given |provided )?context,? it is not",
     r"the excerpts do not",
     r"context does not",
+    r"недостаточно информации",
+    r"не содержат достаточно",
+    r"не удалось определить",
+    r"невозможно определить",
 ]
 
 _CITATION_RE = re.compile(r"\[\d+\]")

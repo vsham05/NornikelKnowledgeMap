@@ -10,7 +10,7 @@ from search.query_processing import keyword_search_string, significant_terms
 
 logger = logging.getLogger(__name__)
 
-REWRITE_SYSTEM = """You help search a scientific document knowledge base.
+REWRITE_SYSTEM = """You help search a scientific document knowledge base (Russian and English articles).
 Given a user question, produce search terms that will retrieve the most relevant passages.
 
 Reply with JSON only:
@@ -18,7 +18,8 @@ Reply with JSON only:
 
 Rules:
 - search_query: rephrase the information need clearly (include entities, years, topics).
-- keywords: 4-10 important words/phrases from the question (nouns, names, years, technical terms).
+- keywords: 4-10 important words/phrases (nouns, names, years, technical terms) in the question's language.
+- Keep Russian keywords in Cyrillic; English in Latin script.
 - Do not answer the question — only optimize retrieval.
 - Preserve years and named entities exactly."""
 

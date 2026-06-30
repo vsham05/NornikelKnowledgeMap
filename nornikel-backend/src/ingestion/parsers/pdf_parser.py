@@ -112,13 +112,22 @@ class PDFParser:
         return None
     
     def _detect_section_title(self, text: str) -> str | None:
-        """Пытается определить заголовок секции."""
+        """Пытается определить заголовок секции (EN/RU)."""
         lines = text.split("\n")
-        for line in lines[:3]:  # Первые строки
+        for line in lines[:3]:
             line = line.strip()
-            if len(line) < 100 and line.isupper():
+            if not line or len(line) > 100:
+                continue
+            if line.isupper():
                 return line
             if line.startswith(("1.", "2.", "3.", "I.", "II.")):
+                return line
+            lower = line.lower()
+            if lower in (
+                "введение", "заключение", "результаты", "обсуждение", "методы",
+                "материалы", "литература", "аннотация", "abstract", "introduction",
+                "conclusion", "references",
+            ):
                 return line
         return None
     

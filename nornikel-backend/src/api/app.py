@@ -95,5 +95,6 @@ async def health():
             "idf-rerank",
             "context-compression",
             "dynamic-confidence",
+            "multilingual-ru-en",
         ],
     }
