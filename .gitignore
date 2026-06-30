@@ -32,6 +32,11 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+nornikel-backend/.env
+nornikel-backend/.venv
+
+# local llama binaries (download via scripts)
+/tools/
 
 # vercel
 .vercel

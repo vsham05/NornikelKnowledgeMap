@@ -1,0 +1,212 @@
+# Онтология свойств материалов
+# Используется для валидации извлеченных свойств и UI
+
+property_categories:
+  mechanical:
+    label: "Механические свойства"
+    description: "Прочность, твердость, пластичность"
+  
+  thermal:
+    label: "Термические свойства"
+    description: "Температуры фазовых превращений, теплопроводность"
+  
+  physical:
+    label: "Физические свойства"
+    description: "Плотность, модули упругости"
+  
+  chemical:
+    label: "Химические свойства"
+    description: "Состав, коррозионная стойкость"
+  
+  microstructure:
+    label: "Микроструктура"
+    description: "Фазы, морфология, размер зерна"
+  
+  technological:
+    label: "Технологические свойства"
+    description: "Обрабатываемость, свариваемость"
+
+
+# Справочник свойств с ожидаемыми единицами измерения
+properties:
+  # Механические
+  yield_strength:
+    label: "Предел текучести"
+    category: mechanical
+    expected_units: ["MPa", "GPa"]
+    value_type: scalar
+    
+  ultimate_tensile_strength:
+    label: "Предел прочности"
+    category: mechanical
+    expected_units: ["MPa", "GPa"]
+    value_type: scalar
+    
+  elongation:
+    label: "Относительное удлинение"
+    category: mechanical
+    expected_units: ["%"]
+    value_type: scalar
+    range: [0, 100]
+    
+  hardness_hv:
+    label: "Твердость по Виккерсу"
+    category: mechanical
+    expected_units: ["HV"]
+    value_type: scalar
+    
+  hardness_hrc:
+    label: "Твердость по Роквеллу"
+    category: mechanical
+    expected_units: ["HRC"]
+    value_type: scalar
+    
+  impact_toughness:
+    label: "Ударная вязкость"
+    category: mechanical
+    expected_units: ["J/cm²", "MJ/m²"]
+    value_type: scalar
+    
+  fatigue_limit:
+    label: "Предел выносливости"
+    category: mechanical
+    expected_units: ["MPa"]
+    value_type: scalar
+    
+  fracture_toughness:
+    label: "Вязкость разрушения"
+    category: mechanical
+    expected_units: ["MPa·m^0.5"]
+    value_type: scalar
+    
+  # Термические
+  melting_point:
+    label: "Температура плавления"
+    category: thermal
+    expected_units: ["°C", "K"]
+    value_type: range_or_scalar
+    
+  annealing_temperature:
+    label: "Температура отжига"
+    category: thermal
+    expected_units: ["°C"]
+    value_type: scalar
+    
+  thermal_conductivity:
+    label: "Теплопроводность"
+    category: thermal
+    expected_units: ["W/(m·K)"]
+    value_type: scalar
+    
+  # Физические
+  density:
+    label: "Плотность"
+    category: physical
+    expected_units: ["g/cm³", "kg/m³"]
+    value_type: scalar
+    
+  young_modulus:
+    label: "Модуль Юнга"
+    category: physical
+    expected_units: ["GPa"]
+    value_type: scalar
+    
+  poisson_ratio:
+    label: "Коэффициент Пуассона"
+    category: physical
+    expected_units: [""]
+    value_type: scalar
+    range: [0, 0.5]
+    
+  # Химические
+  composition:
+    label: "Химический состав"
+    category: chemical
+    expected_units: ["%", "mass%", "at%"]
+    value_type: dict
+    
+  corrosion_rate:
+    label: "Скорость коррозии"
+    category: chemical
+    expected_units: ["mm/year", "g/(m²·h)"]
+    value_type: scalar
+    
+  # Микроструктура
+  grain_size:
+    label: "Размер зерна"
+    category: microstructure
+    expected_units: ["μm", "mm"]
+    value_type: scalar_or_range
+    
+  phase_composition:
+    label: "Фазовый состав"
+    category: microstructure
+    expected_units: ["%"]
+    value_type: dict
+
+
+# Параметры режимов обработки
+regime_parameters:
+  temperature:
+    label: "Температура"
+    expected_units: ["°C", "K"]
+    value_type: scalar
+    
+  duration:
+    label: "Длительность"
+    expected_units: ["h", "min", "s"]
+    value_type: scalar
+    
+  cooling_rate:
+    label: "Скорость охлаждения"
+    expected_units: ["°C/min", "°C/s"]
+    value_type: scalar
+    
+  heating_rate:
+    label: "Скорость нагрева"
+    expected_units: ["°C/min", "°C/s"]
+    value_type: scalar
+    
+  atmosphere:
+    label: "Атмосфера"
+    expected_units: []
+    value_type: string
+    examples: ["воздух", "вакуум", "аргон", "азот"]
+    
+  deformation:
+    label: "Деформация"
+    expected_units: ["%"]
+    value_type: scalar
+    range: [0, 100]
+    
+  pressure:
+    label: "Давление"
+    expected_units: ["MPa", "Pa", "atm"]
+    value_type: scalar
+
+
+# Типы режимов обработки
+regime_types:
+  heat_treatment:
+    label: "Термическая обработка"
+    typical_parameters: ["temperature", "duration", "cooling_rate", "atmosphere"]
+    
+  annealing:
+    label: "Отжиг"
+    parent: heat_treatment
+    
+  quenching:
+    label: "Закалка"
+    parent: heat_treatment
+    
+  aging:
+    label: "Старение"
+    parent: heat_treatment
+    
+  mechanical:
+    label: "Механическая обработка"
+    typical_parameters: ["deformation", "temperature"]
+    
+  thermomechanical:
+    label: "Термомеханическая обработка"
+    typical_parameters: ["temperature", "deformation", "duration"]

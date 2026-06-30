@@ -1,0 +1,107 @@
+"""LLM query rewrite for better retrieval recall."""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+
+from search.query_processing import keyword_search_string, significant_terms
+
+logger = logging.getLogger(__name__)
+
+REWRITE_SYSTEM = """You help search a scientific document knowledge base.
+Given a user question, produce search terms that will retrieve the most relevant passages.
+
+Reply with JSON only:
+{"search_query": "one concise sentence for semantic search", "keywords": ["term1", "term2"]}
+
+Rules:
+- search_query: rephrase the information need clearly (include entities, years, topics).
+- keywords: 4-10 important words/phrases from the question (nouns, names, years, technical terms).
+- Do not answer the question — only optimize retrieval.
+- Preserve years and named entities exactly."""
+
+_JSON_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+
+@dataclass(frozen=True)
+class RewrittenQuery:
+    original: str
+    search_query: str
+    keywords: tuple[str, ...]
+
+
+def _heuristic_rewrite(question: str) -> RewrittenQuery:
+    terms = significant_terms(question)
+    search = question.strip()
+    if terms:
+        search = f"{question.strip()} — focus on: {', '.join(terms[:8])}"
+    return RewrittenQuery(
+        original=question.strip(),
+        search_query=search,
+        keywords=tuple(terms[:10]),
+    )
+
+
+def _parse_rewrite_json(text: str, fallback: str) -> RewrittenQuery | None:
+    import json
+
+    for match in _JSON_RE.finditer(text):
+        try:
+            data = json.loads(match.group())
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        search_query = str(data.get("search_query") or "").strip()
+        raw_kw = data.get("keywords") or []
+        keywords = tuple(
+            str(k).strip()
+            for k in raw_kw
+            if isinstance(k, str) and k.strip()
+        )[:10]
+        if search_query:
+            return RewrittenQuery(
+                original=fallback.strip(),
+                search_query=search_query,
+                keywords=keywords or tuple(significant_terms(fallback)),
+            )
+    return None
+
+
+async def rewrite_query_for_retrieval(llm_client, question: str) -> RewrittenQuery:
+    """Rewrite user question into retrieval-optimized queries (LLM with heuristic fallback)."""
+    question = (question or "").strip()
+    if not question:
+        return _heuristic_rewrite("")
+
+    try:
+        raw = await llm_client.chat(
+            user_message=f"USER QUESTION:\n{question}",
+            system_message=REWRITE_SYSTEM,
+            temperature=0.0,
+        )
+        parsed = _parse_rewrite_json(raw, question)
+        if parsed:
+            logger.info(
+                "Query rewrite: search_query=%r keywords=%s",
+                parsed.search_query[:80],
+                list(parsed.keywords)[:6],
+            )
+            return parsed
+    except Exception as exc:
+        logger.warning("Query rewrite failed, using heuristic: %s", exc)
+
+    return _heuristic_rewrite(question)
+
+
+def auxiliary_retrieval_queries(rewritten: RewrittenQuery) -> list[str]:
+    """Distinct queries for multi-query RRF (original always retrieved separately)."""
+    queries: list[str] = []
+    if rewritten.search_query and rewritten.search_query != rewritten.original:
+        queries.append(rewritten.search_query)
+    kw_string = keyword_search_string(rewritten.original, list(rewritten.keywords))
+    if kw_string and kw_string not in queries and kw_string != rewritten.original:
+        queries.append(kw_string)
+    return queries

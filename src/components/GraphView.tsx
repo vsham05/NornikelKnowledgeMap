@@ -1,0 +1,151 @@
+"use client";
+
+import { useEffect, useRef, useCallback } from "react";
+import dynamic from "next/dynamic";
+import type { GraphEdge, GraphNode } from "@/lib/types";
+import { getEntityLabel } from "@/lib/graph";
+
+function displayName(node: GraphNode): string {
+  const name = node.name?.trim();
+  if (name) return name;
+  const id = node.id?.trim();
+  if (id) return id.length > 12 ? `${id.slice(0, 8)}…` : id;
+  return "Unknown";
+}
+
+function truncateLabel(name: string, max = 22): string {
+  return name.length > max ? `${name.slice(0, max - 1)}…` : name;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), { ssr: false }) as any;
+
+interface GraphViewProps {
+  nodes: GraphNode[];
+  links: GraphEdge[];
+  onNodeClick?: (node: GraphNode) => void;
+  highlightId?: string;
+  emptyMessage?: string;
+}
+
+export function GraphView({ nodes, links, onNodeClick, highlightId, emptyMessage }: GraphViewProps) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fgRef = useRef<any>(null);
+
+  const graphData = {
+    nodes: nodes.map((n) => ({ ...n })),
+    links: links.map((l) => ({
+      source: l.source,
+      target: l.target,
+      relation: l.relation,
+    })),
+  };
+
+  useEffect(() => {
+    const t = setTimeout(() => fgRef.current?.zoomToFit(400, 60), 300);
+    return () => clearTimeout(t);
+  }, [nodes, links]);
+
+  const nodeRadius = useCallback((n: GraphNode) => Math.sqrt(n.val ?? 4) * 3.5, []);
+
+  // Required when using nodeCanvasObject — otherwise clicks do not register.
+  const paintPointerArea = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (node: any, color: string, ctx: CanvasRenderingContext2D) => {
+      const n = node as GraphNode & { x?: number; y?: number };
+      const r = nodeRadius(n);
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(n.x ?? 0, n.y ?? 0, r + 8, 0, 2 * Math.PI);
+      ctx.fill();
+    },
+    [nodeRadius]
+  );
+
+  const paintNode = useCallback(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (node: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
+      const n = node as GraphNode & { x?: number; y?: number };
+      const label = truncateLabel(displayName(n));
+      const fontSize = Math.max(10 / globalScale, 2.5);
+      const r = nodeRadius(n);
+      const isHighlight = highlightId === n.id;
+
+      ctx.beginPath();
+      ctx.arc(n.x ?? 0, n.y ?? 0, r, 0, 2 * Math.PI);
+      ctx.fillStyle = n.color;
+      ctx.globalAlpha = isHighlight ? 1 : 0.85;
+      ctx.fill();
+      if (isHighlight) {
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 2 / globalScale;
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+
+      ctx.font = `${fontSize}px Sans-Serif`;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      ctx.fillStyle = "rgba(226, 232, 240, 0.9)";
+      ctx.fillText(label, n.x ?? 0, (n.y ?? 0) + r + 1);
+    },
+    [highlightId, nodeRadius]
+  );
+
+  if (nodes.length === 0) {
+    return (
+      <div className="flex h-full min-h-[360px] items-center justify-center rounded-xl border border-slate-700/50 bg-slate-950/60 p-8 text-center text-slate-500">
+        {emptyMessage ?? "No graph data to display"}
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative h-full w-full overflow-hidden rounded-xl border border-slate-700/50 bg-slate-950/60">
+      <ForceGraph2D
+        ref={fgRef}
+        graphData={graphData}
+        nodeLabel={(n: GraphNode) => {
+          const name = displayName(n);
+          return `<div style="padding:6px 10px;background:#1e293b;border-radius:6px;font-size:12px">
+            <strong>${name}</strong><br/>
+            <span style="color:#94a3b8">${getEntityLabel(n.type)}</span>
+          </div>`;
+        }}
+        nodeCanvasObject={paintNode}
+        nodePointerAreaPaint={paintPointerArea}
+        linkColor={() => "rgba(100, 116, 139, 0.35)"}
+        linkDirectionalParticles={1}
+        linkDirectionalParticleWidth={2}
+        linkDirectionalParticleColor={() => "rgba(34, 211, 238, 0.5)"}
+        onNodeClick={(n: GraphNode) => onNodeClick?.(n)}
+        backgroundColor="rgba(2, 6, 23, 0.4)"
+        cooldownTicks={80}
+      />
+      <div className="absolute bottom-3 left-3 flex flex-wrap gap-2">
+        {(["material", "experiment", "mode", "property", "conclusion", "article"] as const).map(
+          (type) => (
+            <span
+              key={type}
+              className="rounded px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-400"
+              style={{
+                borderLeft: `3px solid ${
+                  {
+                    material: "#f472b6",
+                    experiment: "#34d399",
+                    mode: "#a78bfa",
+                    property: "#fbbf24",
+                    conclusion: "#2dd4bf",
+                    article: "#60a5fa",
+                  }[type]
+                }`,
+              }}
+            >
+              {type}
+            </span>
+          )
+        )}
+      </div>
+    </div>
+  );
+}
