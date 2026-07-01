@@ -9,11 +9,12 @@ import { Timeline } from "@/components/Timeline";
 import { EntityPanel } from "@/components/EntityPanel";
 import { StatsBar } from "@/components/StatsBar";
 import { DocumentUpload } from "@/components/DocumentUpload";
+import { DocumentFilter, type DocumentOption } from "@/components/DocumentFilter";
 import { SourceExcerpts } from "@/components/SourceExcerpts";
 import { checkBackendHealth, backendApi } from "@/lib/api/backend";
 import { backendSearch, backendGraphToFrontend } from "@/lib/adapters/backend";
 import { backendDocumentToArticle, graphNodeToEntity } from "@/lib/entityFromGraph";
-import type { Entity, GraphEdge, GraphNode, SearchResult } from "@/lib/types";
+import type { Entity, GraphEdge, GraphNode, SearchResult, EntityType } from "@/lib/types";
 import { Network, MessageSquareQuote, Server, ServerOff, AlertCircle } from "lucide-react";
 
 export function Dashboard() {
@@ -32,6 +33,10 @@ export function Dashboard() {
     links: GraphEdge[];
   }>({ nodes: [], links: [] });
   const [graphVersion, setGraphVersion] = useState(0);
+  const [graphTypeFilter, setGraphTypeFilter] = useState<EntityType | null>(null);
+  const [documents, setDocuments] = useState<DocumentOption[]>([]);
+  const [selectedDocumentId, setSelectedDocumentId] = useState("");
+  const [lastQuery, setLastQuery] = useState("");
   const panelRef = useRef<HTMLDivElement>(null);
 
   const refreshBackendStatus = useCallback(async () => {
@@ -41,7 +46,7 @@ export function Dashboard() {
   }, []);
 
   const refreshGraphSnapshot = useCallback(async () => {
-    const explore = await backendApi.exploreGraph(120).catch(() => null);
+    const explore = await backendApi.exploreGraph(300).catch(() => null);
     if (!explore) return;
 
     const graph = backendGraphToFrontend(explore);
@@ -54,6 +59,13 @@ export function Dashboard() {
     await refreshBackendStatus();
     setStatsRefreshKey((k) => k + 1);
     await refreshGraphSnapshot();
+    const docs = await backendApi.listDocuments().catch(() => []);
+    setDocuments(
+      docs.map((d) => ({
+        id: d.id,
+        title: d.title || d.id.slice(0, 8),
+      }))
+    );
   }, [refreshBackendStatus, refreshGraphSnapshot]);
 
   useEffect(() => {
@@ -66,14 +78,24 @@ export function Dashboard() {
     if (backendOnline) {
       void refreshGraphSnapshot();
       setStatsRefreshKey((k) => k + 1);
+      void backendApi.listDocuments().then((docs) => {
+        setDocuments(
+          docs.map((d) => ({
+            id: d.id,
+            title: d.title || d.id.slice(0, 8),
+          }))
+        );
+      }).catch(() => setDocuments([]));
     }
   }, [backendOnline, refreshGraphSnapshot]);
 
   const handleSearch = useCallback(
-    async (query: string) => {
+    async (query: string, documentId?: string) => {
       setLoading(true);
       setHasSearched(true);
       setSearchError(null);
+      setLastQuery(query);
+      const docFilter = documentId ?? selectedDocumentId;
       try {
         const online = await refreshBackendStatus();
         if (!online) {
@@ -81,10 +103,12 @@ export function Dashboard() {
           setResult(null);
           return;
         }
-        const res = await backendSearch(query);
+        const res = await backendSearch(query, docFilter || undefined);
         setResult(res);
-        setGraphSnapshot(res.graph);
-        setGraphVersion((v) => v + 1);
+        if (res.graph.nodes.length > 0) {
+          setGraphSnapshot(res.graph);
+          setGraphVersion((v) => v + 1);
+        }
         setSelectedExpId(res.experiments[0]?.experiment.id ?? null);
         setPanelEntity(null);
         setSelectedNodeId(null);
@@ -95,7 +119,17 @@ export function Dashboard() {
         setLoading(false);
       }
     },
-    [refreshBackendStatus]
+    [refreshBackendStatus, selectedDocumentId]
+  );
+
+  const handlePickDocument = useCallback(
+    (documentId: string) => {
+      setSelectedDocumentId(documentId);
+      if (lastQuery.trim()) {
+        void handleSearch(lastQuery, documentId);
+      }
+    },
+    [lastQuery, handleSearch]
   );
 
   const handleNodeClick = useCallback(async (node: GraphNode) => {
@@ -139,13 +173,15 @@ export function Dashboard() {
     [result]
   );
 
-  const displayGraph = result?.graph ?? graphSnapshot;
+  const displayGraph = graphSnapshot;
 
   const graphEmptyMessage =
     displayGraph.nodes.length === 0
-      ? !hasSearched
-        ? "Search your knowledge base or upload documents to get started."
-        : "No graph data yet. Upload PDFs or DOCX files to build the knowledge graph."
+      ? !backendOnline
+        ? "Connect the backend to load the knowledge graph."
+        : !hasSearched
+          ? "Loading graph from Neo4j… upload documents or wait a moment."
+          : "No graph data yet. Upload PDFs or DOCX files to build the knowledge graph."
       : undefined;
 
   return (
@@ -198,12 +234,45 @@ export function Dashboard() {
             </div>
           )}
 
+          <div className="mb-3">
+            <DocumentFilter
+              documents={documents}
+              value={selectedDocumentId}
+              onChange={setSelectedDocumentId}
+              disabled={!backendOnline}
+              loading={loading}
+            />
+          </div>
+
           <SearchBar onSearch={handleSearch} loading={loading} disabled={!backendOnline} />
           {searchError && (
             <p className="mt-2 text-sm text-red-400">{searchError}</p>
           )}
+
+          {result?.needsDisambiguation && result.documentCandidates && (
+            <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-sm text-amber-100">
+              <p className="mb-2 font-medium">Multiple documents match — pick one:</p>
+              <div className="flex flex-wrap gap-2">
+                {result.documentCandidates.map((candidate) => (
+                  <button
+                    key={candidate.documentId}
+                    type="button"
+                    onClick={() => handlePickDocument(candidate.documentId)}
+                    className="rounded-lg border border-amber-500/40 bg-amber-900/30 px-3 py-1.5 text-xs hover:bg-amber-800/40"
+                  >
+                    {candidate.title || candidate.documentId.slice(0, 8)}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="mt-4">
-            <StatsBar useBackend={backendOnline} refreshKey={statsRefreshKey} />
+            <StatsBar
+              useBackend={backendOnline}
+              refreshKey={statsRefreshKey}
+              activeFilter={graphTypeFilter}
+              onFilterChange={setGraphTypeFilter}
+            />
           </div>
           <div className="mt-4">
             <DocumentUpload
@@ -260,6 +329,16 @@ export function Dashboard() {
           )}
 
           <div className="min-h-[360px] flex-1">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="text-xs text-slate-500">
+                Knowledge graph — documents, experiments, materials, modes & teams linked by source
+              </p>
+              {displayGraph.nodes.length > 0 && (
+                <span className="shrink-0 text-[10px] text-slate-600">
+                  {displayGraph.nodes.length} nodes · {displayGraph.links.length} links
+                </span>
+              )}
+            </div>
             <GraphView
               key={graphVersion}
               nodes={displayGraph.nodes}
@@ -267,6 +346,7 @@ export function Dashboard() {
               onNodeClick={handleNodeClick}
               highlightId={selectedNodeId ?? selectedExpId ?? undefined}
               emptyMessage={graphEmptyMessage}
+              typeFilter={graphTypeFilter}
             />
           </div>
         </section>

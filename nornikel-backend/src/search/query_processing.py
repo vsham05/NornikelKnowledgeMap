@@ -90,6 +90,31 @@ def detect_language(text: str) -> str:
     return "en"
 
 
+def resolve_answer_language(question: str) -> str:
+    """Answer language must match the question: 'en' or 'ru' only."""
+    lang = detect_language(question)
+    if lang == "ru":
+        return "ru"
+    if lang == "mixed":
+        cyr = len(CYRILLIC_RE.findall(question))
+        lat = len(re.findall(r"[a-zA-Z]", question))
+        return "ru" if cyr > lat else "en"
+    return "en"
+
+
+def answer_language_instruction(lang: str) -> str:
+    """Hard constraint prepended to LLM prompts."""
+    if lang == "ru":
+        return (
+            "ОБЯЗАТЕЛЬНО: весь ответ только на русском языке, "
+            "даже если фрагменты на английском. Не используй английский в ответе."
+        )
+    return (
+        "MANDATORY: Write your ENTIRE answer in English only, "
+        "even if the excerpts are in Russian. Do not use Russian in the answer."
+    )
+
+
 def is_stopword(token: str) -> bool:
     return token.lower() in STOPWORDS
 

@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 
 from search.query_processing import HARM_TERMS, YEAR_RE, QueryIntent, analyze_intent, significant_terms
 
+from search.reranker import rerank_chunks
+
 logger = logging.getLogger(__name__)
 
 RRF_K = 60
@@ -167,6 +169,8 @@ class HybridRetriever:
         limit: int = 8,
         *,
         auxiliary_queries: list[str] | None = None,
+        document_id: str | None = None,
+        max_per_document: int | None = None,
     ) -> list[RetrievedChunk]:
         intent = analyze_intent(query)
         terms = list(intent.content_terms) or significant_terms(query)
@@ -181,8 +185,12 @@ class HybridRetriever:
         all_rankings: list[list[str]] = []
 
         for q in queries:
-            vector_hits = await self._vector_hits(q, pool_size=RETRIEVAL_POOL)
-            keyword_hits = self._keyword_hits(q, pool_size=RETRIEVAL_POOL)
+            vector_hits = await self._vector_hits(
+                q, pool_size=RETRIEVAL_POOL, document_id=document_id
+            )
+            keyword_hits = self._keyword_hits(
+                q, pool_size=RETRIEVAL_POOL, document_id=document_id
+            )
 
             vector_ranking: list[str] = []
             for hit in vector_hits:
@@ -271,7 +279,11 @@ class HybridRetriever:
                 )
 
         ranked = sorted(pool.values(), key=lambda c: c.final_score, reverse=True)
-        selected = _select_diverse(ranked, limit)
+        ranked = rerank_chunks(query, ranked)
+        per_doc_cap = max_per_document if max_per_document is not None else (
+            limit if document_id else 2
+        )
+        selected = _select_diverse(ranked, limit, max_per_document=per_doc_cap)
 
         logger.info(
             "Hybrid retrieval: queries=%s pool=%s -> top %s (intent temporal=%s harm=%s)",
@@ -283,10 +295,20 @@ class HybridRetriever:
         )
         return selected
 
-    async def _vector_hits(self, query: str, pool_size: int) -> list[dict]:
+    async def _vector_hits(
+        self,
+        query: str,
+        pool_size: int,
+        *,
+        document_id: str | None = None,
+    ) -> list[dict]:
         try:
             embedding = await self.embedding_client.embed_query(query)
-            similar = self.vector_db.search_similar_text(embedding, limit=pool_size)
+            similar = self.vector_db.search_similar_text(
+                embedding,
+                limit=pool_size,
+                document_id=document_id,
+            )
         except Exception as exc:
             logger.warning("Vector retrieval failed: %s", exc)
             return []
@@ -310,9 +332,19 @@ class HybridRetriever:
             })
         return hits
 
-    def _keyword_hits(self, query: str, pool_size: int) -> list[dict]:
+    def _keyword_hits(
+        self,
+        query: str,
+        pool_size: int,
+        *,
+        document_id: str | None = None,
+    ) -> list[dict]:
         try:
-            rows = self.graph_db.search_text_chunks(query, limit=pool_size)
+            rows = self.graph_db.search_text_chunks(
+                query,
+                limit=pool_size,
+                document_id=document_id,
+            )
         except Exception as exc:
             logger.warning("Keyword retrieval failed: %s", exc)
             return []

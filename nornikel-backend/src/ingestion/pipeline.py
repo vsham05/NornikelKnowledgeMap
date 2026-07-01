@@ -9,6 +9,7 @@ from ingestion.dedup_service import DocumentDedupService, cleanup_duplicate_docu
 from ingestion.parsers.pdf_parser import PDFParser
 from ingestion.parsers.docx_parser import DOCXParser
 from ingestion.vision.vlm_analyzer import VLMAnalyzer
+from ingestion.nlp.document_enricher import DocumentEnricher
 from ingestion.nlp.entity_extractor import EntityExtractor
 from ingestion.nlp.entity_resolver import EntityResolver
 from storage.graph_db import GraphDB
@@ -30,6 +31,7 @@ class IngestionPipeline:
         self.docx_parser = DOCXParser()
         self.vlm_analyzer = VLMAnalyzer(settings)
         self.entity_extractor = EntityExtractor(settings)
+        self.document_enricher = DocumentEnricher(settings)
         self.graph_db = GraphDB(settings)
         self.entity_resolver = EntityResolver(self.graph_db)
         self.vector_db = VectorDB(settings)
@@ -107,10 +109,64 @@ class IngestionPipeline:
             all_experiments, all_materials, resolved_materials
         )
 
+        enrichment = None
+        if not resolved_materials and not resolved_experiments:
+            enrichment = await self.document_enricher.enrich_document(document)
+            resolved_materials = await self._resolve_materials(enrichment["materials"])
+            resolved_experiments = self._link_experiments_to_materials(
+                enrichment["experiments"],
+                enrichment["materials"],
+                resolved_materials,
+            )
+
         self._save_to_graph(resolved_materials, resolved_experiments, document)
+        if enrichment:
+            self._save_enrichment(document, enrichment)
         await self._save_to_vector_db(document)
         cleanup_duplicate_documents(self.graph_db, self.vector_db)
         logger.info(f"Ingestion completed: {document.id}")
+
+    async def enrich_existing_document(self, document_id: str) -> dict:
+        """Backfill graph entities for a document already in Neo4j."""
+        if self.graph_db.document_has_entities(document_id):
+            return {"document_id": document_id, "status": "skipped", "reason": "already_enriched"}
+
+        document = self.graph_db.load_document_dto(document_id)
+        if not document:
+            return {"document_id": document_id, "status": "not_found"}
+
+        enrichment = await self.document_enricher.enrich_document(document)
+        resolved_materials = await self._resolve_materials(enrichment["materials"])
+        resolved_experiments = self._link_experiments_to_materials(
+            enrichment["experiments"],
+            enrichment["materials"],
+            resolved_materials,
+        )
+        for material in resolved_materials.values():
+            self.graph_db.save_material(material)
+        for experiment in resolved_experiments:
+            self.graph_db.save_experiment(experiment)
+        self._save_enrichment(document, enrichment)
+
+        return {
+            "document_id": document_id,
+            "status": "enriched",
+            "materials": len(resolved_materials),
+            "experiments": len(resolved_experiments),
+            "teams": len(enrichment.get("teams") or []),
+            "topics": len(enrichment.get("topics") or []),
+        }
+
+    async def enrich_all_documents(self) -> dict:
+        docs = self.graph_db.list_documents(limit=200)
+        results = []
+        for doc in docs:
+            doc_id = str(doc.get("id") or "")
+            if not doc_id:
+                continue
+            results.append(await self.enrich_existing_document(doc_id))
+        enriched = sum(1 for r in results if r.get("status") == "enriched")
+        return {"processed": len(results), "enriched": enriched, "results": results}
 
     def _parse_file(self, file_path: Path) -> DocumentDTO:
         suffix = file_path.suffix.lower()
@@ -161,9 +217,22 @@ class IngestionPipeline:
             material_name = getattr(exp, "_material_name", None)
             if material_name and material_name in name_to_id:
                 linked.append(exp.model_copy(update={"material_id": name_to_id[material_name]}))
+            elif exp.material_id:
+                linked.append(exp)
             else:
                 logger.warning(f"Could not link experiment to material: {material_name}")
         return linked
+
+    def _save_enrichment(self, document: DocumentDTO, enrichment: dict) -> None:
+        for team in enrichment.get("teams") or []:
+            self.graph_db.save_team(
+                team_id=team["id"],
+                name=team["name"],
+                members=team.get("members") or [],
+                document_id=str(document.id),
+            )
+        for topic in enrichment.get("topics") or []:
+            self.graph_db.link_document_topic(str(document.id), topic)
 
     def _save_to_graph(
         self,

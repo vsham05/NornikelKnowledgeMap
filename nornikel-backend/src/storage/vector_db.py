@@ -106,12 +106,29 @@ class VectorDB:
             )
         logger.info(f"Deleted vector chunks for document: {document_id}")
 
-    def search_similar_text(self, query_embedding: list[float], limit: int = 10) -> list[dict]:
+    def search_similar_text(
+        self,
+        query_embedding: list[float],
+        limit: int = 10,
+        *,
+        document_id: str | None = None,
+    ) -> list[dict]:
         """Search similar text chunks by embedding."""
+        query_filter = None
+        if document_id:
+            query_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(value=document_id),
+                    )
+                ]
+            )
         response = self.client.query_points(
             collection_name=self.text_collection,
             query=query_embedding,
             limit=limit,
+            query_filter=query_filter,
         )
         return [
             {

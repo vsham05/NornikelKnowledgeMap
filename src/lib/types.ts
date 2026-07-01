@@ -154,6 +154,8 @@ export interface SearchResult {
   narrative: string;
   sources: SourceExcerpt[];
   confidence?: number;
+  needsDisambiguation?: boolean;
+  documentCandidates?: Array<{ documentId: string; title?: string | null; score?: number }>;
 }
 
 export interface ParsedQuery {

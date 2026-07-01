@@ -1,9 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useMemo } from "react";
 import dynamic from "next/dynamic";
 import type { GraphEdge, GraphNode } from "@/lib/types";
 import { getEntityLabel } from "@/lib/graph";
+import { relationLabel } from "@/lib/adapters/backend";
+import type { EntityType } from "@/lib/types";
 
 function displayName(node: GraphNode): string {
   const name = node.name?.trim();
@@ -26,20 +28,66 @@ interface GraphViewProps {
   onNodeClick?: (node: GraphNode) => void;
   highlightId?: string;
   emptyMessage?: string;
+  typeFilter?: EntityType | null;
 }
 
-export function GraphView({ nodes, links, onNodeClick, highlightId, emptyMessage }: GraphViewProps) {
+const LEGEND_TYPES: EntityType[] = [
+  "article",
+  "experiment",
+  "material",
+  "mode",
+  "team",
+  "property",
+];
+
+export function GraphView({
+  nodes,
+  links,
+  onNodeClick,
+  highlightId,
+  emptyMessage,
+  typeFilter,
+}: GraphViewProps) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const fgRef = useRef<any>(null);
 
-  const graphData = {
-    nodes: nodes.map((n) => ({ ...n })),
-    links: links.map((l) => ({
-      source: l.source,
-      target: l.target,
-      relation: l.relation,
-    })),
-  };
+  const visibleIds = useMemo(() => {
+    if (!typeFilter) return null;
+    const ids = new Set<string>();
+    for (const n of nodes) {
+      if (n.type === typeFilter) ids.add(n.id);
+    }
+    for (const link of links) {
+      const src = typeof link.source === "string" ? link.source : String(link.source);
+      const tgt = typeof link.target === "string" ? link.target : String(link.target);
+      if (ids.has(src)) ids.add(tgt);
+      if (ids.has(tgt)) ids.add(src);
+    }
+    return ids;
+  }, [nodes, links, typeFilter]);
+
+  const graphData = useMemo(
+    () => ({
+      nodes: nodes.map((n) => ({
+        ...n,
+        color:
+          visibleIds && !visibleIds.has(n.id) ? "rgba(100, 116, 139, 0.2)" : n.color,
+      })),
+      links: links
+        .filter((l) => {
+          if (!visibleIds) return true;
+          const src = typeof l.source === "string" ? l.source : String(l.source);
+          const tgt = typeof l.target === "string" ? l.target : String(l.target);
+          return visibleIds.has(src) && visibleIds.has(tgt);
+        })
+        .map((l) => ({
+          source: l.source,
+          target: l.target,
+          relation: l.relation,
+        })),
+    }),
+    [nodes, links, visibleIds]
+  );
 
   useEffect(() => {
     const t = setTimeout(() => fgRef.current?.zoomToFit(400, 60), 300);
@@ -114,7 +162,10 @@ export function GraphView({ nodes, links, onNodeClick, highlightId, emptyMessage
         }}
         nodeCanvasObject={paintNode}
         nodePointerAreaPaint={paintPointerArea}
-        linkColor={() => "rgba(100, 116, 139, 0.35)"}
+        linkColor={() => "rgba(100, 116, 139, 0.45)"}
+        linkLabel={(l: { relation?: GraphEdge["relation"] }) =>
+          l.relation ? relationLabel(l.relation) : ""
+        }
         linkDirectionalParticles={1}
         linkDirectionalParticleWidth={2}
         linkDirectionalParticleColor={() => "rgba(34, 211, 238, 0.5)"}
@@ -123,29 +174,38 @@ export function GraphView({ nodes, links, onNodeClick, highlightId, emptyMessage
         cooldownTicks={80}
       />
       <div className="absolute bottom-3 left-3 flex flex-wrap gap-2">
-        {(["material", "experiment", "mode", "property", "conclusion", "article"] as const).map(
-          (type) => (
-            <span
-              key={type}
-              className="rounded px-2 py-0.5 text-[10px] uppercase tracking-wider text-slate-400"
-              style={{
-                borderLeft: `3px solid ${
-                  {
-                    material: "#f472b6",
-                    experiment: "#34d399",
-                    mode: "#a78bfa",
-                    property: "#fbbf24",
-                    conclusion: "#2dd4bf",
-                    article: "#60a5fa",
-                  }[type]
-                }`,
-              }}
-            >
-              {type}
-            </span>
-          )
-        )}
+        {LEGEND_TYPES.map((type) => (
+          <span
+            key={type}
+            className={`rounded px-2 py-0.5 text-[10px] uppercase tracking-wider ${
+              typeFilter === type ? "text-slate-100" : "text-slate-400"
+            }`}
+            style={{
+              borderLeft: `3px solid ${
+                {
+                  material: "#f472b6",
+                  experiment: "#34d399",
+                  mode: "#a78bfa",
+                  property: "#fbbf24",
+                  conclusion: "#2dd4bf",
+                  article: "#60a5fa",
+                  team: "#fb923c",
+                  setup: "#94a3b8",
+                  topic: "#64748b",
+                  equipment: "#78716c",
+                }[type]
+              }`,
+            }}
+          >
+            {getEntityLabel(type)}
+          </span>
+        ))}
       </div>
+      {typeFilter && (
+        <div className="absolute right-3 top-3 rounded-lg border border-cyan-500/30 bg-slate-900/90 px-2 py-1 text-[10px] text-cyan-300">
+          Showing {getEntityLabel(typeFilter)} + neighbors
+        </div>
+      )}
     </div>
   );
 }

@@ -80,6 +80,9 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
       <p className="mt-1 text-xs text-slate-500">
         PDF/DOCX → MinIO · text → Qdrant · entities → Neo4j
       </p>
+      <p className="mt-1 text-xs text-slate-600">
+        Paywalled journals (Nature, Springer, etc.) usually block URL ingest — upload the PDF instead.
+      </p>
 
       <div className="mt-3 flex flex-wrap gap-2">
         <input

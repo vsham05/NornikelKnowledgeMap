@@ -82,8 +82,15 @@ export interface BackendStats {
   documents?: number;
   properties?: number;
   images?: number;
+  teams?: number;
+  regimeparameters?: number;
   edges?: number;
   regime_types?: Record<string, number>;
+  experiment_status?: {
+    completed?: number;
+    ongoing?: number;
+    planned?: number;
+  };
 }
 
 export interface BackendDocument {
@@ -108,6 +115,14 @@ export interface BackendRagResult {
   experiment_ids?: string[];
   confidence: number;
   sources?: BackendSourceExcerpt[];
+  needs_disambiguation?: boolean;
+  document_candidates?: BackendDocumentCandidate[];
+}
+
+export interface BackendDocumentCandidate {
+  document_id: string;
+  title?: string | null;
+  score?: number;
 }
 
 export interface BackendSourceExcerpt {
@@ -155,6 +170,11 @@ export const backendApi = {
 
   graphStats: () => backendFetch<BackendStats>("/api/v1/graph/stats"),
 
+  enrichAllDocuments: () =>
+    backendFetch<{ processed: number; enriched: number }>("/api/v1/graph/enrich-all", {
+      method: "POST",
+    }),
+
   exploreGraph: (limit = 200) =>
     backendFetch<BackendGraph>(`/api/v1/graph/explore?limit=${limit}`),
 
@@ -176,11 +196,14 @@ export const backendApi = {
       "/api/v1/graph/analytics/gaps"
     ),
 
-  ragSearch: (text: string) =>
+  ragSearch: (text: string, documentId?: string) =>
     backendFetch<BackendRagResult>("/api/v1/search/json", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        ...(documentId ? { document_id: documentId } : {}),
+      }),
     }),
 
   ingestFile: async (file: File): Promise<IngestTask> => {

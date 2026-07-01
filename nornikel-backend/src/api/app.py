@@ -96,5 +96,10 @@ async def health():
             "context-compression",
             "dynamic-confidence",
             "multilingual-ru-en",
+            "document-scoped-rag",
+            "cross-encoder-rerank",
+            "citation-isolation",
+            "document-disambiguation",
+            "aggregate-map-reduce",
         ],
     }

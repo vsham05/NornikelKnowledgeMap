@@ -5,7 +5,8 @@ from typing import Literal
 
 from fastapi import APIRouter, Query, HTTPException, Depends
 
-from api.deps import get_graph_db
+from api.deps import get_graph_db, get_ingestion_pipeline
+from ingestion.pipeline import IngestionPipeline
 from storage.graph_db import GraphDB
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,17 @@ async def get_stats(graph_db: GraphDB = Depends(get_graph_db)):
     - Распределение экспериментов по типам режимов
     """
     return graph_db.get_stats()
+
+
+@router.post("/enrich-all")
+async def enrich_all_documents(
+    pipeline: IngestionPipeline = Depends(get_ingestion_pipeline),
+):
+    """
+    Backfill Materials, Experiments, Modes (topics), and Teams
+    for documents that were ingested without graph entities.
+    """
+    return await pipeline.enrich_all_documents()
 
 
 @router.get("/explore")

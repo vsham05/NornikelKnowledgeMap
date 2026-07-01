@@ -5,11 +5,22 @@ from neo4j import AsyncGraphDatabase, GraphDatabase
 
 from domain.dto.material import MaterialDTO
 from domain.dto.experiment import ExperimentDTO
-from domain.dto.document import DocumentDTO
+from domain.dto.document import DocumentDTO, DocumentChunkDTO
+from domain.enums import DocumentType
 from settings import Settings
 from search.query_processing import extract_search_terms
 
 logger = logging.getLogger(__name__)
+
+VISUAL_NODE_LABELS = (
+    "Document",
+    "Material",
+    "Experiment",
+    "RegimeParameter",
+    "Team",
+    "Property",
+)
+SKIP_VISUAL_REL_TYPES = frozenset({"HAS_CHUNK", "CONTAINS_IMAGE"})
 
 
 class GraphDB:
@@ -24,6 +35,29 @@ class GraphDB:
     
     def close(self):
         self.driver.close()
+
+    @staticmethod
+    def _visual_node_id(node) -> str | None:
+        props = dict(node)
+        labels = list(node.labels)
+        if props.get("id"):
+            return str(props["id"])
+        if "RegimeParameter" in labels and props.get("name"):
+            return f"rp:{props['name']}"
+        if "Property" in labels and props.get("canonical_name"):
+            return f"prop:{props['canonical_name']}"
+        return None
+
+    @staticmethod
+    def _visual_node_label(node) -> str:
+        props = dict(node)
+        return (
+            props.get("title")
+            or props.get("name")
+            or props.get("canonical_name")
+            or props.get("regime_name")
+            or (str(props["id"])[:8] if props.get("id") else "Unknown")
+        )
 
     def _get_graph_labels(self) -> set[str]:
         """Return labels present in the database (avoids Neo4j warnings on empty schema)."""
@@ -106,7 +140,11 @@ class GraphDB:
             # Создаем узел Experiment
             regime_type = experiment.regime.regime_type.value
             regime_name = experiment.regime.name or regime_type
-            
+            status = "completed"
+            status_param = experiment.regime.parameters.get("status")
+            if status_param and status_param.value.value:
+                status = str(status_param.value.value)
+
             session.run("""
                 MERGE (e:Experiment {id: $id})
                 SET e.regime_type = $regime_type,
@@ -114,6 +152,7 @@ class GraphDB:
                     e.regime_description = $regime_description,
                     e.conclusions = $conclusions,
                     e.document_id = $document_id,
+                    e.status = $status,
                     e.created_at = $created_at
             """, {
                 "id": str(experiment.id),
@@ -122,6 +161,7 @@ class GraphDB:
                 "regime_description": experiment.regime.description,
                 "conclusions": experiment.conclusions,
                 "document_id": str(experiment.document_id),
+                "status": status,
                 "created_at": experiment.created_at.isoformat()
             })
             
@@ -177,6 +217,40 @@ class GraphDB:
             """, {"exp_id": str(experiment.id), "doc_id": str(experiment.document_id)})
         
         logger.info(f"Saved experiment: {experiment.id}")
+
+    def save_team(
+        self,
+        team_id: str,
+        name: str,
+        members: list[str],
+        document_id: str,
+    ) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MERGE (t:Team {id: $id})
+                SET t.name = $name,
+                    t.members = $members
+                WITH t
+                MATCH (d:Document {id: $doc_id})
+                MERGE (t)-[:AUTHORED]->(d)
+            """, {
+                "id": team_id,
+                "name": name,
+                "members": members,
+                "doc_id": document_id,
+            })
+        logger.info("Saved team: %s", name)
+
+    def link_document_topic(self, document_id: str, topic: str) -> None:
+        topic = (topic or "").strip()[:120]
+        if not topic:
+            return
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (d:Document {id: $doc_id})
+                MERGE (rp:RegimeParameter {name: $topic})
+                MERGE (d)-[:HAS_TOPIC]->(rp)
+            """, {"doc_id": document_id, "topic": topic})
     
     def save_document(self, document: DocumentDTO):
         """Сохраняет документ как узел в графе."""
@@ -403,39 +477,115 @@ class GraphDB:
             """, {"limit": limit})
             return [dict(record) for record in result]
 
+    def document_has_entities(self, document_id: str) -> bool:
+        with self.driver.session() as session:
+            record = session.run("""
+                MATCH (d:Document {id: $id})
+                OPTIONAL MATCH (m:Material {source_document_id: $id})
+                OPTIONAL MATCH (e:Experiment {document_id: $id})
+                RETURN count(m) + count(e) as c
+            """, {"id": document_id}).single()
+            return bool(record and record["c"] > 0)
+
+    def load_document_dto(self, document_id: str) -> DocumentDTO | None:
+        """Rebuild DocumentDTO from Neo4j for re-enrichment."""
+        with self.driver.session() as session:
+            record = session.run("""
+                MATCH (d:Document {id: $id})
+                OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:DocumentChunk)
+                WITH d, c ORDER BY c.chunk_index
+                RETURN d,
+                       collect({
+                           id: c.id,
+                           text: c.text,
+                           page_number: c.page_number,
+                           chunk_index: c.chunk_index
+                       }) as chunks
+            """, {"id": document_id}).single()
+            if not record:
+                return None
+
+            node = dict(record["d"])
+            raw_chunks = [
+                c for c in record["chunks"]
+                if c.get("id") and c.get("text")
+            ]
+            chunks = [
+                DocumentChunkDTO(
+                    id=UUID(str(c["id"])),
+                    document_id=UUID(document_id),
+                    text=c["text"],
+                    chunk_index=int(c.get("chunk_index") or i),
+                    page_number=c.get("page_number"),
+                )
+                for i, c in enumerate(raw_chunks)
+            ]
+            doc_type = node.get("document_type") or "article"
+            try:
+                dtype = DocumentType(doc_type)
+            except ValueError:
+                dtype = DocumentType.OTHER
+
+            return DocumentDTO(
+                id=UUID(document_id),
+                title=node.get("title") or "Untitled",
+                document_type=dtype,
+                authors=node.get("authors") or [],
+                year=node.get("year"),
+                file_path=node.get("file_path") or "",
+                content_hash=node.get("content_hash"),
+                canonical_source=node.get("canonical_source"),
+                file_hash=node.get("file_hash"),
+                chunks=chunks,
+            )
+
     # ================== READ (для API) ==================
     
     def get_stats(self) -> dict:
         """Общая статистика графа."""
         with self.driver.session() as session:
             counts = {}
-            for label in ["Material", "Experiment", "Document", "Property", "Image", "RegimeParameter"]:
+            for label in [
+                "Material", "Experiment", "Document", "Property",
+                "Image", "RegimeParameter", "Team",
+            ]:
                 result = session.run(f"MATCH (n:{label}) RETURN count(n) as c").single()
                 counts[label.lower() + "s"] = result["c"]
-            
+
             result = session.run("MATCH ()-[r]->() RETURN count(r) as c").single()
             counts["edges"] = result["c"]
-            
-            # Распределение классов материалов
+
             class_dist = {}
             result = session.run("""
-                MATCH (m:Material) 
+                MATCH (m:Material)
                 RETURN m.material_class as cls, count(m) as c
             """)
             for record in result:
                 class_dist[record["cls"]] = record["c"]
             counts["material_classes"] = class_dist
-            
-            # Распределение типов экспериментов
+
             regime_dist = {}
             result = session.run("""
-                MATCH (e:Experiment) 
+                MATCH (e:Experiment)
                 RETURN e.regime_type as rt, count(e) as c
             """)
             for record in result:
                 regime_dist[record["rt"]] = record["c"]
             counts["regime_types"] = regime_dist
-            
+
+            status_dist = {"completed": 0, "ongoing": 0, "planned": 0}
+            result = session.run("""
+                MATCH (e:Experiment)
+                RETURN coalesce(e.status, 'completed') as st, count(e) as c
+            """)
+            for record in result:
+                key = record["st"] or "completed"
+                if key in status_dist:
+                    status_dist[key] = record["c"]
+                else:
+                    status_dist["completed"] += record["c"]
+            counts["experiment_status"] = status_dist
+
             return counts
     
     def list_materials(self, limit: int = 100, offset: int = 0) -> list[dict]:
@@ -602,43 +752,72 @@ class GraphDB:
             
             return {"nodes": nodes, "edges": edges}
     
-    def get_full_graph(self, limit: int = 200) -> dict:
-        """Document-level graph for visualization (excludes chunks/images)."""
+    def get_full_graph(self, limit: int = 500) -> dict:
+        """Knowledge graph for visualization: documents, materials, experiments, modes, teams."""
+        labels = list(VISUAL_NODE_LABELS)
         with self.driver.session() as session:
-            nodes_result = session.run("""
-                MATCH (d:Document)
-                RETURN d as n, 'Document' as label
-                ORDER BY coalesce(d.title, d.id)
+            nodes_result = session.run(
+                """
+                MATCH (n)
+                WHERE any(l IN labels(n) WHERE l IN $labels)
+                RETURN n, labels(n)[0] AS label
                 LIMIT $limit
-            """, {"limit": limit})
-            
+                """,
+                {"labels": labels, "limit": limit},
+            )
+
             nodes = []
-            node_ids = set()
+            node_ids: set[str] = set()
             for record in nodes_result:
                 node = record["n"]
-                node_id = node.get("id")
-                if not node_id:
+                node_id = self._visual_node_id(node)
+                if not node_id or node_id in node_ids:
                     continue
                 nodes.append({
                     "id": node_id,
-                    "label": node.get("title") or node.get("name") or node_id[:8],
+                    "label": self._visual_node_label(node),
                     "type": record["label"],
-                    "properties": {k: v for k, v in dict(node).items() if k != "id"}
+                    "properties": {
+                        k: v for k, v in dict(node).items()
+                        if k not in ("id", "title", "name", "canonical_name")
+                    },
                 })
                 node_ids.add(node_id)
-            
+
             edges = []
-            if len(node_ids) > 1:
-                edges_result = session.run("""
-                    MATCH (a:Document)-[r]->(b:Document)
-                    WHERE a.id IN $ids AND b.id IN $ids
-                    RETURN a.id as source, b.id as target, type(r) as type
-                """, {"ids": list(node_ids)})
-                edges = [
-                    {"source": r["source"], "target": r["target"], "type": r["type"]}
-                    for r in edges_result
-                ]
-            
+            if node_ids:
+                edges_result = session.run(
+                    """
+                    MATCH (a)-[r]->(b)
+                    WHERE any(l IN labels(a) WHERE l IN $labels)
+                      AND any(l IN labels(b) WHERE l IN $labels)
+                      AND NOT type(r) IN $skip
+                    RETURN a, b, type(r) AS type
+                    """,
+                    {
+                        "labels": labels,
+                        "skip": list(SKIP_VISUAL_REL_TYPES),
+                    },
+                )
+                seen_edges: set[tuple[str, str, str]] = set()
+                for record in edges_result:
+                    source = self._visual_node_id(record["a"])
+                    target = self._visual_node_id(record["b"])
+                    rel_type = record["type"]
+                    if not source or not target:
+                        continue
+                    if source not in node_ids or target not in node_ids:
+                        continue
+                    key = (source, target, rel_type)
+                    if key in seen_edges:
+                        continue
+                    seen_edges.add(key)
+                    edges.append({
+                        "source": source,
+                        "target": target,
+                        "type": rel_type,
+                    })
+
             return {"nodes": nodes, "edges": edges}
     
     def find_similar_materials(self, name: str, limit: int = 20) -> list[dict]:
@@ -818,15 +997,29 @@ class GraphDB:
                 })
             return results
 
-    def search_text_chunks(self, query: str, limit: int = 10) -> list[dict]:
+    def search_text_chunks(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        document_id: str | None = None,
+    ) -> list[dict]:
         """Full-text search over stored document chunks in Neo4j."""
         terms = extract_search_terms(query, limit=12)
         with self.driver.session() as session:
-            result = session.run("""
-                MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)
-                WHERE any(t IN $terms WHERE toLower(c.text) CONTAINS t)
-                RETURN c.id as id, c.text as text, d.id as document_id, d.title as title
-                LIMIT $limit
-            """, {"terms": terms or [query.lower()], "limit": limit})
+            if document_id:
+                result = session.run("""
+                    MATCH (d:Document {id: $document_id})-[:HAS_CHUNK]->(c:DocumentChunk)
+                    WHERE any(t IN $terms WHERE toLower(c.text) CONTAINS t)
+                    RETURN c.id as id, c.text as text, d.id as document_id, d.title as title
+                    LIMIT $limit
+                """, {"terms": terms or [query.lower()], "limit": limit, "document_id": document_id})
+            else:
+                result = session.run("""
+                    MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)
+                    WHERE any(t IN $terms WHERE toLower(c.text) CONTAINS t)
+                    RETURN c.id as id, c.text as text, d.id as document_id, d.title as title
+                    LIMIT $limit
+                """, {"terms": terms or [query.lower()], "limit": limit})
 
             return [dict(record) for record in result]

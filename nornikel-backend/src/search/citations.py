@@ -8,8 +8,10 @@ import re
 from typing import Any
 
 from search.query_processing import (
+    CYRILLIC_RE,
     TEMPORAL_QUERY_RE,
     YEAR_RE,
+    answer_language_instruction,
     is_name_question as _is_name_question_qp,
     significant_terms,
 )
@@ -230,7 +232,9 @@ def _role_for_name(text: str, name: str) -> str | None:
     return None
 
 
-def extract_person_facts_from_chunks(chunks: list[dict]) -> list[dict[str, Any]]:
+def extract_person_facts_from_chunks(
+    chunks: list[dict], *, answer_lang: str = "en"
+) -> list[dict[str, Any]]:
     """Deterministic person extraction for name/who questions (no LLM hallucination)."""
     people: dict[str, dict[str, Any]] = {}
 
@@ -243,7 +247,7 @@ def extract_person_facts_from_chunks(chunks: list[dict]) -> list[dict[str, Any]]
                 continue
             if name not in people:
                 role = _role_for_name(text, name)
-                claim = f"{name}" + (f" — {role}" if role else "")
+                claim = _format_person_claim(name, role, answer_lang)
                 people[name] = {"claim": claim, "sources": [index]}
             elif index not in people[name]["sources"]:
                 people[name]["sources"].append(index)
@@ -265,8 +269,23 @@ def validate_facts(facts: list[dict[str, Any]], max_source: int) -> list[dict[st
     return valid
 
 
-def format_grounded_answer(facts: list[dict[str, Any]]) -> str:
+def _format_person_claim(name: str, role: str | None, lang: str) -> str:
+    if not role:
+        return name
+    if lang == "en" and CYRILLIC_RE.search(role):
+        return name
+    return f"{name} — {role}"
+
+
+def format_grounded_answer(
+    facts: list[dict[str, Any]], *, lang: str = "en"
+) -> str:
     if not facts:
+        if lang == "ru":
+            return (
+                "В проиндексированных фрагментах недостаточно информации, "
+                "чтобы ответить на этот вопрос."
+            )
         return (
             "The indexed excerpts do not contain enough information to answer this question."
         )
@@ -295,6 +314,78 @@ def citation_coverage(answer: str, max_source: int) -> float:
     return cited / len(sentences)
 
 
+def _sentence_doc_ids(nums: list[int], index_to_doc: dict[int, str]) -> set[str]:
+    return {index_to_doc[n] for n in nums if n in index_to_doc}
+
+
+def _split_cross_document_sentence(
+    sentence: str,
+    nums: list[int],
+    index_to_doc: dict[int, str],
+) -> list[str]:
+    """Split one sentence that cites multiple documents into per-document sentences."""
+    by_doc: dict[str, list[int]] = {}
+    for num in nums:
+        doc_id = index_to_doc.get(num)
+        if not doc_id:
+            continue
+        by_doc.setdefault(doc_id, []).append(num)
+
+    if len(by_doc) <= 1:
+        return [sentence]
+
+    body = _CITATION_RE.sub("", sentence).strip().rstrip(".,;:")
+    if not body:
+        return [sentence]
+
+    parts: list[str] = []
+    for doc_nums in by_doc.values():
+        cites = "".join(f"[{n}]" for n in sorted(doc_nums))
+        parts.append(f"{body} {cites}".strip())
+    return parts
+
+
+def enforce_citation_document_isolation(
+    answer: str,
+    index_to_doc: dict[int, str],
+) -> tuple[str, bool]:
+    """
+    Fix sentences that cite excerpts from different documents.
+    Returns (fixed_answer, had_violations).
+    """
+    if not answer.strip() or not index_to_doc:
+        return answer, False
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer) if s.strip()]
+    fixed: list[str] = []
+    had_violations = False
+
+    for sentence in sentences:
+        nums = [int(n) for n in _CITATION_RE.findall(sentence)]
+        if len(nums) < 2:
+            fixed.append(sentence)
+            continue
+
+        doc_ids = _sentence_doc_ids(nums, index_to_doc)
+        if len(doc_ids) <= 1:
+            fixed.append(sentence)
+            continue
+
+        had_violations = True
+        fixed.extend(_split_cross_document_sentence(sentence, nums, index_to_doc))
+
+    return " ".join(fixed), had_violations
+
+
+def build_index_to_document(context_chunks: list[dict]) -> dict[int, str]:
+    mapping: dict[int, str] = {}
+    for index, chunk in enumerate(context_chunks, start=1):
+        doc_id = str(chunk.get("document_id") or "").strip()
+        if doc_id:
+            mapping[index] = doc_id
+    return mapping
+
+
 FACT_EXTRACTION_SYSTEM = """You extract facts ONLY from the numbered document excerpts provided.
 Reply with JSON only: {"facts": [{"claim": "...", "sources": [1]}]}
 
@@ -309,14 +400,21 @@ Rules:
 - If excerpts cannot answer the question, return {"facts": []}."""
 
 ANSWER_SYSTEM = """You are a precise research assistant answering from numbered document excerpts only.
-Documents may be in Russian or English — excerpts can be in either language.
+Excerpts may be in Russian or English — you must still answer in the language specified at the top of the prompt.
 
 Rules:
 1. Read the QUESTION carefully — answer exactly what was asked (year, name, number, comparison, etc.).
-2. Reply in the SAME language as the user's question (Russian question → Russian answer; English → English).
+2. The answer language is fixed by the MANDATORY language line — never switch languages.
 3. Use ONLY facts stated in the excerpts. Never invent data.
 4. Cite every factual claim with excerpt numbers like [1], [2].
 5. Prefer specific numbers, years, and quotes from the excerpts over vague summaries.
-6. If multiple excerpts conflict, mention the range and cite both.
-7. If excerpts lack the exact answer, give the closest supported facts (e.g. a date range or estimate) and cite them. Only say there is not enough information if even partial facts are absent.
-8. Keep answers concise: 1-4 sentences for simple questions; bullet list only when listing multiple items."""
+6. Each excerpt belongs to ONE source document (shown in headers). Never merge facts from different documents into one sentence.
+7. Citations in one sentence must come from excerpts of the SAME document only.
+8. If multiple documents are present, answer per document in separate sentences or bullets and name the document.
+9. If excerpts from one document conflict with another, state what each document says separately — do not synthesize a blended answer.
+10. If excerpts lack the exact answer, give the closest supported facts and cite them. Only say there is not enough information if even partial facts are absent.
+11. Keep answers concise: 1-4 sentences for simple questions; bullet list only when listing multiple items."""
+
+
+def build_answer_system(answer_lang: str) -> str:
+    return f"{answer_language_instruction(answer_lang)}\n\n{ANSWER_SYSTEM}"

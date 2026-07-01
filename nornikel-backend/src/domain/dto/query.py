@@ -2,9 +2,18 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 
+class DocumentCandidateDTO(BaseModel):
+    document_id: str
+    title: str | None = None
+    score: float = 0.0
+
+
 class UserQueryDTO(BaseModel):
     """Запрос пользователя."""
     text: str | None = Field(None, description="Текстовый запрос")
+    document_id: str | None = Field(
+        None, description="Optional: search only within this document"
+    )
     image_path: str | None = Field(None, description="Путь к изображению для визуального поиска")
     filters: dict[str, str] = Field(
         default_factory=dict,
@@ -33,6 +42,14 @@ class SearchResultDTO(BaseModel):
     sources: list[SourceExcerptDTO] = Field(
         default_factory=list,
         description="Numbered excerpts used to generate the answer",
+    )
+    needs_disambiguation: bool = Field(
+        False,
+        description="True when the user should pick which document to search",
+    )
+    document_candidates: list[DocumentCandidateDTO] = Field(
+        default_factory=list,
+        description="Top document options when needs_disambiguation is true",
     )
     
     class Config:

@@ -24,15 +24,17 @@ const TYPE_MAP: Record<string, EntityType> = {
   Property: "property",
   Image: "article",
   RegimeParameter: "mode",
+  Team: "team",
 };
 
 const NODE_SIZE: Record<string, number> = {
   Material: 7,
   Experiment: 8,
-  Document: 4,
+  Document: 9,
   Property: 5,
   Image: 3,
-  RegimeParameter: 4,
+  RegimeParameter: 6,
+  Team: 6,
 };
 
 export function backendNodeType(label: string): EntityType {
@@ -80,18 +82,38 @@ function mapRelation(relation: string): GraphEdge["relation"] {
   const map: Record<string, GraphEdge["relation"]> = {
     USES_MATERIAL: "uses_material",
     UNDER_MODE: "under_mode",
+    HAS_REGIME_PARAM: "under_mode",
     MEASURED: "measures",
+    HAS_PROPERTY: "measures",
     USES_SETUP: "uses_setup",
     CONDUCTED_BY: "conducted_by",
     CONCLUDES: "concludes",
     DESCRIBED_IN: "describes",
-    HAS_PROPERTY: "measures",
+    AUTHORED: "conducted_by",
+    HAS_TOPIC: "tagged",
     HAS_VALUE: "measures",
     TAGGED: "tagged",
     REFERENCES: "references",
     EMPLOYS: "employs",
   };
   return map[relation] ?? "references";
+}
+
+const RELATION_LABELS: Record<GraphEdge["relation"], string> = {
+  describes: "from document",
+  uses_material: "uses material",
+  under_mode: "mode / parameter",
+  measures: "measures",
+  uses_setup: "uses setup",
+  conducted_by: "authored by",
+  concludes: "concludes",
+  tagged: "topic",
+  references: "references",
+  employs: "employs",
+};
+
+export function relationLabel(relation: GraphEdge["relation"]): string {
+  return RELATION_LABELS[relation] ?? relation;
 }
 
 export function backendGapsToFrontend(gaps: BackendGap[]): DataGap[] {
@@ -168,50 +190,32 @@ function documentGraphFromExplore(graph: BackendGraph): {
   nodes: GraphNode[];
   links: GraphEdge[];
 } {
-  const docIds = new Set(
-    graph.nodes.filter((n) => n.type === "Document").map((n) => n.id)
-  );
-  return backendGraphToFrontend({
-    nodes: graph.nodes.filter((n) => n.type === "Document"),
-    edges: graph.edges.filter((e) => docIds.has(e.source) && docIds.has(e.target)),
-  });
+  return backendGraphToFrontend(graph);
 }
 
-function linkDocumentsStar(nodes: GraphNode[]): GraphEdge[] {
-  if (nodes.length < 2) return [];
-  const center = nodes[0];
-  return nodes.slice(1).map((n, i) => ({
-    id: `doc-link-${i}`,
-    source: center.id,
-    target: n.id,
-    relation: "references" as const,
-  }));
-}
-
-export async function backendSearch(query: string): Promise<SearchResult> {
+export async function backendSearch(
+  query: string,
+  documentId?: string
+): Promise<SearchResult> {
   const parsed = parseQuery(query);
 
   const materialName = parsed.material;
 
   const [rag, graphSearch, gapsRes, materialExps, explore] = await Promise.all([
-    backendApi.ragSearch(query).catch(() => null),
+    backendApi.ragSearch(query, documentId).catch(() => null),
     backendApi.graphSearch(query).catch(() => ({ query, results: [], count: 0 })),
     backendApi.dataGaps().catch(() => ({ gaps: [], count: 0 })),
     materialName
       ? backendApi.experimentsByMaterial(materialName).catch(() => ({ experiments: [], count: 0 }))
       : Promise.resolve({ experiments: [], count: 0 }),
-    backendApi.exploreGraph(80).catch(() => null),
+    backendApi.exploreGraph(300).catch(() => null),
   ]);
 
   const experiments: ExperimentResult[] = (materialExps.experiments ?? []).map(
     backendExperimentToResult
   );
 
-  let graph = explore ? documentGraphFromExplore(explore) : { nodes: [], links: [] };
-
-  if (graph.nodes.length > 1 && graph.links.length === 0) {
-    graph = { nodes: graph.nodes, links: linkDocumentsStar(graph.nodes) };
-  }
+  const graph = explore ? documentGraphFromExplore(explore) : { nodes: [], links: [] };
 
   void graphSearch;
 
@@ -234,6 +238,12 @@ export async function backendSearch(query: string): Promise<SearchResult> {
     narrative: buildNarrative(rag, experiments, gaps),
     sources,
     confidence: rag?.confidence,
+    needsDisambiguation: rag?.needs_disambiguation,
+    documentCandidates: rag?.document_candidates?.map((c) => ({
+      documentId: c.document_id,
+      title: c.title,
+      score: c.score,
+    })),
   };
 }
 

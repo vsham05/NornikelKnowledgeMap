@@ -13,6 +13,50 @@ from domain.enums import DocumentType, ImageType
 
 logger = logging.getLogger(__name__)
 
+_PAYWALL_HINT = (
+    "This publisher requires a subscription or institutional login. "
+    "Download the PDF (e.g. via your university library) and use Upload PDF/DOCX instead."
+)
+
+_AUTH_REDIRECT_MARKERS = (
+    "idp.",
+    "/authorize",
+    "/login",
+    "cas.",
+    "shibboleth",
+    "sso.",
+    "signin",
+    "sign-in",
+)
+
+
+class PaywalledContentError(Exception):
+    """Page is behind a publisher paywall or login wall."""
+
+
+def _is_auth_redirect(url: str) -> bool:
+    lower = url.lower()
+    return any(marker in lower for marker in _AUTH_REDIRECT_MARKERS)
+
+
+def _paywall_message(original_url: str) -> str:
+    host = urlparse(original_url).netloc.lower()
+    if "nature.com" in host:
+        return (
+            f"Nature.com blocked automated access to {original_url} (subscription/login required). "
+            + _PAYWALL_HINT
+        )
+    return f"Access to {original_url} requires login or a paid subscription. " + _PAYWALL_HINT
+
+
+def _looks_like_login_page(html: str) -> bool:
+    lower = html.lower()
+    if "idp.nature.com" in lower or "springer nature" in lower and "sign in" in lower:
+        return True
+    if "sign in" in lower and ("password" in lower or "institutional access" in lower):
+        return len(html) < 80_000
+    return False
+
 
 class WebScraper:
     """Парсер веб-страниц с извлечением текста и изображений."""
@@ -35,8 +79,15 @@ class WebScraper:
         """Скрапит веб-страницу и возвращает DocumentDTO."""
         logger.info(f"Scraping URL: {url}")
         
-        # 1. Загружаем HTML
-        html = await self._fetch_html(url)
+        # 1. Загружаем HTML (with open-access mirror fallback for paywalled DOIs)
+        try:
+            html = await self._fetch_html(url)
+        except PaywalledContentError:
+            fallback = await self._open_access_fallback(url)
+            if not fallback:
+                raise
+            logger.info(f"Paywalled URL; trying open-access mirror: {fallback}")
+            html = await self._fetch_html(fallback)
         
         # 2. Парсим HTML
         parser = HTMLParser(html)
@@ -77,10 +128,71 @@ class WebScraper:
         """Загружает HTML страницы."""
         if self.use_playwright:
             return await self._fetch_with_playwright(url)
-        else:
-            response = await self.client.get(url)
+        return await self._fetch_with_httpx(url)
+
+    async def _fetch_with_httpx(self, url: str) -> str:
+        """HTTP fetch with paywall / auth-redirect detection."""
+        try:
+            response = await self.client.get(url, follow_redirects=False)
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Could not reach {url}: {exc}") from exc
+
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("location", "")
+            if location and _is_auth_redirect(location):
+                raise PaywalledContentError(_paywall_message(url))
+            response = await self.client.get(url, follow_redirects=True)
+
+        try:
             response.raise_for_status()
-            return response.text
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"HTTP {exc.response.status_code} when fetching {url}"
+            ) from exc
+
+        final_url = str(response.url)
+        if _is_auth_redirect(final_url):
+            raise PaywalledContentError(_paywall_message(url))
+
+        html = response.text
+        if _looks_like_login_page(html):
+            raise PaywalledContentError(_paywall_message(url))
+        return html
+
+    async def _open_access_fallback(self, url: str) -> str | None:
+        """Try Europe PMC / PMC for open-access full text of a DOI-based article."""
+        doi = self._doi_from_url(url)
+        if not doi:
+            return None
+        api = (
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+            f"?query=DOI:{doi}&format=json&resultType=core&pageSize=1"
+        )
+        try:
+            response = await self.client.get(api, follow_redirects=True)
+            response.raise_for_status()
+            results = response.json().get("resultList", {}).get("result", [])
+            if not results:
+                return None
+            for entry in results[0].get("fullTextUrlList", {}).get("fullTextUrl", []):
+                if entry.get("availability") in ("Open access", "Free"):
+                    mirror = entry.get("url")
+                    if mirror:
+                        return mirror
+        except Exception as exc:
+            logger.warning(f"Europe PMC lookup failed for DOI {doi}: {exc}")
+        return None
+
+    @staticmethod
+    def _doi_from_url(url: str) -> str | None:
+        host = urlparse(url).netloc.lower()
+        path = urlparse(url).path
+        if "nature.com" in host:
+            match = re.search(r"/articles/([^/?#]+)", path)
+            if match:
+                return f"10.1038/{match.group(1)}"
+        match = re.search(r"10\.\d{4,9}/[^\s?#]+", url)
+        return match.group(0) if match else None
     
     async def _fetch_with_playwright(self, url: str) -> str:
         """Загружает HTML с JS-рендерингом через Playwright."""
@@ -91,14 +203,18 @@ class WebScraper:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
                 await page.goto(url, wait_until="networkidle")
+                final_url = page.url
+                if _is_auth_redirect(final_url):
+                    await browser.close()
+                    raise PaywalledContentError(_paywall_message(url))
                 html = await page.content()
                 await browser.close()
+                if _looks_like_login_page(html):
+                    raise PaywalledContentError(_paywall_message(url))
                 return html
         except ImportError:
             logger.warning("Playwright not installed, falling back to httpx")
-            response = await self.client.get(url)
-            response.raise_for_status()
-            return response.text
+            return await self._fetch_with_httpx(url)
     
     def _extract_title(self, parser: HTMLParser, url: str) -> str:
         """Извлекает заголовок страницы."""
