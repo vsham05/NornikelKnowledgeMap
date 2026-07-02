@@ -112,6 +112,14 @@ export interface BackendDocument {
   experiments?: Array<{ experiment_id?: string; regime?: string; material?: string }>;
 }
 
+export interface BackendRetrievalScope {
+  mode: "full_corpus" | "explicit_document" | "structured_filters" | "structured_fallback";
+  filter_document_ids?: string[];
+  filter_document_titles?: string[];
+  filters_applied?: Record<string, unknown>;
+  graph_match_count?: number;
+}
+
 export interface BackendRagResult {
   query: string;
   answer: string | null;
@@ -121,6 +129,7 @@ export interface BackendRagResult {
   sources?: BackendSourceExcerpt[];
   needs_disambiguation?: boolean;
   document_candidates?: BackendDocumentCandidate[];
+  retrieval_scope?: BackendRetrievalScope;
 }
 
 export interface BackendDocumentCandidate {

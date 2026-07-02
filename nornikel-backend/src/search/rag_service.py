@@ -5,7 +5,13 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from domain.dto.query import DocumentCandidateDTO, SearchResultDTO, SourceExcerptDTO, UserQueryDTO
+from domain.dto.query import (
+    DocumentCandidateDTO,
+    RetrievalScopeDTO,
+    SearchResultDTO,
+    SourceExcerptDTO,
+    UserQueryDTO,
+)
 from infra.embedding_client import EmbeddingClient
 from infra.llm_client import LLMClient
 from search.citations import (
@@ -68,17 +74,33 @@ class RAGService:
         all_documents = self.graph_db.list_documents()
         answer_lang = resolve_answer_language(question)
 
+        filter_payload, filter_doc_ids, graph_ctx, _ = (
+            self._resolve_structured_filters(query, question)
+        )
+        has_structured_filters = bool(filter_payload) and not forced_doc_id
+
         if query_requests_aggregate(question) and not forced_doc_id:
             return await self._answer_aggregate(question, aux, answer_lang, all_documents)
 
         disambiguation = await self._check_disambiguation(
-            question, aux, all_documents, forced_doc_id, answer_lang
+            question,
+            aux,
+            all_documents,
+            forced_doc_id,
+            answer_lang,
+            structured_document_ids=filter_doc_ids if has_structured_filters else None,
         )
         if disambiguation is not None:
             return disambiguation
 
-        retrieved, scope = await self._retrieve_scoped(
-            question, aux, forced_document_id=forced_doc_id, all_documents=all_documents
+        retrieved, scope, retrieval_scope = await self._retrieve_scoped(
+            question,
+            aux,
+            forced_document_id=forced_doc_id,
+            all_documents=all_documents,
+            structured_document_ids=filter_doc_ids if has_structured_filters else None,
+            structured_filters_active=has_structured_filters,
+            filter_payload=filter_payload,
         )
         context_chunks = [chunk.as_context_dict() for chunk in retrieved]
         context_chunks = compress_chunks(context_chunks, question)
@@ -86,10 +108,9 @@ class RAGService:
             context_chunks = self._sort_chunks_by_document(context_chunks)
 
         if not context_chunks:
-            return self._empty_result(answer_lang)
+            return self._empty_result(answer_lang, retrieval_scope)
 
         full_context = self._assemble_context(context_chunks, scope)
-        graph_ctx = self._structured_graph_context(query, question)
         if graph_ctx:
             full_context = graph_ctx + "\n\n" + full_context
         answer, used_grounded = await self._generate_answer(
@@ -131,6 +152,7 @@ class RAGService:
             answer_text=answer,
             confidence=confidence,
             sources=sources,
+            retrieval_scope=retrieval_scope,
         )
 
     async def _check_disambiguation(
@@ -140,8 +162,12 @@ class RAGService:
         all_documents: list[dict],
         forced_doc_id: str | None,
         answer_lang: str,
+        *,
+        structured_document_ids: list[str] | None = None,
     ) -> SearchResultDTO | None:
         if forced_doc_id:
+            return None
+        if structured_document_ids:
             return None
         if query_requests_comparison(question) or query_requests_aggregate(question):
             return None
@@ -272,7 +298,11 @@ class RAGService:
             sources=sources,
         )
 
-    def _empty_result(self, answer_lang: str) -> SearchResultDTO:
+    def _empty_result(
+        self,
+        answer_lang: str,
+        retrieval_scope: RetrievalScopeDTO | None = None,
+    ) -> SearchResultDTO:
         no_data = (
             "По этому запросу пока нет проиндексированного текста. "
             "Загрузите документы заново, чтобы фрагменты попали в Qdrant и граф."
@@ -289,6 +319,27 @@ class RAGService:
             answer_text=no_data,
             confidence=0.0,
             sources=[],
+            retrieval_scope=retrieval_scope or RetrievalScopeDTO(),
+        )
+
+    def _build_retrieval_scope(
+        self,
+        mode: str,
+        filter_doc_ids: list[str],
+        filter_payload: dict,
+        *,
+        graph_match_count: int | None = None,
+    ) -> RetrievalScopeDTO:
+        titles: list[str] = []
+        for doc_id in filter_doc_ids:
+            title = self.graph_db.get_document_title(doc_id)
+            titles.append(title or doc_id[:8])
+        return RetrievalScopeDTO(
+            mode=mode,
+            filter_document_ids=list(filter_doc_ids),
+            filter_document_titles=titles,
+            filters_applied=dict(filter_payload),
+            graph_match_count=graph_match_count if graph_match_count is not None else len(filter_doc_ids),
         )
 
     async def _retrieve_scoped(
@@ -298,26 +349,94 @@ class RAGService:
         *,
         forced_document_id: str | None = None,
         all_documents: list[dict] | None = None,
-    ) -> tuple[list[RetrievedChunk], DocumentScope]:
+        structured_document_ids: list[str] | None = None,
+        structured_filters_active: bool = False,
+        filter_payload: dict | None = None,
+    ) -> tuple[list[RetrievedChunk], DocumentScope, RetrievalScopeDTO]:
         """Probe retrieval, then focus on one document unless comparison is requested."""
         all_documents = all_documents or self.graph_db.list_documents()
+        filter_payload = filter_payload or {}
+
+        if forced_document_id:
+            probe = await self.retriever.retrieve(
+                question,
+                limit=RETRIEVAL_LIMIT,
+                auxiliary_queries=auxiliary_queries,
+                document_id=forced_document_id,
+            )
+            probe_chunks = [chunk.as_context_dict() for chunk in probe]
+            scope = resolve_document_scope(
+                question,
+                probe_chunks,
+                all_documents=all_documents,
+                forced_document_id=forced_document_id,
+            )
+            retrieval_scope = self._build_retrieval_scope(
+                "explicit_document",
+                [forced_document_id],
+                filter_payload,
+                graph_match_count=1,
+            )
+            return probe, scope, retrieval_scope
+
+        if structured_filters_active:
+            if structured_document_ids:
+                scoped = await self.retriever.retrieve(
+                    question,
+                    limit=RETRIEVAL_LIMIT,
+                    auxiliary_queries=auxiliary_queries,
+                    document_ids=structured_document_ids,
+                )
+                scope = DocumentScope(
+                    "multi",
+                    None,
+                    None,
+                    tuple(structured_document_ids),
+                    "structured_filters",
+                )
+                retrieval_scope = self._build_retrieval_scope(
+                    "structured_filters",
+                    structured_document_ids,
+                    filter_payload,
+                )
+                return scoped, scope, retrieval_scope
+
+            probe = await self.retriever.retrieve(
+                question,
+                limit=RETRIEVAL_LIMIT,
+                auxiliary_queries=auxiliary_queries,
+            )
+            probe_chunks = [chunk.as_context_dict() for chunk in probe]
+            scope = resolve_document_scope(
+                question,
+                probe_chunks,
+                all_documents=all_documents,
+                forced_document_id=None,
+            )
+            retrieval_scope = self._build_retrieval_scope(
+                "structured_fallback",
+                [],
+                filter_payload,
+                graph_match_count=0,
+            )
+            return probe, scope, retrieval_scope
 
         probe = await self.retriever.retrieve(
             question,
             limit=RETRIEVAL_LIMIT,
             auxiliary_queries=auxiliary_queries,
-            document_id=forced_document_id,
         )
         probe_chunks = [chunk.as_context_dict() for chunk in probe]
         scope = resolve_document_scope(
             question,
             probe_chunks,
             all_documents=all_documents,
-            forced_document_id=forced_document_id,
+            forced_document_id=None,
         )
+        retrieval_scope = RetrievalScopeDTO(mode="full_corpus")
 
         if scope.mode == "aggregate":
-            return probe, scope
+            return probe, scope, retrieval_scope
 
         if scope.mode in ("single", "explicit") and scope.primary_document_id:
             focused = await self.retriever.retrieve(
@@ -328,8 +447,8 @@ class RAGService:
                 max_per_document=RETRIEVAL_LIMIT,
             )
             if focused:
-                return focused, scope
-            return probe, scope
+                return focused, scope, retrieval_scope
+            return probe, scope, retrieval_scope
 
         if scope.mode == "multi":
             allowed = set(scope.document_ids)
@@ -338,9 +457,9 @@ class RAGService:
                 if str(chunk.document_id) in allowed
             ]
             if filtered:
-                return filtered[:RETRIEVAL_LIMIT], scope
+                return filtered[:RETRIEVAL_LIMIT], scope, retrieval_scope
 
-        return probe, scope
+        return probe, scope, retrieval_scope
 
     def _sort_chunks_by_document(self, chunks: list[dict]) -> list[dict]:
         ordered: list[dict] = []
@@ -469,21 +588,42 @@ Answer the question directly using only the excerpts above.
             )
         return sources
 
-    def _structured_graph_context(self, query: UserQueryDTO, question: str) -> str:
-        """Inject structured Neo4j matches into RAG context."""
+    def _resolve_structured_filters(
+        self,
+        query: UserQueryDTO,
+        question: str,
+    ) -> tuple[dict, list[str], str, dict | None]:
+        """Resolve structured filters once for both retrieval scoping and graph context."""
         sf = query.structured
         payload = sf.model_dump(exclude_none=True) if sf else {}
         if not payload:
             payload = self._infer_filters_from_question(question)
         if not payload:
-            return ""
+            return {}, [], "", None
 
         try:
-            result = self.graph_db.structured_search(limit=12, **payload)
+            result = self.graph_db.structured_search(limit=50, **payload)
         except Exception as exc:
             logger.warning("Structured graph search failed: %s", exc)
-            return ""
+            return payload, [], "", None
 
+        doc_ids: list[str] = []
+        seen: set[str] = set()
+        for doc in result.get("documents") or []:
+            doc_id = doc.get("id")
+            if doc_id and str(doc_id) not in seen:
+                seen.add(str(doc_id))
+                doc_ids.append(str(doc_id))
+        for row in result.get("experiments") or []:
+            doc_id = row.get("document_id")
+            if doc_id and str(doc_id) not in seen:
+                seen.add(str(doc_id))
+                doc_ids.append(str(doc_id))
+
+        graph_ctx = self._format_structured_context(result)
+        return payload, doc_ids, graph_ctx, result
+
+    def _format_structured_context(self, result: dict) -> str:
         experiments = result.get("experiments") or []
         if not experiments:
             return ""

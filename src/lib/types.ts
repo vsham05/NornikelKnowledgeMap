@@ -147,6 +147,14 @@ export interface SourceExcerpt {
   title?: string | null;
 }
 
+export interface RetrievalScope {
+  mode: "full_corpus" | "explicit_document" | "structured_filters" | "structured_fallback";
+  filterDocumentIds?: string[];
+  filterDocumentTitles?: string[];
+  filtersApplied?: Record<string, unknown>;
+  graphMatchCount?: number;
+}
+
 export interface SearchResult {
   query: string;
   parsed: ParsedQuery;
@@ -159,6 +167,7 @@ export interface SearchResult {
   confidence?: number;
   needsDisambiguation?: boolean;
   documentCandidates?: Array<{ documentId: string; title?: string | null; score?: number }>;
+  retrievalScope?: RetrievalScope;
 }
 
 export interface ParsedQuery {

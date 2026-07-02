@@ -254,7 +254,9 @@ export function Dashboard() {
             />
           </div>
 
-          <div className="mb-3">
+          <SearchBar onSearch={handleSearch} loading={loading} disabled={!backendOnline} />
+
+          <div className="mt-3">
             <QueryFilters
               value={structuredFilters}
               onChange={setStructuredFilters}
@@ -262,7 +264,6 @@ export function Dashboard() {
             />
           </div>
 
-          <SearchBar onSearch={handleSearch} loading={loading} disabled={!backendOnline} />
           {searchError && (
             <p className="mt-2 text-sm text-red-400">{searchError}</p>
           )}
@@ -317,6 +318,21 @@ export function Dashboard() {
                     {result.confidence != null && result.confidence > 0 && (
                       <span className="rounded-full bg-cyan-500/15 px-2.5 py-0.5 text-xs font-medium text-cyan-300">
                         confidence: {Math.round(result.confidence * 100)}%
+                      </span>
+                    )}
+                    {result.retrievalScope?.mode === "structured_filters" && (
+                      <span className="rounded-full bg-emerald-500/15 px-2.5 py-0.5 text-xs font-medium text-emerald-300">
+                        retrieval scoped to {result.retrievalScope.graphMatchCount ?? result.retrievalScope.filterDocumentIds?.length ?? 0} document(s) via graph filters
+                      </span>
+                    )}
+                    {result.retrievalScope?.mode === "structured_fallback" && (
+                      <span className="rounded-full bg-amber-500/15 px-2.5 py-0.5 text-xs font-medium text-amber-300">
+                        graph filters matched no documents — searching full corpus
+                      </span>
+                    )}
+                    {result.retrievalScope?.mode === "explicit_document" && (
+                      <span className="rounded-full bg-violet-500/15 px-2.5 py-0.5 text-xs font-medium text-violet-300">
+                        scoped to selected document
                       </span>
                     )}
                     <button
@@ -385,17 +401,13 @@ export function Dashboard() {
             <SourceExcerpts sources={result.sources} />
           )}
 
-          <div className="min-h-[360px] flex-1">
+          <div className="flex min-h-[min(68vh,720px)] flex-1 flex-col">
             <div className="mb-2 flex items-center justify-between gap-2">
               <p className="text-xs text-slate-500">
                 Knowledge graph — documents, experiments, materials, modes & teams linked by source
               </p>
-              {displayGraph.nodes.length > 0 && (
-                <span className="shrink-0 text-[10px] text-slate-600">
-                  {displayGraph.nodes.length} nodes · {displayGraph.links.length} links
-                </span>
-              )}
             </div>
+            <div className="min-h-[420px] flex-1">
             <GraphView
               key={graphVersion}
               nodes={displayGraph.nodes}
@@ -405,6 +417,7 @@ export function Dashboard() {
               emptyMessage={graphEmptyMessage}
               typeFilter={graphTypeFilter}
             />
+            </div>
           </div>
         </section>
 

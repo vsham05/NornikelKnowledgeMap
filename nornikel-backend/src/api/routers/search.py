@@ -17,6 +17,7 @@ def _result_payload(query: str, result) -> dict:
         "sources": [s.model_dump() for s in result.sources],
         "needs_disambiguation": result.needs_disambiguation,
         "document_candidates": [c.model_dump() for c in result.document_candidates],
+        "retrieval_scope": result.retrieval_scope.model_dump(),
     }
 
 

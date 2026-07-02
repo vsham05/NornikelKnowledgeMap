@@ -170,6 +170,7 @@ class HybridRetriever:
         *,
         auxiliary_queries: list[str] | None = None,
         document_id: str | None = None,
+        document_ids: list[str] | None = None,
         max_per_document: int | None = None,
     ) -> list[RetrievedChunk]:
         intent = analyze_intent(query)
@@ -186,10 +187,10 @@ class HybridRetriever:
 
         for q in queries:
             vector_hits = await self._vector_hits(
-                q, pool_size=RETRIEVAL_POOL, document_id=document_id
+                q, pool_size=RETRIEVAL_POOL, document_id=document_id, document_ids=document_ids
             )
             keyword_hits = self._keyword_hits(
-                q, pool_size=RETRIEVAL_POOL, document_id=document_id
+                q, pool_size=RETRIEVAL_POOL, document_id=document_id, document_ids=document_ids
             )
 
             vector_ranking: list[str] = []
@@ -281,7 +282,7 @@ class HybridRetriever:
         ranked = sorted(pool.values(), key=lambda c: c.final_score, reverse=True)
         ranked = rerank_chunks(query, ranked)
         per_doc_cap = max_per_document if max_per_document is not None else (
-            limit if document_id else 2
+            limit if document_id else (4 if document_ids and len(document_ids) <= 3 else 2)
         )
         selected = _select_diverse(ranked, limit, max_per_document=per_doc_cap)
 
@@ -301,6 +302,7 @@ class HybridRetriever:
         pool_size: int,
         *,
         document_id: str | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict]:
         try:
             embedding = await self.embedding_client.embed_query(query)
@@ -308,6 +310,7 @@ class HybridRetriever:
                 embedding,
                 limit=pool_size,
                 document_id=document_id,
+                document_ids=document_ids,
             )
         except Exception as exc:
             logger.warning("Vector retrieval failed: %s", exc)
@@ -338,12 +341,14 @@ class HybridRetriever:
         pool_size: int,
         *,
         document_id: str | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict]:
         try:
             rows = self.graph_db.search_text_chunks(
                 query,
                 limit=pool_size,
                 document_id=document_id,
+                document_ids=document_ids,
             )
         except Exception as exc:
             logger.warning("Keyword retrieval failed: %s", exc)

@@ -2,7 +2,7 @@ import logging
 from uuid import UUID
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, MatchAny
 
 from domain.dto.document import DocumentChunkDTO
 from domain.dto.image import ImageDTO
@@ -106,12 +106,23 @@ class VectorDB:
             )
         logger.info(f"Deleted vector chunks for document: {document_id}")
 
+    def clear_all_collections(self) -> None:
+        """Drop and recreate vector collections (full vector index reset)."""
+        for name in (self.text_collection, self.visual_collection):
+            try:
+                self.client.delete_collection(name)
+                logger.info("Deleted Qdrant collection: %s", name)
+            except Exception as exc:
+                logger.warning("Could not delete collection %s: %s", name, exc)
+        self._ensure_collections()
+
     def search_similar_text(
         self,
         query_embedding: list[float],
         limit: int = 10,
         *,
         document_id: str | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict]:
         """Search similar text chunks by embedding."""
         query_filter = None
@@ -121,6 +132,15 @@ class VectorDB:
                     FieldCondition(
                         key="document_id",
                         match=MatchValue(value=document_id),
+                    )
+                ]
+            )
+        elif document_ids:
+            query_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchAny(any=list(document_ids)),
                     )
                 ]
             )

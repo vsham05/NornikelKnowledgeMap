@@ -266,6 +266,15 @@ export async function backendSearch(
       title: c.title,
       score: c.score,
     })),
+    retrievalScope: rag?.retrieval_scope
+      ? {
+          mode: rag.retrieval_scope.mode,
+          filterDocumentIds: rag.retrieval_scope.filter_document_ids,
+          filterDocumentTitles: rag.retrieval_scope.filter_document_titles,
+          filtersApplied: rag.retrieval_scope.filters_applied,
+          graphMatchCount: rag.retrieval_scope.graph_match_count,
+        }
+      : undefined,
   };
 }
 

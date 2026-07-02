@@ -581,6 +581,46 @@ class GraphDB:
             """, {"id": document_id})
             return True
 
+    def purge_all_ingested_data(self) -> dict:
+        """
+        Remove all documents and ingestion-derived knowledge graph entities.
+        Keeps Neo4j schema; wipes documents, chunks, experiments, materials, etc.
+        """
+        label_keys = {
+            "Document": "documents",
+            "DocumentChunk": "document_chunks",
+            "Image": "images",
+            "Experiment": "experiments",
+            "Material": "materials",
+            "Team": "teams",
+            "Process": "processes",
+            "Equipment": "equipment",
+            "Facility": "facilities",
+            "Expert": "experts",
+            "RegimeParameter": "regime_parameters",
+            "Property": "properties",
+            "PropertyValue": "property_values",
+        }
+        deleted: dict[str, int] = {}
+        with self.driver.session() as session:
+            for label, key in label_keys.items():
+                count_result = session.run(
+                    f"MATCH (n:{label}) RETURN count(n) AS c"
+                ).single()
+                count = int(count_result["c"]) if count_result else 0
+                if count:
+                    session.run(f"MATCH (n:{label}) DETACH DELETE n")
+                deleted[key] = count
+
+            edges = session.run(
+                "MATCH ()-[r]->() DELETE r RETURN count(r) AS c"
+            ).single()
+            deleted["remaining_edges"] = 0
+
+        total_nodes = sum(v for k, v in deleted.items() if k != "remaining_edges")
+        logger.info("Purged knowledge graph: %s", deleted)
+        return {"deleted": deleted, "total_nodes_removed": total_nodes}
+
     def list_documents(self, limit: int = 100) -> list[dict]:
         """List ingested documents."""
         with self.driver.session() as session:
@@ -1127,9 +1167,11 @@ class GraphDB:
         limit: int = 10,
         *,
         document_id: str | None = None,
+        document_ids: list[str] | None = None,
     ) -> list[dict]:
         """Full-text search over stored document chunks in Neo4j."""
         terms = extract_search_terms(query, limit=12)
+        params: dict = {"terms": terms or [query.lower()], "limit": limit}
         with self.driver.session() as session:
             if document_id:
                 result = session.run("""
@@ -1137,14 +1179,22 @@ class GraphDB:
                     WHERE any(t IN $terms WHERE toLower(c.text) CONTAINS t)
                     RETURN c.id as id, c.text as text, d.id as document_id, d.title as title
                     LIMIT $limit
-                """, {"terms": terms or [query.lower()], "limit": limit, "document_id": document_id})
+                """, {**params, "document_id": document_id})
+            elif document_ids:
+                result = session.run("""
+                    MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)
+                    WHERE d.id IN $document_ids
+                      AND any(t IN $terms WHERE toLower(c.text) CONTAINS t)
+                    RETURN c.id as id, c.text as text, d.id as document_id, d.title as title
+                    LIMIT $limit
+                """, {**params, "document_ids": list(document_ids)})
             else:
                 result = session.run("""
                     MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)
                     WHERE any(t IN $terms WHERE toLower(c.text) CONTAINS t)
                     RETURN c.id as id, c.text as text, d.id as document_id, d.title as title
                     LIMIT $limit
-                """, {"terms": terms or [query.lower()], "limit": limit})
+                """, params)
 
             return [dict(record) for record in result]
 

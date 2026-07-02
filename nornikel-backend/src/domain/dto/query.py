@@ -39,6 +39,18 @@ class UserQueryDTO(BaseModel):
     )
 
 
+class RetrievalScopeDTO(BaseModel):
+    """How retrieval was scoped for this answer."""
+    mode: str = Field(
+        "full_corpus",
+        description="full_corpus | explicit_document | structured_filters | structured_fallback",
+    )
+    filter_document_ids: list[str] = Field(default_factory=list)
+    filter_document_titles: list[str] = Field(default_factory=list)
+    filters_applied: dict = Field(default_factory=dict)
+    graph_match_count: int = 0
+
+
 class SourceExcerptDTO(BaseModel):
     """A numbered excerpt passed to the LLM as context (matches [1], [2], … in answers)."""
     index: int = Field(..., ge=1)
@@ -69,6 +81,10 @@ class SearchResultDTO(BaseModel):
         default_factory=list,
         description="Top document options when needs_disambiguation is true",
     )
-    
+    retrieval_scope: RetrievalScopeDTO = Field(
+        default_factory=RetrievalScopeDTO,
+        description="Whether chunk retrieval was scoped by structured filters",
+    )
+
     class Config:
         frozen = False

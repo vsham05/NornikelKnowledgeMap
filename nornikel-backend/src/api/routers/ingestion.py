@@ -230,6 +230,31 @@ async def delete_document(
     return {"status": "deleted", "document_id": document_id}
 
 
+@router.delete("/documents")
+async def delete_all_documents(
+    graph_db=Depends(get_graph_db),
+    vector_db=Depends(get_vector_db),
+):
+    """
+    Delete ALL ingested documents and derived graph entities (full knowledge reset).
+    Clears Neo4j ingestion graph + Qdrant text/visual collections.
+    """
+    graph_result = graph_db.purge_all_ingested_data()
+    vector_status = "cleared"
+    try:
+        vector_db.clear_all_collections()
+    except Exception as e:
+        logger.warning(f"Qdrant full clear failed: {e}")
+        vector_status = f"failed: {e}"
+
+    return {
+        "status": "purged",
+        "graph": graph_result,
+        "vectors": vector_status,
+        "message": "All documents and derived knowledge graph data were removed.",
+    }
+
+
 @router.get("/documents/{document_id}")
 async def get_document(
     document_id: str,
