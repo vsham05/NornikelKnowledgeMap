@@ -14,8 +14,13 @@ import { SourceExcerpts } from "@/components/SourceExcerpts";
 import { checkBackendHealth, backendApi } from "@/lib/api/backend";
 import { backendSearch, backendGraphToFrontend } from "@/lib/adapters/backend";
 import { backendDocumentToArticle, graphNodeToEntity } from "@/lib/entityFromGraph";
-import type { Entity, GraphEdge, GraphNode, SearchResult, EntityType } from "@/lib/types";
-import { Network, MessageSquareQuote, Server, ServerOff, AlertCircle } from "lucide-react";
+import { QueryFilters } from "@/components/QueryFilters";
+import { CoverageMatrix } from "@/components/CoverageMatrix";
+import { ContradictionsPanel } from "@/components/ContradictionsPanel";
+import { downloadText, exportSearchJson, exportSearchMarkdown } from "@/lib/exportResults";
+import { parseQuery, parsedToStructured } from "@/lib/query";
+import type { Entity, GraphEdge, GraphNode, SearchResult, EntityType, StructuredFilters } from "@/lib/types";
+import { Network, MessageSquareQuote, Server, ServerOff, AlertCircle, Download } from "lucide-react";
 
 export function Dashboard() {
   const [result, setResult] = useState<SearchResult | null>(null);
@@ -37,6 +42,7 @@ export function Dashboard() {
   const [documents, setDocuments] = useState<DocumentOption[]>([]);
   const [selectedDocumentId, setSelectedDocumentId] = useState("");
   const [lastQuery, setLastQuery] = useState("");
+  const [structuredFilters, setStructuredFilters] = useState<StructuredFilters>({});
   const panelRef = useRef<HTMLDivElement>(null);
 
   const refreshBackendStatus = useCallback(async () => {
@@ -103,7 +109,11 @@ export function Dashboard() {
           setResult(null);
           return;
         }
-        const res = await backendSearch(query, docFilter || undefined);
+        const res = await backendSearch(
+          query,
+          docFilter || undefined,
+          { ...parsedToStructured(parseQuery(query)), ...structuredFilters }
+        );
         setResult(res);
         if (res.graph.nodes.length > 0) {
           setGraphSnapshot(res.graph);
@@ -119,7 +129,7 @@ export function Dashboard() {
         setLoading(false);
       }
     },
-    [refreshBackendStatus, selectedDocumentId]
+    [refreshBackendStatus, selectedDocumentId, structuredFilters]
   );
 
   const handlePickDocument = useCallback(
@@ -195,10 +205,10 @@ export function Dashboard() {
               </div>
               <div>
                 <h1 className="text-xl font-bold tracking-tight text-slate-100">
-                  Scientific Tangle
+                  R&D Knowledge Map
                 </h1>
                 <p className="text-sm text-slate-500">
-                  Neo4j · Qdrant RAG · MinIO · Ollama
+                  Mining & metallurgy · Neo4j graph · Qdrant RAG · provenance & geography
                 </p>
               </div>
             </div>
@@ -241,6 +251,14 @@ export function Dashboard() {
               onChange={setSelectedDocumentId}
               disabled={!backendOnline}
               loading={loading}
+            />
+          </div>
+
+          <div className="mb-3">
+            <QueryFilters
+              value={structuredFilters}
+              onChange={setStructuredFilters}
+              disabled={!backendOnline || loading}
             />
           </div>
 
@@ -295,11 +313,50 @@ export function Dashboard() {
                   <p className="flex-1 text-sm leading-relaxed text-slate-200 whitespace-pre-wrap">
                     {result.narrative}
                   </p>
-                  {result.confidence != null && result.confidence > 0 && (
-                    <span className="shrink-0 rounded-full bg-cyan-500/15 px-2.5 py-0.5 text-xs font-medium text-cyan-300">
-                      confidence: {Math.round(result.confidence * 100)}%
-                    </span>
-                  )}
+                  <div className="flex shrink-0 flex-wrap gap-1">
+                    {result.confidence != null && result.confidence > 0 && (
+                      <span className="rounded-full bg-cyan-500/15 px-2.5 py-0.5 text-xs font-medium text-cyan-300">
+                        confidence: {Math.round(result.confidence * 100)}%
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        downloadText(
+                          "rd-query-report.md",
+                          exportSearchMarkdown(result),
+                          "text/markdown"
+                        )
+                      }
+                      className="flex items-center gap-1 rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-slate-800"
+                    >
+                      <Download className="h-3 w-3" /> MD
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        downloadText("rd-query-report.json", exportSearchJson(result))
+                      }
+                      className="flex items-center gap-1 rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-slate-800"
+                    >
+                      <Download className="h-3 w-3" /> JSON
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void backendApi.exportJsonLd().then((ld) =>
+                          downloadText(
+                            "knowledge-map.jsonld",
+                            JSON.stringify(ld, null, 2),
+                            "application/ld+json"
+                          )
+                        )
+                      }
+                      className="flex items-center gap-1 rounded-full border border-slate-600 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-slate-800"
+                    >
+                      <Download className="h-3 w-3" /> JSON-LD
+                    </button>
+                  </div>
                 </div>
                 {(result.parsed.material || result.parsed.mode || result.parsed.property) && (
                   <div className="mt-2 flex flex-wrap gap-2 text-xs">
@@ -395,6 +452,9 @@ export function Dashboard() {
           )}
 
           {result && <Timeline experiments={result.experiments} />}
+
+          <CoverageMatrix enabled={backendOnline} />
+          <ContradictionsPanel enabled={backendOnline} />
 
           {result && (
             <div className="rounded-xl border border-slate-700/50 bg-slate-900/40 p-4">

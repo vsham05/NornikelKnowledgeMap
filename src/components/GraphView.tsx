@@ -35,7 +35,11 @@ const LEGEND_TYPES: EntityType[] = [
   "article",
   "experiment",
   "material",
+  "process",
   "mode",
+  "equipment",
+  "facility",
+  "expert",
   "team",
   "property",
 ];
@@ -193,6 +197,9 @@ export function GraphView({
                   setup: "#94a3b8",
                   topic: "#64748b",
                   equipment: "#78716c",
+                  process: "#38bdf8",
+                  facility: "#c084fc",
+                  expert: "#fdba74",
                 }[type]
               }`,
             }}

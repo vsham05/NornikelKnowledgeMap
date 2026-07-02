@@ -6,9 +6,9 @@ from typing import Literal
 from fastapi import APIRouter, Query, HTTPException, Depends
 
 from api.deps import get_graph_db, get_ingestion_pipeline
+from domain.dto.query import StructuredFiltersDTO
 from ingestion.pipeline import IngestionPipeline
 from storage.graph_db import GraphDB
-
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/graph", tags=["graph"])
 
@@ -54,6 +54,64 @@ async def explore_graph(
     """
     return graph_db.get_full_graph(limit=limit)
 
+
+@router.post("/query")
+async def structured_graph_query(
+    filters: StructuredFiltersDTO,
+    limit: int = Query(50, ge=1, le=200),
+    graph_db: GraphDB = Depends(get_graph_db),
+):
+    """
+    Multi-parameter knowledge map query:
+    material + process + geography + year range + numeric property limits.
+    """
+    return graph_db.structured_search(limit=limit, **filters.model_dump(exclude_none=True))
+
+
+@router.get("/query")
+async def structured_graph_query_get(
+    material: str | None = None,
+    process: str | None = None,
+    geography: str | None = None,
+    year_from: int | None = Query(None, ge=1900),
+    year_to: int | None = Query(None, le=2100),
+    property_name: str | None = None,
+    value_min: float | None = None,
+    value_max: float | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    graph_db: GraphDB = Depends(get_graph_db),
+):
+    """GET variant for structured graph queries."""
+    return graph_db.structured_search(
+        material=material,
+        process=process,
+        geography=geography,
+        year_from=year_from,
+        year_to=year_to,
+        property_name=property_name,
+        value_min=value_min,
+        value_max=value_max,
+        limit=limit,
+    )
+
+
+@router.get("/export/json-ld")
+async def export_json_ld(
+    limit: int = Query(500, ge=10, le=2000),
+    graph_db: GraphDB = Depends(get_graph_db),
+):
+    """Export knowledge graph as JSON-LD (FAIR / interoperability)."""
+    return graph_db.export_json_ld(limit=limit)
+
+
+@router.get("/analytics/contradictions")
+async def get_contradictions(
+    limit: int = Query(30, ge=1, le=100),
+    graph_db: GraphDB = Depends(get_graph_db),
+):
+    """Conflicting measurements for the same material + property across sources."""
+    items = graph_db.find_contradictions(limit=limit)
+    return {"contradictions": items, "count": len(items)}
 
 # ================== Materials ==================
 

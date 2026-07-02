@@ -1,9 +1,11 @@
 import { getEntityColor } from "@/lib/graph";
-import { parseQuery } from "@/lib/query";
+import { parseQuery, parsedToStructured, structuredToBackend } from "@/lib/query";
+import type { StructuredFilters } from "@/lib/types";
 import type {
   BackendExperiment,
   BackendGap,
   BackendGraph,
+  BackendGraphNode,
   BackendRagResult,
 } from "@/lib/api/backend";
 import type {
@@ -25,6 +27,10 @@ const TYPE_MAP: Record<string, EntityType> = {
   Image: "article",
   RegimeParameter: "mode",
   Team: "team",
+  Process: "process",
+  Equipment: "equipment",
+  Facility: "facility",
+  Expert: "expert",
 };
 
 const NODE_SIZE: Record<string, number> = {
@@ -35,6 +41,10 @@ const NODE_SIZE: Record<string, number> = {
   Image: 3,
   RegimeParameter: 6,
   Team: 6,
+  Process: 7,
+  Equipment: 6,
+  Facility: 5,
+  Expert: 5,
 };
 
 export function backendNodeType(label: string): EntityType {
@@ -195,20 +205,31 @@ function documentGraphFromExplore(graph: BackendGraph): {
 
 export async function backendSearch(
   query: string,
-  documentId?: string
+  documentId?: string,
+  structuredFilters?: StructuredFilters
 ): Promise<SearchResult> {
   const parsed = parseQuery(query);
+  const structured = {
+    ...structuredToBackend(parsedToStructured(parsed)),
+    ...structuredToBackend(structuredFilters ?? {}),
+  };
+  const cleanStructured = Object.fromEntries(
+    Object.entries(structured).filter(([, v]) => v != null && v !== "")
+  );
 
-  const materialName = parsed.material;
+  const materialName = structuredFilters?.material ?? parsed.material;
 
-  const [rag, graphSearch, gapsRes, materialExps, explore] = await Promise.all([
-    backendApi.ragSearch(query, documentId).catch(() => null),
+  const [rag, graphSearch, gapsRes, materialExps, explore, structuredHits] = await Promise.all([
+    backendApi.ragSearch(query, documentId, cleanStructured).catch(() => null),
     backendApi.graphSearch(query).catch(() => ({ query, results: [], count: 0 })),
     backendApi.dataGaps().catch(() => ({ gaps: [], count: 0 })),
     materialName
       ? backendApi.experimentsByMaterial(materialName).catch(() => ({ experiments: [], count: 0 }))
       : Promise.resolve({ experiments: [], count: 0 }),
     backendApi.exploreGraph(300).catch(() => null),
+    Object.keys(cleanStructured).length
+      ? backendApi.structuredQuery(cleanStructured).catch(() => null)
+      : Promise.resolve(null),
   ]);
 
   const experiments: ExperimentResult[] = (materialExps.experiments ?? []).map(
@@ -218,6 +239,7 @@ export async function backendSearch(
   const graph = explore ? documentGraphFromExplore(explore) : { nodes: [], links: [] };
 
   void graphSearch;
+  void structuredHits;
 
   const gaps = backendGapsToFrontend(gapsRes.gaps ?? []).slice(0, 12);
 
@@ -235,7 +257,7 @@ export async function backendSearch(
     relatedEntities: [],
     graph,
     gaps,
-    narrative: buildNarrative(rag, experiments, gaps),
+    narrative: buildNarrative(rag, experiments, gaps, structuredHits),
     sources,
     confidence: rag?.confidence,
     needsDisambiguation: rag?.needs_disambiguation,
@@ -250,7 +272,8 @@ export async function backendSearch(
 function buildNarrative(
   rag: BackendRagResult | null,
   experiments: ExperimentResult[],
-  gaps: DataGap[]
+  gaps: DataGap[],
+  structuredHits: { count?: number } | null
 ): string {
   const parts: string[] = [];
 
@@ -258,12 +281,15 @@ function buildNarrative(
     parts.push(rag.answer);
   } else if (experiments.length > 0) {
     parts.push(`Found ${experiments.length} related experiment(s) in the knowledge graph.`);
+  } else if (structuredHits?.count) {
+    parts.push(
+      `Knowledge graph: ${structuredHits.count} matching experiment(s) for your structured filters.`
+    );
   } else {
     parts.push(
-      "No answer generated. Try re-ingesting your documents, then search again."
+      "No answer generated. Try re-ingesting documents or refining filters, then search again."
     );
   }
 
-  // Gaps are shown in the sidebar — don't append to the answer text.
   return parts.join(" ");
 }

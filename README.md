@@ -1,133 +1,94 @@
-# Scientific Tangle
+# R&D Knowledge Map — Nornickel Hackathon
 
-Full-stack research knowledge system: **Next.js UI** + **NornikelHack FastAPI backend** (Neo4j, Qdrant, MinIO, RAG via **Ollama**).
+Unified **mining & metallurgy** research knowledge map: links publications, experiments, materials, processes, equipment, facilities, experts, and verified conclusions in a Neo4j graph with semantic RAG (RU/EN).
+
+## Problem we solve
+
+| Pain | Solution |
+|------|----------|
+| Scattered institutional memory | Ingest PDF/DOCX/URLs → normalized graph + vector index |
+| Duplicate literature reviews | Structured search + graph traversal shows what was already studied |
+| Disparate interdisciplinary data | Entity links: material → process → experiment → publication |
+| Slow manual synthesis | RAG answers with numbered citations + confidence |
+| Contradictory conclusions | Contradiction panel + source reliability on documents |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Next.js (Scientific Tangle UI)          :3000              │
-│  Graph · RAG search · ingest · gap analysis                 │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ REST
-┌──────────────────────────▼──────────────────────────────────┐
-│  FastAPI (nornikel-backend)              :8000                  │
-│  Ingest · NER · RAG · graph API                                 │
-└──┬──────────────┬──────────────┬──────────────┬─────────────────┘
-   │              │              │              │
- Neo4j         Qdrant          MinIO         Ollama
- :7687         :6333           :9000         :11434/v1
- graph         vectors         PDF/DOCX      LLM + embeddings
+Next.js UI (:3000)
+    ↓ REST
+FastAPI (:8000) — ingest · NLP · RAG · graph analytics
+    ↓
+Neo4j (graph) · Qdrant (vectors) · MinIO (files) · Ollama (LLM + embeddings)
 ```
+
+**Models (local, no API keys):**
+- LLM: `qwen2.5:7b-instruct`
+- Embeddings: `mxbai-embed-large` (1024-dim)
+
+## Entity ontology
+
+| Type | Neo4j label | Example |
+|------|-------------|---------|
+| Publication | `Document` | Article, report, patent |
+| Material | `Material` | Nickel cathode, copper matte |
+| Process | `Process` | Electrowinning, heap leaching |
+| Experiment | `Experiment` | Protocol + parameters + status |
+| Property | `Property` | Concentration, flow rate |
+| Equipment | `Equipment` | Diaphragm cell, PVD furnace |
+| Facility | `Facility` | Plant, laboratory + country |
+| Expert / Team | `Expert`, `Team` | Authors, competence holders |
+
+**Key relationships:** `USES_MATERIAL`, `USES_PROCESS`, `DESCRIBED_IN`, `MEASURED`, `AUTHORED`, `HAS_TOPIC`, `WORKS_AT`, `MENTIONS_EQUIPMENT`
+
+## Hackathon features
+
+- **Multi-parameter queries:** material + process + geography + year + numeric limits
+- **Geography:** domestic (Russia/CIS) vs international/global on documents
+- **Provenance:** source excerpts [1][2], document type reliability, update metadata
+- **Gap analysis:** materials without experiments, missing properties
+- **Contradictions:** conflicting measurements for same material + property
+- **Coverage matrix:** material × property grid
+- **Graph visualization:** full knowledge map with filters
+- **Export:** Markdown report, JSON, JSON-LD (`/api/v1/graph/export/json-ld`)
+- **Multilingual:** Russian & English queries and documents
 
 ## Quick start
 
-### 1. Infrastructure (Docker)
-
-```bash
+```powershell
 docker compose up -d
-```
-
-Services:
-- Neo4j Browser: http://localhost:7474 (`neo4j` / `password123`)
-- Qdrant: http://localhost:6333
-- MinIO Console: http://localhost:9001 (`minioadmin` / `minioadmin`)
-
-### 2. Ollama (LLM + embeddings)
-
-Install from [https://ollama.com](https://ollama.com), then pull models:
-
-```powershell
 .\scripts\pull-ollama-models.ps1
-```
-
-Or manually:
-
-```powershell
-ollama pull qwen2.5:7b-instruct
-ollama pull mxbai-embed-large
-```
-
-Verify:
-
-```powershell
-ollama list
-curl http://localhost:11434/v1/models
-```
-
-Backend `.env` (`nornikel-backend/.env`) is preconfigured for Ollama:
-
-```env
-LLM_BASE_URL=http://localhost:11434/v1
-LLM_MODEL=qwen2.5:7b-instruct
-EMBEDDING_BASE_URL=http://localhost:11434/v1
-EMBEDDING_MODEL=mxbai-embed-large
-EMBEDDING_DIMENSIONS=1024
-```
-
-> If you change embedding models, reset the Qdrant volume so vector dimensions match.
-
-### 3. Backend
-
-```bash
-cd nornikel-backend
-python -m venv .venv
-.\.venv\Scripts\activate          # Windows
-pip install -e .
-set PYTHONPATH=src
-python run.py
-```
-
-Or from project root: `.\start-backend.bat`
-
-API docs: http://localhost:8000/docs
-
-### 4. Frontend
-
-```bash
-npm install
+.\start-backend.bat
 npm run dev
 ```
 
 Open http://localhost:3000
 
-## Features
+### Demo queries (from case)
 
-| Layer | Capability |
-|-------|------------|
-| **Ingest** | Upload PDF/DOCX or URL → parse text → MinIO + Neo4j + Qdrant |
-| **Graph** | Neo4j knowledge graph visualization |
-| **RAG** | Qdrant retrieval + Ollama LLM synthesis |
-| **Analytics** | Data gaps, coverage matrix |
+1. *What water desalination methods are suitable if feed water has sulfates/chlorides at 200–300 mg/L?*
+2. *Catholyte circulation during nickel electrowinning — global practice and optimal flow rate?*
+3. *Distribution of Au, Ag, PGMs between matte and slag (last 5 years)?* — use year filter `2021–2026`
+4. *Mine water pumping to deep horizons — Russia vs abroad?* — geography: **domestic** / **international**
 
-## Project layout
+### Ingest case data
 
-```
-scientific-tangle/
-├── src/                    # Next.js frontend
-├── nornikel-backend/       # FastAPI backend (NornikelHack)
-├── docker-compose.yaml     # Neo4j, Qdrant, MinIO
-├── start-backend.bat
-└── scripts/pull-ollama-models.ps1
-```
+Download corpus from [Yandex Disk](https://disk.yandex.ru/d/npigiuw4Rbe9Pg), then upload PDFs/DOCX via the UI. Run **enrich-all** (auto on first load) to populate graph entities.
 
-## API (backend)
+## API highlights
 
-| Endpoint | Description |
-|----------|-------------|
-| `POST /api/v1/ingest/file` | Upload PDF/DOCX |
-| `POST /api/v1/search/json` | RAG query |
-| `GET /api/v1/graph/explore` | Graph visualization |
-| `GET /api/v1/graph/analytics/gaps` | Data gaps |
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /api/v1/ingest/file` | Upload document |
+| `POST /api/v1/search/json` | RAG + structured filters |
+| `GET /api/v1/graph/explore` | Full graph for visualization |
+| `GET /api/v1/graph/query` | Structured multi-param search |
+| `GET /api/v1/graph/analytics/gaps` | Knowledge gaps |
+| `GET /api/v1/graph/analytics/contradictions` | Conflicting values |
+| `GET /api/v1/graph/export/json-ld` | FAIR JSON-LD export |
 
 ## Tech stack
 
-**Frontend:** Next.js 16, React 19, TypeScript, Tailwind
+Next.js 16 · FastAPI · Neo4j · Qdrant · MinIO · Ollama · LangChain
 
-**Backend:** FastAPI, Neo4j, Qdrant, MinIO, LangChain OpenAI client
-
-**AI:** Ollama (`qwen2.5:7b-instruct` + `mxbai-embed-large`)
-
-## License
-
-Backend adapted from [NornikelHack](https://github.com/vsham05/NornikelHack).
+Branch: `scientific-tangle` on [NornikelHack](https://github.com/vsham05/NornikelHack)

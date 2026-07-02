@@ -8,6 +8,20 @@ class DocumentCandidateDTO(BaseModel):
     score: float = 0.0
 
 
+class StructuredFiltersDTO(BaseModel):
+    """Multi-parameter filters for mining/metallurgy R&D queries."""
+    material: str | None = Field(None, description="Material or substance name")
+    process: str | None = Field(None, description="Process: leaching, electrowinning, …")
+    geography: str | None = Field(
+        None, description="domestic | international | country name (Russia, CN, …)"
+    )
+    year_from: int | None = Field(None, ge=1900, le=2100)
+    year_to: int | None = Field(None, ge=1900, le=2100)
+    property_name: str | None = Field(None, description="Measured property or parameter")
+    value_min: float | None = None
+    value_max: float | None = None
+
+
 class UserQueryDTO(BaseModel):
     """Запрос пользователя."""
     text: str | None = Field(None, description="Текстовый запрос")
@@ -18,6 +32,10 @@ class UserQueryDTO(BaseModel):
     filters: dict[str, str] = Field(
         default_factory=dict,
         description="Фильтры: {material: 'Ti-6Al-4V', property: 'прочность'}"
+    )
+    structured: StructuredFiltersDTO = Field(
+        default_factory=StructuredFiltersDTO,
+        description="Structured multi-parameter filters",
     )
 
 

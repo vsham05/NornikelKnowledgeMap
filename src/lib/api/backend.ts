@@ -83,6 +83,10 @@ export interface BackendStats {
   properties?: number;
   images?: number;
   teams?: number;
+  processes?: number;
+  equipments?: number;
+  facilities?: number;
+  experts?: number;
   regimeparameters?: number;
   edges?: number;
   regime_types?: Record<string, number>;
@@ -150,6 +154,35 @@ export interface BackendExperiment {
   conclusions?: string;
 }
 
+export interface BackendContradiction {
+  material: string;
+  property: string;
+  value_a: string;
+  value_b: string;
+  experiment_a?: string;
+  experiment_b?: string;
+  source_a?: string;
+  source_b?: string;
+  description: string;
+}
+
+export interface StructuredFiltersPayload {
+  material?: string;
+  process?: string;
+  geography?: string;
+  year_from?: number;
+  year_to?: number;
+  property_name?: string;
+  value_min?: number;
+  value_max?: number;
+}
+
+export interface BackendStructuredResult {
+  count: number;
+  experiments: Array<Record<string, unknown>>;
+  documents: Array<Record<string, unknown>>;
+}
+
 export interface IngestTask {
   task_id: string;
   status: string;
@@ -196,13 +229,39 @@ export const backendApi = {
       "/api/v1/graph/analytics/gaps"
     ),
 
-  ragSearch: (text: string, documentId?: string) =>
+  coverageMatrix: () =>
+    backendFetch<{
+      materials: Array<{ material: string; properties: string[] }>;
+      properties: string[];
+    }>("/api/v1/graph/analytics/coverage-matrix"),
+
+  contradictions: () =>
+    backendFetch<{ contradictions: BackendContradiction[]; count: number }>(
+      "/api/v1/graph/analytics/contradictions"
+    ),
+
+  structuredQuery: (filters: StructuredFiltersPayload) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v != null && v !== "") params.set(k, String(v));
+    });
+    return backendFetch<BackendStructuredResult>(
+      `/api/v1/graph/query?${params.toString()}`
+    );
+  },
+
+  exportJsonLd: () => backendFetch<Record<string, unknown>>("/api/v1/graph/export/json-ld"),
+
+  ragSearch: (text: string, documentId?: string, structured?: StructuredFiltersPayload) =>
     backendFetch<BackendRagResult>("/api/v1/search/json", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         text,
         ...(documentId ? { document_id: documentId } : {}),
+        ...(structured && Object.keys(structured).length
+          ? { structured }
+          : {}),
       }),
     }),
 

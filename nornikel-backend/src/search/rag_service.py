@@ -89,6 +89,9 @@ class RAGService:
             return self._empty_result(answer_lang)
 
         full_context = self._assemble_context(context_chunks, scope)
+        graph_ctx = self._structured_graph_context(query, question)
+        if graph_ctx:
+            full_context = graph_ctx + "\n\n" + full_context
         answer, used_grounded = await self._generate_answer(
             question, full_context, context_chunks, answer_lang, scope
         )
@@ -465,3 +468,58 @@ Answer the question directly using only the excerpts above.
                 )
             )
         return sources
+
+    def _structured_graph_context(self, query: UserQueryDTO, question: str) -> str:
+        """Inject structured Neo4j matches into RAG context."""
+        sf = query.structured
+        payload = sf.model_dump(exclude_none=True) if sf else {}
+        if not payload:
+            payload = self._infer_filters_from_question(question)
+        if not payload:
+            return ""
+
+        try:
+            result = self.graph_db.structured_search(limit=12, **payload)
+        except Exception as exc:
+            logger.warning("Structured graph search failed: %s", exc)
+            return ""
+
+        experiments = result.get("experiments") or []
+        if not experiments:
+            return ""
+
+        lines = [
+            "STRUCTURED KNOWLEDGE GRAPH MATCHES "
+            "(verified links: experiment → material → source document):"
+        ]
+        for row in experiments[:10]:
+            rel = row.get("reliability")
+            rel_txt = f" | reliability={rel:.0%}" if isinstance(rel, (int, float)) else ""
+            geo = row.get("scope") or row.get("country") or ""
+            geo_txt = f" | {geo}" if geo else ""
+            lines.append(
+                f"- Material: {row.get('material')} | Process: {row.get('regime') or row.get('process')} "
+                f"| Source: {row.get('document_title')} ({row.get('year') or 'n/d'}){geo_txt}{rel_txt}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _infer_filters_from_question(question: str) -> dict:
+        lower = question.lower()
+        filters: dict = {}
+        geo_markers = {
+            "domestic": ("росси", "russia", "отечеств", "domestic", "cis"),
+            "international": ("international", "global", "abroad", "зарубеж", "миров"),
+        }
+        for scope, markers in geo_markers.items():
+            if any(m in lower for m in markers):
+                filters["geography"] = scope
+                break
+        import re
+        year_match = re.search(r"(20\d{2})\s*[-–]\s*(20\d{2})", question)
+        if year_match:
+            filters["year_from"] = int(year_match.group(1))
+            filters["year_to"] = int(year_match.group(2))
+        elif re.search(r"last\s+5\s+years", lower):
+            filters["year_from"] = 2021
+        return filters

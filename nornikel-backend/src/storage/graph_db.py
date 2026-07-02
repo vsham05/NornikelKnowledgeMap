@@ -6,7 +6,7 @@ from neo4j import AsyncGraphDatabase, GraphDatabase
 from domain.dto.material import MaterialDTO
 from domain.dto.experiment import ExperimentDTO
 from domain.dto.document import DocumentDTO, DocumentChunkDTO
-from domain.enums import DocumentType
+from domain.enums import DOCUMENT_RELIABILITY, DocumentType
 from settings import Settings
 from search.query_processing import extract_search_terms
 
@@ -19,6 +19,10 @@ VISUAL_NODE_LABELS = (
     "RegimeParameter",
     "Team",
     "Property",
+    "Process",
+    "Equipment",
+    "Facility",
+    "Expert",
 )
 SKIP_VISUAL_REL_TYPES = frozenset({"HAS_CHUNK", "CONTAINS_IMAGE"})
 
@@ -251,6 +255,125 @@ class GraphDB:
                 MERGE (rp:RegimeParameter {name: $topic})
                 MERGE (d)-[:HAS_TOPIC]->(rp)
             """, {"doc_id": document_id, "topic": topic})
+
+    def update_document_metadata(
+        self,
+        document_id: str,
+        *,
+        country: str | None = None,
+        scope: str | None = None,
+        reliability: float | None = None,
+        domain: str | None = None,
+    ) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (d:Document {id: $doc_id})
+                SET d.country = coalesce($country, d.country),
+                    d.scope = coalesce($scope, d.scope),
+                    d.reliability = coalesce($reliability, d.reliability),
+                    d.domain = coalesce($domain, d.domain),
+                    d.updated_at = datetime()
+            """, {
+                "doc_id": document_id,
+                "country": country,
+                "scope": scope,
+                "reliability": reliability,
+                "domain": domain,
+            })
+
+    def save_process(self, process_id: str, name: str, document_id: str, aliases: list[str] | None = None) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MERGE (p:Process {id: $id})
+                SET p.name = $name, p.aliases = $aliases
+                WITH p
+                MATCH (d:Document {id: $doc_id})
+                MERGE (d)-[:DESCRIBES_PROCESS]->(p)
+            """, {
+                "id": process_id,
+                "name": name,
+                "aliases": aliases or [],
+                "doc_id": document_id,
+            })
+
+    def save_equipment(
+        self, equipment_id: str, name: str, document_id: str, process_id: str | None = None
+    ) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MERGE (eq:Equipment {id: $id})
+                SET eq.name = $name
+                WITH eq
+                MATCH (d:Document {id: $doc_id})
+                MERGE (d)-[:MENTIONS_EQUIPMENT]->(eq)
+            """, {"id": equipment_id, "name": name, "doc_id": document_id})
+            if process_id:
+                session.run("""
+                    MATCH (eq:Equipment {id: $eq_id})
+                    MATCH (p:Process {id: $proc_id})
+                    MERGE (p)-[:USES_EQUIPMENT]->(eq)
+                """, {"eq_id": equipment_id, "proc_id": process_id})
+
+    def save_facility(
+        self, facility_id: str, name: str, country: str | None, document_id: str
+    ) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MERGE (f:Facility {id: $id})
+                SET f.name = $name, f.country = $country
+                WITH f
+                MATCH (d:Document {id: $doc_id})
+                MERGE (d)-[:FROM_FACILITY]->(f)
+            """, {
+                "id": facility_id,
+                "name": name,
+                "country": country,
+                "doc_id": document_id,
+            })
+
+    def save_expert(
+        self,
+        expert_id: str,
+        name: str,
+        field: str | None,
+        document_id: str,
+        team_id: str | None = None,
+    ) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MERGE (x:Expert {id: $id})
+                SET x.name = $name, x.field = $field
+                WITH x
+                MATCH (d:Document {id: $doc_id})
+                MERGE (d)-[:AUTHORED_BY]->(x)
+            """, {
+                "id": expert_id,
+                "name": name,
+                "field": field,
+                "doc_id": document_id,
+            })
+            if team_id:
+                session.run("""
+                    MATCH (x:Expert {id: $expert_id})
+                    MATCH (t:Team {id: $team_id})
+                    MERGE (x)-[:MEMBER_OF]->(t)
+                """, {"expert_id": expert_id, "team_id": team_id})
+
+    def link_team_facility(self, team_id: str, facility_id: str) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (t:Team {id: $team_id})
+                MATCH (f:Facility {id: $facility_id})
+                MERGE (t)-[:WORKS_AT]->(f)
+            """, {"team_id": team_id, "facility_id": facility_id})
+
+    def link_experiment_process(self, experiment_id: str, process_id: str) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (e:Experiment {id: $exp_id})
+                MATCH (p:Process {id: $proc_id})
+                MERGE (e)-[:USES_PROCESS]->(p)
+            """, {"exp_id": experiment_id, "proc_id": process_id})
     
     def save_document(self, document: DocumentDTO):
         """Сохраняет документ как узел в графе."""
@@ -547,7 +670,8 @@ class GraphDB:
             counts = {}
             for label in [
                 "Material", "Experiment", "Document", "Property",
-                "Image", "RegimeParameter", "Team",
+                "Image", "RegimeParameter", "Team", "Process",
+                "Equipment", "Facility", "Expert",
             ]:
                 result = session.run(f"MATCH (n:{label}) RETURN count(n) as c").single()
                 counts[label.lower() + "s"] = result["c"]
@@ -1023,3 +1147,241 @@ class GraphDB:
                 """, {"terms": terms or [query.lower()], "limit": limit})
 
             return [dict(record) for record in result]
+
+    def structured_search(
+        self,
+        *,
+        material: str | None = None,
+        process: str | None = None,
+        geography: str | None = None,
+        year_from: int | None = None,
+        year_to: int | None = None,
+        property_name: str | None = None,
+        value_min: float | None = None,
+        value_max: float | None = None,
+        limit: int = 50,
+    ) -> dict:
+        """Multi-parameter graph query for mining/metallurgy R&D map."""
+        where: list[str] = []
+        params: dict = {"limit": limit}
+
+        if material:
+            where.append(
+                "toLower(m.name) CONTAINS toLower($material) "
+                "OR any(a IN coalesce(m.aliases, []) WHERE toLower(a) CONTAINS toLower($material))"
+            )
+            params["material"] = material
+        if process:
+            where.append(
+                "(toLower(coalesce(pr.name, '')) CONTAINS toLower($process) "
+                "OR toLower(coalesce(e.regime_name, '')) CONTAINS toLower($process) "
+                "OR toLower(coalesce(e.regime_type, '')) CONTAINS toLower($process))"
+            )
+            params["process"] = process
+        if geography:
+            geo = geography.lower().strip()
+            if geo in ("domestic", "russia", "ru", "россия", "российск"):
+                where.append(
+                    "(toLower(coalesce(d.scope, '')) = 'domestic' "
+                    "OR toLower(coalesce(d.country, '')) IN ['russia', 'ru', 'россия'])"
+                )
+            elif geo in ("international", "global", "foreign", "abroad"):
+                where.append("toLower(coalesce(d.scope, '')) IN ['international', 'global']")
+            else:
+                where.append("toLower(coalesce(d.country, '')) CONTAINS toLower($geography)")
+                params["geography"] = geography
+        if year_from is not None:
+            where.append("d.year >= $year_from")
+            params["year_from"] = year_from
+        if year_to is not None:
+            where.append("d.year <= $year_to")
+            params["year_to"] = year_to
+        if property_name:
+            where.append(
+                "EXISTS { MATCH (e)-[:MEASURED]->(p:Property) "
+                "WHERE toLower(p.canonical_name) CONTAINS toLower($property_name) }"
+            )
+            params["property_name"] = property_name
+
+        where_clause = " AND ".join(where) if where else "true"
+
+        with self.driver.session() as session:
+            result = session.run(
+                f"""
+                MATCH (e:Experiment)-[:USES_MATERIAL]->(m:Material)
+                OPTIONAL MATCH (e)-[:DESCRIBED_IN]->(d:Document)
+                OPTIONAL MATCH (e)-[:USES_PROCESS]->(pr:Process)
+                WHERE {where_clause}
+                RETURN e.id AS experiment_id,
+                       e.regime_name AS regime,
+                       e.regime_type AS regime_type,
+                       e.status AS status,
+                       m.name AS material,
+                       d.id AS document_id,
+                       d.title AS document_title,
+                       d.year AS year,
+                       d.country AS country,
+                       d.scope AS scope,
+                       d.reliability AS reliability,
+                       pr.name AS process
+                ORDER BY coalesce(d.year, 0) DESC, e.regime_name
+                LIMIT $limit
+                """,
+                params,
+            )
+            rows = [dict(r) for r in result]
+
+        if value_min is not None or value_max is not None:
+            rows = self._filter_rows_by_measured_value(
+                rows, property_name, value_min, value_max
+            )
+
+        documents = []
+        seen_docs: set[str] = set()
+        for row in rows:
+            doc_id = row.get("document_id")
+            if doc_id and doc_id not in seen_docs:
+                seen_docs.add(doc_id)
+                documents.append({
+                    "id": doc_id,
+                    "title": row.get("document_title"),
+                    "year": row.get("year"),
+                    "country": row.get("country"),
+                    "scope": row.get("scope"),
+                    "reliability": row.get("reliability"),
+                })
+
+        return {
+            "count": len(rows),
+            "experiments": rows,
+            "documents": documents,
+            "filters_applied": {
+                k: v for k, v in params.items() if k != "limit" and v is not None
+            },
+        }
+
+    def _filter_rows_by_measured_value(
+        self,
+        rows: list[dict],
+        property_name: str | None,
+        value_min: float | None,
+        value_max: float | None,
+    ) -> list[dict]:
+        if not rows:
+            return rows
+        exp_ids = [r["experiment_id"] for r in rows if r.get("experiment_id")]
+        if not exp_ids:
+            return rows
+
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (e:Experiment)-[r:MEASURED]->(p:Property)
+                WHERE e.id IN $ids
+                  AND ($property_name IS NULL
+                       OR toLower(p.canonical_name) CONTAINS toLower($property_name))
+                RETURN e.id AS experiment_id, r.value AS value
+                """,
+                {"ids": exp_ids, "property_name": property_name},
+            )
+            allowed: set[str] = set()
+            for record in result:
+                try:
+                    val = float(str(record["value"]).replace(",", ".").split()[0])
+                except (TypeError, ValueError):
+                    continue
+                if value_min is not None and val < value_min:
+                    continue
+                if value_max is not None and val > value_max:
+                    continue
+                allowed.add(record["experiment_id"])
+
+        if not allowed:
+            return []
+        return [r for r in rows if r.get("experiment_id") in allowed]
+
+    def find_contradictions(self, limit: int = 30) -> list[dict]:
+        """Conflicting measured values for the same material + property."""
+        labels = self._get_graph_labels()
+        if not {"Material", "Experiment", "Property"}.issubset(labels):
+            return []
+
+        contradictions: list[dict] = []
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (m:Material)<-[:USES_MATERIAL]-(e1:Experiment)-[r1:MEASURED]->(p:Property)
+                MATCH (m)<-[:USES_MATERIAL]-(e2:Experiment)-[r2:MEASURED]->(p)
+                WHERE e1.id < e2.id AND r1.value <> r2.value
+                OPTIONAL MATCH (e1)-[:DESCRIBED_IN]->(d1:Document)
+                OPTIONAL MATCH (e2)-[:DESCRIBED_IN]->(d2:Document)
+                RETURN m.name AS material,
+                       p.canonical_name AS property,
+                       r1.value AS value_a,
+                       r2.value AS value_b,
+                       e1.regime_name AS experiment_a,
+                       e2.regime_name AS experiment_b,
+                       d1.title AS source_a,
+                       d2.title AS source_b
+                LIMIT $limit
+                """,
+                {"limit": limit},
+            )
+            for record in result:
+                contradictions.append({
+                    "material": record["material"],
+                    "property": record["property"],
+                    "value_a": record["value_a"],
+                    "value_b": record["value_b"],
+                    "experiment_a": record["experiment_a"],
+                    "experiment_b": record["experiment_b"],
+                    "source_a": record["source_a"],
+                    "source_b": record["source_b"],
+                    "description": (
+                        f"Conflicting {record['property']} for {record['material']}: "
+                        f"{record['value_a']} vs {record['value_b']}"
+                    ),
+                })
+        return contradictions
+
+    def export_json_ld(self, limit: int = 500) -> dict:
+        """Export knowledge graph as JSON-LD for interoperability."""
+        graph = self.get_full_graph(limit=limit)
+        entities = []
+        for node in graph["nodes"]:
+            label = node["type"]
+            schema_type = {
+                "Document": "ScholarlyArticle",
+                "Material": "DefinedTerm",
+                "Experiment": "ResearchProject",
+                "Team": "Organization",
+                "Expert": "Person",
+                "Facility": "Place",
+                "Equipment": "Product",
+                "Process": "DefinedTerm",
+                "Property": "PropertyValue",
+                "RegimeParameter": "QuantitativeValue",
+            }.get(label, "Thing")
+            entities.append({
+                "@type": schema_type,
+                "@id": f"urn:scientific-tangle:{node['id']}",
+                "name": node["label"],
+                "additionalType": label,
+            })
+
+        relations = []
+        for edge in graph["edges"]:
+            relations.append({
+                "@type": "Relationship",
+                "source": f"urn:scientific-tangle:{edge['source']}",
+                "target": f"urn:scientific-tangle:{edge['target']}",
+                "relationshipType": edge["type"],
+            })
+
+        return {
+            "@context": {
+                "@vocab": "https://schema.org/",
+                "relationshipType": "https://schema.org/additionalProperty",
+            },
+            "@graph": entities + relations,
+        }

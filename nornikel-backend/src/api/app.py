@@ -37,19 +37,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Научный клубок API",
+    title="R&D Knowledge Map API",
     description="""
-    Система для работы с научными знаниями в материаловедении.
+    Unified R&D knowledge map for mining and metallurgy.
     
-    **Возможности:**
-    - Загрузка PDF/DOCX/веб-страниц
-    - Автоматическое извлечение материалов, экспериментов, свойств
-    - Построение графа знаний
-    - Семантический поиск (RAG)
-    - Визуальный поиск изображений
-    - Анализ пробелов в данных
+    **Capabilities:**
+    - Ingest articles, reports, patents (RU/EN)
+    - NLP extraction: materials, processes, equipment, experiments, experts
+    - Neo4j knowledge graph with provenance and geography
+    - Multi-parameter structured queries + semantic RAG
+    - Gap analysis, contradictions, JSON-LD export
     """,
-    version="0.1.0",
+    version="1.0.0",
     lifespan=lifespan
 )
 
@@ -87,8 +86,9 @@ async def root():
 async def health():
     return {
         "status": "ok",
-        "build": "rag-v4-professional",
+        "build": "hackathon-rd-knowledge-map-v1",
         "features": [
+            "mining-metallurgy-ontology",
             "document-dedup",
             "query-rewrite",
             "multi-query-rrf",
@@ -101,5 +101,11 @@ async def health():
             "citation-isolation",
             "document-disambiguation",
             "aggregate-map-reduce",
+            "structured-graph-query",
+            "geography-filter",
+            "numeric-range-filter",
+            "contradiction-detection",
+            "json-ld-export",
+            "full-graph-visualization",
         ],
     }

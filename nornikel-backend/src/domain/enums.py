@@ -58,3 +58,20 @@ class DocumentType(str, Enum):
     PATENT = "patent"
     THESIS = "thesis"
     OTHER = "other"
+
+
+class GeographyScope(str, Enum):
+    """Domestic vs international practice."""
+    DOMESTIC = "domestic"
+    INTERNATIONAL = "international"
+    GLOBAL = "global"
+
+
+# Reliability weight for source verification (0–1)
+DOCUMENT_RELIABILITY: dict[str, float] = {
+    DocumentType.ARTICLE.value: 0.92,
+    DocumentType.REPORT.value: 0.88,
+    DocumentType.PATENT.value: 0.85,
+    DocumentType.THESIS.value: 0.80,
+    DocumentType.OTHER.value: 0.70,
+}

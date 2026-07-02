@@ -122,6 +122,7 @@ class IngestionPipeline:
         self._save_to_graph(resolved_materials, resolved_experiments, document)
         if enrichment:
             self._save_enrichment(document, enrichment)
+            self._link_enriched_experiments(resolved_experiments)
         await self._save_to_vector_db(document)
         cleanup_duplicate_documents(self.graph_db, self.vector_db)
         logger.info(f"Ingestion completed: {document.id}")
@@ -147,6 +148,7 @@ class IngestionPipeline:
         for experiment in resolved_experiments:
             self.graph_db.save_experiment(experiment)
         self._save_enrichment(document, enrichment)
+        self._link_enriched_experiments(resolved_experiments)
 
         return {
             "document_id": document_id,
@@ -224,15 +226,68 @@ class IngestionPipeline:
         return linked
 
     def _save_enrichment(self, document: DocumentDTO, enrichment: dict) -> None:
+        doc_id = str(document.id)
+        geo = enrichment.get("geography") or {}
+        self.graph_db.update_document_metadata(
+            doc_id,
+            country=geo.get("country"),
+            scope=geo.get("scope"),
+            reliability=enrichment.get("reliability"),
+            domain="mining_metallurgy",
+        )
+
+        process_by_name = {}
+        for proc in enrichment.get("processes") or []:
+            self.graph_db.save_process(
+                proc["id"], proc["name"], doc_id, proc.get("aliases")
+            )
+            process_by_name[proc["name"].lower()] = proc["id"]
+
         for team in enrichment.get("teams") or []:
             self.graph_db.save_team(
                 team_id=team["id"],
                 name=team["name"],
                 members=team.get("members") or [],
-                document_id=str(document.id),
+                document_id=doc_id,
             )
+
+        facility_ids = []
+        for fac in enrichment.get("facilities") or []:
+            self.graph_db.save_facility(
+                fac["id"], fac["name"], fac.get("country"), doc_id
+            )
+            facility_ids.append(fac["id"])
+
+        if enrichment.get("teams") and facility_ids:
+            self.graph_db.link_team_facility(
+                enrichment["teams"][0]["id"], facility_ids[0]
+            )
+
+        for expert in enrichment.get("experts") or []:
+            self.graph_db.save_expert(
+                expert["id"],
+                expert["name"],
+                expert.get("field"),
+                doc_id,
+                expert.get("team_id"),
+            )
+
+        primary_process_id = (
+            enrichment["processes"][0]["id"] if enrichment.get("processes") else None
+        )
+        for eq in enrichment.get("equipment") or []:
+            self.graph_db.save_equipment(
+                eq["id"], eq["name"], doc_id, primary_process_id
+            )
+
         for topic in enrichment.get("topics") or []:
-            self.graph_db.link_document_topic(str(document.id), topic)
+            self.graph_db.link_document_topic(doc_id, topic)
+
+    def _link_enriched_experiments(self, experiments: list[ExperimentDTO]) -> None:
+        for exp in experiments:
+            process_id = getattr(exp, "_process_id", None)
+            if process_id:
+                self.graph_db.link_experiment_process(str(exp.id), process_id)
 
     def _save_to_graph(
         self,

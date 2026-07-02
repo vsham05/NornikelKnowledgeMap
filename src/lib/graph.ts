@@ -11,6 +11,9 @@ const ENTITY_COLORS: Record<EntityType, string> = {
   conclusion: "#2dd4bf",
   topic: "#64748b",
   equipment: "#78716c",
+  process: "#38bdf8",
+  facility: "#c084fc",
+  expert: "#fdba74",
 };
 
 export function getEntityColor(type: EntityType): string {
@@ -29,6 +32,9 @@ export function getEntityLabel(type: EntityType): string {
     conclusion: "Conclusion",
     topic: "Topic",
     equipment: "Equipment",
+    process: "Process",
+    facility: "Facility",
+    expert: "Expert",
   };
   return labels[type];
 }

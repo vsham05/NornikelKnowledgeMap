@@ -8,7 +8,10 @@ export type EntityType =
   | "team"
   | "conclusion"
   | "topic"
-  | "equipment";
+  | "equipment"
+  | "process"
+  | "facility"
+  | "expert";
 
 export interface BaseEntity {
   id: string;
@@ -163,7 +166,19 @@ export interface ParsedQuery {
   mode?: string;
   property?: string;
   team?: string;
+  geography?: string;
   keywords: string[];
+}
+
+export interface StructuredFilters {
+  material?: string;
+  process?: string;
+  geography?: string;
+  yearFrom?: number;
+  yearTo?: number;
+  propertyName?: string;
+  valueMin?: number;
+  valueMax?: number;
 }
 
 export interface ExperimentResult {
