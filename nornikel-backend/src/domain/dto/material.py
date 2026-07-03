@@ -4,6 +4,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 from domain.enums import MaterialClass, MaterialState
+from domain.material_taxonomy import get_material_taxonomy
 from domain.dto.property_value import PropertyDTO
 
 
@@ -88,12 +89,14 @@ class MaterialDTO(BaseModel):
         merged_microstructure = list(set(
             self.microstructure_features + other.microstructure_features
         ))
+        taxonomy = get_material_taxonomy()
+        merged_class = taxonomy.prefer_class(self.material_class, other.material_class)
         
         return MaterialDTO(
             id=self.id,
             name=self.name,
             aliases=merged_aliases,
-            material_class=self.material_class,
+            material_class=merged_class,
             state=self.state,
             properties=merged_properties,
             microstructure_features=merged_microstructure,

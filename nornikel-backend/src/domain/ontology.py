@@ -31,12 +31,24 @@ class RegimeTypeSchema(BaseModel):
     typical_parameters: list[str] = Field(default_factory=list)
 
 
+class MaterialClassSchema(BaseModel):
+    """Process-material class in the mining/metallurgy value chain."""
+    label: str
+    label_ru: str | None = None
+    stage: str = "other"
+    description: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    name_patterns: list[str] = Field(default_factory=list)
+
+
 class Ontology(BaseModel):
     """Онтология системы — справочник всех возможных свойств и режимов."""
     property_categories: dict[str, dict[str, str]]
     properties: dict[str, PropertySchema]
     regime_parameters: dict[str, RegimeParameterSchema]
     regime_types: dict[str, RegimeTypeSchema]
+    material_classes: dict[str, MaterialClassSchema] = Field(default_factory=dict)
+    material_taxonomy_meta: dict[str, str] = Field(default_factory=dict)
     
     @classmethod
     def from_yaml(cls, path: Path) -> "Ontology":
@@ -64,12 +76,18 @@ class Ontology(BaseModel):
         regime_types = {}
         for name, type_data in data.get("regime_types", {}).items():
             regime_types[name] = RegimeTypeSchema(**type_data)
+
+        material_classes = {}
+        for name, class_data in data.get("material_classes", {}).items():
+            material_classes[name] = MaterialClassSchema(**class_data)
         
         return cls(
             property_categories=data.get("property_categories", {}),
             properties=properties,
             regime_parameters=regime_params,
             regime_types=regime_types,
+            material_classes=material_classes,
+            material_taxonomy_meta=data.get("material_taxonomy") or {},
         )
     
     def get_property_schema(self, name: str) -> PropertySchema | None:
@@ -91,6 +109,12 @@ class Ontology(BaseModel):
         """Возвращает ожидаемые единицы для свойства."""
         schema = self.properties.get(property_name)
         return schema.expected_units if schema else []
+
+    def get_material_class_schema(self, class_id: str) -> MaterialClassSchema | None:
+        return self.material_classes.get(class_id)
+
+    def get_all_material_class_ids(self) -> list[str]:
+        return list(self.material_classes.keys())
 
 
 # Singleton

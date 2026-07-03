@@ -210,3 +210,118 @@ regime_types:
   thermomechanical:
     label: "Термомеханическая обработка"
     typical_parameters: ["temperature", "deformation", "duration"]
+
+
+# ---------------------------------------------------------------------------
+# Material taxonomy — mining / metallurgy process materials
+# References: ISO TC 102/183 ores & concentrates; PMDco material entity
+# ---------------------------------------------------------------------------
+
+material_taxonomy:
+  version: "1.0"
+  reference: "ISO TC 102/183 ores & concentrates; PMDco material entity; process-stream classification"
+
+material_classes:
+  ore:
+    label: "Ore & run-of-mine"
+    label_ru: "Руда"
+    stage: feedstock
+    description: "Run-of-mine ore, crude ore, ore bodies (laterite, sulfide, oxide)"
+    aliases: [ore, rom, run-of-mine, crude ore, oxide ore, sulfide ore, iron ore, nickel ore]
+    name_patterns: [ore, руда, laterite, saprolite, limonite, pentlandite, chalcopyrite]
+
+  mineral:
+    label: "Mineral & gangue"
+    label_ru: "Минерал"
+    stage: feedstock
+    description: "Identified ore minerals and gangue (ISO 14689 rock/mineral identification)"
+    aliases: [mineral, gangue, ore mineral, rock]
+    name_patterns: [mineral, gangue, quartz, feldspar, pyrite, magnetite]
+
+  concentrate:
+    label: "Concentrate"
+    label_ru: "Концентрат"
+    stage: beneficiation
+    description: "Beneficiated flotation/gravity/magnetic concentrate (ISO TC 183)"
+    aliases: [concentrate, flotation concentrate, nickel concentrate, copper concentrate, feed concentrate]
+    name_patterns: [concentrate, концентрат, conc.]
+
+  intermediate:
+    label: "Metallurgical intermediate"
+    label_ru: "Промежуточный продукт"
+    stage: processing
+    description: "Semi-finished metallurgical products in the plant stream"
+    aliases: [matte, slag, blister, anode, cathode, sponge, precipitate, leach residue, tailings, calcine, sinter]
+    name_patterns: [matte, slag, шлак, cathode, anode, sponge, precipitate, tailings, calcine, blister, промежут]
+
+  metal:
+    label: "Metal"
+    label_ru: "Металл"
+    stage: product
+    description: "Elemental metals and unalloyed metal products"
+    aliases: [metal, pure metal, unalloyed, cathode metal, electrolytic nickel, electrolytic copper]
+    name_patterns: [nickel, copper, cobalt, zinc, titanium, zirconium, tantalum, lead, iron, metal]
+
+  alloy:
+    label: "Alloy & steel"
+    label_ru: "Сплав / сталь"
+    stage: engineering
+    description: "Engineered alloys, stainless and specialty steels (PMDco alloy)"
+    aliases: [alloy, steel, stainless steel, stainless, duplex, hastelloy, inconel, aisi, ss316, ss304]
+    name_patterns: [alloy, steel, stainless, hastelloy, inconel, aisi, ss304, ss316, сплав, сталь]
+
+  solution:
+    label: "Process fluid"
+    label_ru: "Процессный раствор"
+    stage: processing
+    description: "Leachates, electrolytes, liquors, pregnant solutions (PLS), catholyte/anolyte"
+    aliases: [solution, electrolyte, leachate, liquor, pls, pregnant liquor, catholyte, anolyte, spent electrolyte]
+    name_patterns: [electrolyte, leachate, liquor, catholyte, anolyte, solution, раствор]
+
+  reagent:
+    label: "Reagent & consumable"
+    label_ru: "Реагент"
+    stage: processing
+    description: "Process chemicals and consumables (acids, bases, collectors, flocculants)"
+    aliases: [reagent, acid, base, collector, flocculant, flux, solvent, leaching agent]
+    name_patterns: [reagent, acid, h2so4, hcl, naoh, collector, flocculant, реагент, кислот]
+
+  compound:
+    label: "Chemical compound"
+    label_ru: "Химическое соединение"
+    stage: processing
+    description: "Defined chemical species (salts, carbonates, sulfates, oxides)"
+    aliases: [compound, salt, carbonate, sulfate, oxide, hydroxide, nickel sulfate, nickel carbonate]
+    name_patterns: [carbonate, sulfate, sulphate, chloride, oxide, hydroxide, niso4, nico3]
+
+  composite:
+    label: "Composite & clad"
+    label_ru: "Композит"
+    stage: engineering
+    description: "Multi-phase or clad engineered materials"
+    aliases: [composite, clad, titanium clad, bimetallic, matrix composite]
+    name_patterns: [composite, clad, bimetal, matrix]
+
+  ceramic:
+    label: "Ceramic & refractory"
+    label_ru: "Керамика / огнеупор"
+    stage: engineering
+    description: "Refractories, ceramics, oxide matrices"
+    aliases: [ceramic, refractory, alumina, zirconia, brick]
+    name_patterns: [ceramic, refractory, alumina, zirconia, керамик, огнеупор]
+
+  polymer:
+    label: "Polymer & coating"
+    label_ru: "Полимер / покрытие"
+    stage: engineering
+    description: "Polymers, elastomers, linings and coatings (PTFE, rubber)"
+    aliases: [polymer, plastic, rubber, ptfe, teflon, coating, liner, elastomer]
+    name_patterns: [polymer, ptfe, teflon, rubber, coating, liner, полимер]
+
+  other:
+    label: "Other / unclassified"
+    label_ru: "Прочее"
+    stage: other
+    description: "Materials that do not fit a process-stream class"
+    aliases: [other, unknown, miscellaneous]
+    name_patterns: []

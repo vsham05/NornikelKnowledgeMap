@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { Scale } from "lucide-react";
 import { backendApi } from "@/lib/api/backend";
+import { useI18n } from "@/lib/i18n/I18nProvider";
 
 interface Contradiction {
   material: string;
@@ -19,6 +20,7 @@ interface ContradictionsPanelProps {
 }
 
 export function ContradictionsPanel({ enabled }: ContradictionsPanelProps) {
+  const { t } = useI18n();
   const [items, setItems] = useState<Contradiction[]>([]);
 
   useEffect(() => {
@@ -34,8 +36,7 @@ export function ContradictionsPanel({ enabled }: ContradictionsPanelProps) {
   if (!items.length) {
     return (
       <div className="rounded-xl border border-slate-700/50 bg-slate-900/40 p-4 text-xs text-slate-500">
-        <Scale className="mb-1 inline h-3.5 w-3.5 text-slate-400" /> No conflicting
-        measurements detected in the graph yet.
+        <Scale className="mb-1 inline h-3.5 w-3.5 text-slate-400" /> {t("contradictions.empty")}
       </div>
     );
   }
@@ -44,7 +45,7 @@ export function ContradictionsPanel({ enabled }: ContradictionsPanelProps) {
     <div className="rounded-xl border border-amber-500/20 bg-amber-950/10 p-4">
       <div className="flex items-center gap-2 text-sm font-medium text-amber-200">
         <Scale className="h-4 w-4" />
-        Conflicting data ({items.length})
+        {t("contradictions.title", { count: items.length })}
       </div>
       <ul className="mt-2 max-h-48 space-y-2 overflow-y-auto text-xs">
         {items.map((c, i) => (
@@ -52,7 +53,7 @@ export function ContradictionsPanel({ enabled }: ContradictionsPanelProps) {
             <p className="font-medium text-amber-100">{c.material} · {c.property}</p>
             <p className="mt-1 text-slate-300">
               <span className="text-red-300">{c.value_a}</span>
-              {" vs "}
+              {t("contradictions.vs")}
               <span className="text-cyan-300">{c.value_b}</span>
             </p>
             {(c.source_a || c.source_b) && (

@@ -1,4 +1,9 @@
+import { translate, type Locale } from "@/lib/i18n/translations";
 import { getEntityColor } from "@/lib/graph";
+import {
+  mergedMaterialLabel,
+  parseMaterialComponents,
+} from "@/lib/materialComponents";
 import { parseQuery, parsedToStructured, structuredToBackend } from "@/lib/query";
 import type { StructuredFilters } from "@/lib/types";
 import type {
@@ -34,17 +39,17 @@ const TYPE_MAP: Record<string, EntityType> = {
 };
 
 const NODE_SIZE: Record<string, number> = {
-  Material: 7,
-  Experiment: 8,
-  Document: 9,
-  Property: 5,
-  Image: 3,
-  RegimeParameter: 6,
-  Team: 6,
-  Process: 7,
-  Equipment: 6,
-  Facility: 5,
-  Expert: 5,
+  Material: 8,
+  Experiment: 9,
+  Document: 12,
+  Property: 6,
+  Image: 4,
+  RegimeParameter: 7,
+  Team: 7,
+  Process: 8,
+  Equipment: 7,
+  Facility: 6,
+  Expert: 6,
 };
 
 export function backendNodeType(label: string): EntityType {
@@ -61,12 +66,35 @@ function backendNodeName(node: BackendGraphNode): string {
 
 function toGraphNode(n: BackendGraphNode): GraphNode {
   const type = backendNodeType(n.type);
+  const name = backendNodeName(n);
+  const aliases = Array.isArray(n.properties?.aliases)
+    ? (n.properties!.aliases as string[]).filter(Boolean)
+    : [];
+  const members = Array.isArray(n.properties?.members)
+    ? (n.properties!.members as string[]).filter(Boolean)
+    : undefined;
+  const country =
+    typeof n.properties?.country === "string" ? n.properties.country : undefined;
+  const facilityType =
+    typeof n.properties?.facility_type === "string"
+      ? n.properties.facility_type
+      : undefined;
+  const components =
+    type === "material" ? parseMaterialComponents(name, aliases) : undefined;
   return {
     id: n.id,
     type,
-    name: backendNodeName(n),
+    name:
+      type === "material" && components && components.length > 1
+        ? mergedMaterialLabel(components)
+        : name,
     val: NODE_SIZE[n.type] ?? 4,
     color: getEntityColor(type),
+    components,
+    ...(type === "team" && members ? { members } : {}),
+    ...(type === "facility"
+      ? { country, facilityType }
+      : {}),
   };
 }
 
@@ -91,16 +119,25 @@ export function backendGraphToFrontend(graph: BackendGraph): {
 function mapRelation(relation: string): GraphEdge["relation"] {
   const map: Record<string, GraphEdge["relation"]> = {
     USES_MATERIAL: "uses_material",
+    MENTIONS_MATERIAL: "uses_material",
     UNDER_MODE: "under_mode",
     HAS_REGIME_PARAM: "under_mode",
+    HAS_TOPIC: "tagged",
     MEASURED: "measures",
     HAS_PROPERTY: "measures",
     USES_SETUP: "uses_setup",
     CONDUCTED_BY: "conducted_by",
+    AUTHORED: "conducted_by",
+    AUTHORED_BY: "conducted_by",
+    MEMBER_OF: "conducted_by",
     CONCLUDES: "concludes",
     DESCRIBED_IN: "describes",
-    AUTHORED: "conducted_by",
-    HAS_TOPIC: "tagged",
+    DESCRIBES_PROCESS: "describes",
+    FROM_FACILITY: "references",
+    MENTIONS_EQUIPMENT: "employs",
+    USES_EQUIPMENT: "employs",
+    USES_PROCESS: "employs",
+    PROCESSED_IN: "processed_in",
     HAS_VALUE: "measures",
     TAGGED: "tagged",
     REFERENCES: "references",
@@ -120,9 +157,16 @@ const RELATION_LABELS: Record<GraphEdge["relation"], string> = {
   tagged: "topic",
   references: "references",
   employs: "employs",
+  processed_in: "processed in",
 };
 
-export function relationLabel(relation: GraphEdge["relation"]): string {
+export function relationLabel(
+  relation: GraphEdge["relation"],
+  locale?: Locale
+): string {
+  if (locale) {
+    return translate(locale, `relation.${relation}`);
+  }
   return RELATION_LABELS[relation] ?? relation;
 }
 
@@ -140,13 +184,12 @@ export function backendGapsToFrontend(gaps: BackendGap[]): DataGap[] {
 }
 
 export function backendExperimentToResult(exp: BackendExperiment): ExperimentResult {
+  const label = [exp.material, exp.regime].filter(Boolean).join(" — ");
   return {
     experiment: {
       id: exp.id,
       type: "experiment",
-      name: exp.regime
-        ? `${exp.material ?? "Material"} — ${exp.regime}`
-        : `Experiment ${exp.id.slice(0, 8)}`,
+      name: label || exp.id.slice(0, 12),
       code: exp.id.slice(0, 12),
       startedAt: "",
       status: "completed",
@@ -159,30 +202,27 @@ export function backendExperimentToResult(exp: BackendExperiment): ExperimentRes
       measurements: [],
       description: exp.conclusions ?? exp.document ?? undefined,
     },
-    material: {
-      id: `mat-${exp.material}`,
-      type: "material",
-      name: exp.material ?? "Unknown",
-      composition: "",
-      category: "",
-    },
-    mode: {
-      id: `mode-${exp.regime}`,
-      type: "mode",
-      name: exp.regime ?? exp.regime_type ?? "Unknown mode",
-      category: exp.regime_type ?? "process",
-    },
+    material: exp.material
+      ? {
+          id: `mat-${exp.material}`,
+          type: "material",
+          name: exp.material,
+          composition: "",
+          category: "",
+        }
+      : undefined,
+    mode: exp.regime || exp.regime_type
+      ? {
+          id: `mode-${exp.regime ?? exp.regime_type}`,
+          type: "mode",
+          name: exp.regime ?? exp.regime_type ?? "",
+          category: exp.regime_type ?? "process",
+        }
+      : undefined,
     properties: [],
-    team: {
-      id: "team-unknown",
-      type: "team",
-      name: "Research team",
-      lab: "",
-      lead: "",
-      members: [],
-    },
     relevance: 85,
-    effectSummary: exp.conclusions ?? (exp.document ? `Source: ${exp.document}` : "See graph for details"),
+    effectSummary:
+      exp.conclusions ?? (exp.document ? `Source: ${exp.document}` : ""),
     conclusion: exp.conclusions
       ? {
           id: `concl-${exp.id}`,

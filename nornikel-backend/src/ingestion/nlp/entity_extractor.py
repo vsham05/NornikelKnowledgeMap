@@ -3,10 +3,18 @@ from uuid import uuid4
 
 from domain.dto.material import MaterialDTO
 from domain.dto.experiment import ExperimentDTO, RegimeDTO, RegimeParameterDTO
-from domain.dto.property_value import PropertyValueDTO, PropertyDTO
+from domain.dto.property_value import PropertyDTO
 from domain.enums import MaterialClass, MaterialState, RegimeType
+from domain.material_taxonomy import get_material_taxonomy, is_valid_material_name
 from domain.ontology import get_ontology
 from infra.llm_client import LLMClient
+from ingestion.nlp.entity_normalize import (
+    coerce_material_class,
+    coerce_material_state,
+    coerce_property_value,
+    split_compound_field,
+)
+from ingestion.nlp.extraction_validate import is_llm_template_string
 from settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -19,6 +27,7 @@ class EntityExtractor:
         self.settings = settings
         self.llm_client = LLMClient(settings)
         self.ontology = get_ontology()
+        self.material_taxonomy = get_material_taxonomy()
     
     async def extract_from_text(self, text: str, document_id, source_page: int | None = None) -> dict:
         """
@@ -77,9 +86,12 @@ class EntityExtractor:
             regime_params_list.append(f"  - {param_name} ({param_schema.label}): [{units}]")
         
         regime_params_text = "\n".join(regime_params_list)
+        material_taxonomy_text = self.material_taxonomy.prompt_block()
         
         prompt = f"""
 Извлеки из научного текста сущности в формате JSON.
+
+{material_taxonomy_text}
 
 ИЗВЕСТНЫЕ СВОЙСТВА (используй эти canonical names):
 {properties_text}
@@ -93,8 +105,8 @@ class EntityExtractor:
     {{
       "name": "canonical material name",
       "aliases": ["синоним1", "синоним2"],
-      "material_class": "alloy|ceramic|polymer|composite|other",
-      "state": "solid|liquid|powder|film",
+      "material_class": "concentrate",
+      "state": "solid",
       "properties": {{
         "canonical_property_name": {{
           "value": число_или_строка_или_объект,
@@ -133,6 +145,9 @@ class EntityExtractor:
 }}
 
 ВАЖНО:
+- material_class и state: ровно одно значение из списка (не через |)
+- name: конкретное вещество (никель, медь, гипс) — НЕ категории ore/concentrate/intermediate/metal/alloy
+- каждый материал — отдельный объект в массиве materials
 - Используй canonical names свойств из списка выше
 - Если свойство не в списке, но явно упомянуто — используй snake_case
 - Указывай source_text — точную цитату из текста
@@ -152,22 +167,20 @@ class EntityExtractor:
         
         for raw_mat in raw_materials:
             try:
-                # Парсим свойства
+                names = split_compound_field(raw_mat.get("name", ""))
+                if not names:
+                    continue
+
                 properties = {}
                 for prop_name, prop_data in raw_mat.get("properties", {}).items():
-                    prop_value = PropertyValueDTO(
-                        value=prop_data.get("value"),
-                        unit=prop_data.get("unit"),
-                        value_min=prop_data.get("value_min"),
-                        value_max=prop_data.get("value_max"),
-                        conditions=prop_data.get("conditions", {}),
-                        source_document_id=document_id,
+                    prop_value = coerce_property_value(
+                        prop_data,
+                        document_id=document_id,
                         source_page=source_page,
-                        source_text=prop_data.get("source_text"),
-                        confidence=0.9
                     )
+                    if prop_value is None:
+                        continue
                     
-                    # Определяем категорию из онтологии
                     schema = self.ontology.get_property_schema(prop_name)
                     category = schema.category if schema else "other"
                     
@@ -177,19 +190,33 @@ class EntityExtractor:
                         value=prop_value,
                         aliases=[]
                     )
-                
-                material = MaterialDTO(
-                    id=uuid4(),
-                    name=raw_mat.get("name", "Unknown"),
-                    aliases=raw_mat.get("aliases", []),
-                    material_class=MaterialClass(raw_mat.get("material_class", "other")),
-                    state=MaterialState(raw_mat.get("state", "solid")),
-                    properties=properties,
-                    microstructure_features=raw_mat.get("microstructure_features", []),
-                    source_document_id=document_id
-                )
-                
-                materials.append(material)
+
+                state = coerce_material_state(raw_mat.get("state"))
+                aliases = raw_mat.get("aliases", [])
+                micro = raw_mat.get("microstructure_features", [])
+
+                for idx, name in enumerate(names):
+                    if not is_valid_material_name(name):
+                        logger.debug("Skipping invalid material name (class label): %s", name)
+                        continue
+                    if is_llm_template_string(name):
+                        logger.debug("Skipping template material name: %s", name)
+                        continue
+                    material = MaterialDTO(
+                        id=uuid4(),
+                        name=name,
+                        aliases=aliases if idx == 0 else [],
+                        material_class=coerce_material_class(
+                            raw_mat.get("material_class") if idx == 0 else None,
+                            name=name,
+                            state=raw_mat.get("state"),
+                        ),
+                        state=state,
+                        properties=properties if idx == 0 else {},
+                        microstructure_features=micro if idx == 0 else [],
+                        source_document_id=document_id
+                    )
+                    materials.append(material)
                 
             except Exception as e:
                 logger.warning(f"Failed to parse material: {e}, data: {raw_mat}")
@@ -202,18 +229,23 @@ class EntityExtractor:
         
         for raw_exp in raw_experiments:
             try:
+                material_name = str(raw_exp.get("material_name") or "").strip()
+                if not material_name or is_llm_template_string(material_name):
+                    logger.debug("Skipping experiment without valid material_name")
+                    continue
+
                 # Парсим режим
                 regime_data = raw_exp.get("regime", {})
                 regime_params = {}
                 
                 for param_name, param_data in regime_data.get("parameters", {}).items():
-                    param_value = PropertyValueDTO(
-                        value=param_data.get("value"),
-                        unit=param_data.get("unit"),
-                        source_document_id=document_id,
+                    param_value = coerce_property_value(
+                        param_data,
+                        document_id=document_id,
                         source_page=source_page,
-                        confidence=0.9
                     )
+                    if param_value is None:
+                        continue
                     
                     regime_params[param_name] = RegimeParameterDTO(
                         name=param_name,
@@ -230,14 +262,13 @@ class EntityExtractor:
                 # Парсим измеренные свойства
                 measured_properties = {}
                 for prop_name, prop_data in raw_exp.get("measured_properties", {}).items():
-                    prop_value = PropertyValueDTO(
-                        value=prop_data.get("value"),
-                        unit=prop_data.get("unit"),
-                        source_document_id=document_id,
+                    prop_value = coerce_property_value(
+                        prop_data,
+                        document_id=document_id,
                         source_page=source_page,
-                        source_text=prop_data.get("source_text"),
-                        confidence=0.9
                     )
+                    if prop_value is None:
+                        continue
                     
                     schema = self.ontology.get_property_schema(prop_name)
                     category = schema.category if schema else "other"
@@ -248,18 +279,17 @@ class EntityExtractor:
                         value=prop_value
                     )
                 
-                # Создаем эксперимент
+                # Создаем эксперимент (material_id resolved in pipeline)
                 experiment = ExperimentDTO(
                     id=uuid4(),
-                    material_id=uuid4(),  # Placeholder
+                    material_id=uuid4(),
                     regime=regime,
                     measured_properties=measured_properties,
                     conclusions=raw_exp.get("conclusions", []),
                     document_id=document_id
                 )
-                
-                # Сохраняем имя материала для связывания
-                experiment._material_name = raw_exp.get("material_name")  # type: ignore
+
+                experiment._material_name = material_name  # type: ignore
                 
                 experiments.append(experiment)
                 

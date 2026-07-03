@@ -14,19 +14,23 @@ import { SourceExcerpts } from "@/components/SourceExcerpts";
 import { checkBackendHealth, backendApi } from "@/lib/api/backend";
 import { backendSearch, backendGraphToFrontend } from "@/lib/adapters/backend";
 import { backendDocumentToArticle, graphNodeToEntity } from "@/lib/entityFromGraph";
+import { getNodeConnections, type NodeConnection } from "@/lib/graphConnections";
 import { QueryFilters } from "@/components/QueryFilters";
-import { CoverageMatrix } from "@/components/CoverageMatrix";
 import { ContradictionsPanel } from "@/components/ContradictionsPanel";
 import { downloadText, exportSearchJson, exportSearchMarkdown } from "@/lib/exportResults";
 import { parseQuery, parsedToStructured } from "@/lib/query";
 import type { Entity, GraphEdge, GraphNode, SearchResult, EntityType, StructuredFilters } from "@/lib/types";
 import { Network, MessageSquareQuote, Server, ServerOff, AlertCircle, Download } from "lucide-react";
+import { LanguageSwitcher } from "@/components/LanguageSwitcher";
+import { useI18n } from "@/lib/i18n/I18nProvider";
 
 export function Dashboard() {
+  const { t } = useI18n();
   const [result, setResult] = useState<SearchResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [selectedExpId, setSelectedExpId] = useState<string | null>(null);
   const [panelEntity, setPanelEntity] = useState<Entity | null>(null);
+  const [panelConnections, setPanelConnections] = useState<NodeConnection[]>([]);
   const [panelLoading, setPanelLoading] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
   const [backendOnline, setBackendOnline] = useState(false);
@@ -105,7 +109,7 @@ export function Dashboard() {
       try {
         const online = await refreshBackendStatus();
         if (!online) {
-          setSearchError("Backend is not connected. Start Docker and the FastAPI server.");
+          setSearchError(t("search.backendDisconnected"));
           setResult(null);
           return;
         }
@@ -121,15 +125,16 @@ export function Dashboard() {
         }
         setSelectedExpId(res.experiments[0]?.experiment.id ?? null);
         setPanelEntity(null);
+        setPanelConnections([]);
         setSelectedNodeId(null);
       } catch (e) {
-        setSearchError(e instanceof Error ? e.message : "Search failed");
+        setSearchError(e instanceof Error ? e.message : t("search.failed"));
         setResult(null);
       } finally {
         setLoading(false);
       }
     },
-    [refreshBackendStatus, selectedDocumentId, structuredFilters]
+    [refreshBackendStatus, selectedDocumentId, structuredFilters, t]
   );
 
   const handlePickDocument = useCallback(
@@ -145,6 +150,9 @@ export function Dashboard() {
   const handleNodeClick = useCallback(async (node: GraphNode) => {
     setSelectedNodeId(node.id);
     setPanelEntity(graphNodeToEntity(node));
+    setPanelConnections(
+      getNodeConnections(node.id, graphSnapshot.nodes, graphSnapshot.links)
+    );
     setPanelLoading(node.type === "article");
 
     requestAnimationFrame(() => {
@@ -170,7 +178,15 @@ export function Dashboard() {
     }
 
     setPanelLoading(false);
-  }, []);
+  }, [graphSnapshot]);
+
+  const handleConnectionClick = useCallback(
+    (nodeId: string) => {
+      const node = graphSnapshot.nodes.find((n) => n.id === nodeId);
+      if (node) void handleNodeClick(node);
+    },
+    [graphSnapshot.nodes, handleNodeClick]
+  );
 
   const handleExpClick = useCallback(
     (expId: string) => {
@@ -188,10 +204,10 @@ export function Dashboard() {
   const graphEmptyMessage =
     displayGraph.nodes.length === 0
       ? !backendOnline
-        ? "Connect the backend to load the knowledge graph."
+        ? t("graph.emptyOffline")
         : !hasSearched
-          ? "Loading graph from Neo4j… upload documents or wait a moment."
-          : "No graph data yet. Upload PDFs or DOCX files to build the knowledge graph."
+          ? t("graph.emptyLoading")
+          : t("graph.emptyNoData")
       : undefined;
 
   return (
@@ -205,14 +221,14 @@ export function Dashboard() {
               </div>
               <div>
                 <h1 className="text-xl font-bold tracking-tight text-slate-100">
-                  R&D Knowledge Map
+                  {t("header.title")}
                 </h1>
-                <p className="text-sm text-slate-500">
-                  Mining & metallurgy · Neo4j graph · Qdrant RAG · provenance & geography
-                </p>
+                <p className="text-sm text-slate-500">{t("header.subtitle")}</p>
               </div>
             </div>
-            <div
+            <div className="flex items-center gap-3">
+              <LanguageSwitcher />
+              <div
               className={`flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${
                 backendOnline
                   ? "border-emerald-500/30 text-emerald-400"
@@ -222,25 +238,22 @@ export function Dashboard() {
               {backendOnline ? (
                 <>
                   <Server className="h-3.5 w-3.5" />
-                  Backend connected
+                  {t("header.backendConnected")}
                 </>
               ) : (
                 <>
                   <ServerOff className="h-3.5 w-3.5" />
-                  Backend offline
+                  {t("header.backendOffline")}
                 </>
               )}
+            </div>
             </div>
           </div>
 
           {!backendOnline && (
             <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <p>
-                Start Docker (<code className="text-amber-100">docker compose up -d</code>) and the
-                FastAPI backend (<code className="text-amber-100">start-backend.bat</code>) to search
-                and ingest documents.
-              </p>
+              <p>{t("header.backendHint")}</p>
             </div>
           )}
 
@@ -270,7 +283,7 @@ export function Dashboard() {
 
           {result?.needsDisambiguation && result.documentCandidates && (
             <div className="mt-3 rounded-lg border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-sm text-amber-100">
-              <p className="mb-2 font-medium">Multiple documents match — pick one:</p>
+              <p className="mb-2 font-medium">{t("search.disambiguation")}</p>
               <div className="flex flex-wrap gap-2">
                 {result.documentCandidates.map((candidate) => (
                   <button
@@ -317,22 +330,29 @@ export function Dashboard() {
                   <div className="flex shrink-0 flex-wrap gap-1">
                     {result.confidence != null && result.confidence > 0 && (
                       <span className="rounded-full bg-cyan-500/15 px-2.5 py-0.5 text-xs font-medium text-cyan-300">
-                        confidence: {Math.round(result.confidence * 100)}%
+                        {t("narrative.confidence", {
+                          pct: Math.round(result.confidence * 100),
+                        })}
                       </span>
                     )}
                     {result.retrievalScope?.mode === "structured_filters" && (
                       <span className="rounded-full bg-emerald-500/15 px-2.5 py-0.5 text-xs font-medium text-emerald-300">
-                        retrieval scoped to {result.retrievalScope.graphMatchCount ?? result.retrievalScope.filterDocumentIds?.length ?? 0} document(s) via graph filters
+                        {t("narrative.scopedStructured", {
+                          count:
+                            result.retrievalScope.graphMatchCount ??
+                            result.retrievalScope.filterDocumentIds?.length ??
+                            0,
+                        })}
                       </span>
                     )}
                     {result.retrievalScope?.mode === "structured_fallback" && (
                       <span className="rounded-full bg-amber-500/15 px-2.5 py-0.5 text-xs font-medium text-amber-300">
-                        graph filters matched no documents — searching full corpus
+                        {t("narrative.fallbackStructured")}
                       </span>
                     )}
                     {result.retrievalScope?.mode === "explicit_document" && (
                       <span className="rounded-full bg-violet-500/15 px-2.5 py-0.5 text-xs font-medium text-violet-300">
-                        scoped to selected document
+                        {t("narrative.scopedDocument")}
                       </span>
                     )}
                     <button
@@ -404,7 +424,7 @@ export function Dashboard() {
           <div className="flex min-h-[min(68vh,720px)] flex-1 flex-col">
             <div className="mb-2 flex items-center justify-between gap-2">
               <p className="text-xs text-slate-500">
-                Knowledge graph — documents, experiments, materials, modes & teams linked by source
+                {t("graph.caption")}
               </p>
             </div>
             <div className="min-h-[420px] flex-1">
@@ -434,14 +454,17 @@ export function Dashboard() {
               <EntityPanel
                 entity={panelEntity}
                 loading={panelLoading}
+                connections={panelConnections}
+                onConnectionClick={handleConnectionClick}
                 onClose={() => {
                   setPanelEntity(null);
+                  setPanelConnections([]);
                   setSelectedNodeId(null);
                 }}
               />
             ) : (
               <div className="hidden rounded-xl border border-dashed border-slate-700/50 bg-slate-900/30 p-6 text-center text-sm text-slate-500 lg:block">
-                Click a graph node to view document or entity details.
+                {t("graph.clickHint")}
               </div>
             )}
           </div>
@@ -449,7 +472,7 @@ export function Dashboard() {
           {result && result.experiments.length > 0 && (
             <div className="space-y-2">
               <h2 className="text-sm font-medium text-slate-300">
-                Experiments ({result.experiments.length})
+                {t("experiments.title", { count: result.experiments.length })}
               </h2>
               <div className="max-h-[340px] space-y-2 overflow-y-auto pr-1">
                 {result.experiments.map((r) => (
@@ -466,7 +489,6 @@ export function Dashboard() {
 
           {result && <Timeline experiments={result.experiments} />}
 
-          <CoverageMatrix enabled={backendOnline} />
           <ContradictionsPanel enabled={backendOnline} />
 
           {result && (

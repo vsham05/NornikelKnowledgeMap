@@ -47,6 +47,7 @@ export function parsedToStructured(parsed: ParsedQuery): StructuredFilters {
 export function structuredToBackend(sf: StructuredFilters) {
   return {
     material: sf.material,
+    material_class: sf.materialClass,
     process: sf.process,
     geography: sf.geography,
     year_from: sf.yearFrom,

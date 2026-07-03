@@ -39,7 +39,7 @@ Neo4j (graph) · Qdrant (vectors) · MinIO (files) · Ollama (LLM + embeddings)
 | Facility | `Facility` | Plant, laboratory + country |
 | Expert / Team | `Expert`, `Team` | Authors, competence holders |
 
-**Key relationships:** `USES_MATERIAL`, `USES_PROCESS`, `DESCRIBED_IN`, `MEASURED`, `AUTHORED`, `HAS_TOPIC`, `WORKS_AT`, `MENTIONS_EQUIPMENT`
+**Key relationships:** `MENTIONS_MATERIAL`, `USES_MATERIAL`, `USES_PROCESS`, `DESCRIBED_IN`, `MEASURED`, `AUTHORED`, `HAS_TOPIC`, `WORKS_AT`, `MENTIONS_EQUIPMENT`
 
 ## Hackathon features
 
@@ -48,7 +48,6 @@ Neo4j (graph) · Qdrant (vectors) · MinIO (files) · Ollama (LLM + embeddings)
 - **Provenance:** source excerpts [1][2], document type reliability, update metadata
 - **Gap analysis:** materials without experiments, missing properties
 - **Contradictions:** conflicting measurements for same material + property
-- **Coverage matrix:** material × property grid
 - **Graph visualization:** full knowledge map with filters
 - **Export:** Markdown report, JSON, JSON-LD (`/api/v1/graph/export/json-ld`)
 - **Multilingual:** Russian & English queries and documents

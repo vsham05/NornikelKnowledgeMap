@@ -4,6 +4,7 @@ from uuid import UUID
 from neo4j import AsyncGraphDatabase, GraphDatabase
 
 from domain.dto.material import MaterialDTO
+from domain.material_taxonomy import coerce_material_class, get_material_taxonomy
 from domain.dto.experiment import ExperimentDTO
 from domain.dto.document import DocumentDTO, DocumentChunkDTO
 from domain.enums import DOCUMENT_RELIABILITY, DocumentType
@@ -83,12 +84,15 @@ class GraphDB:
     
     def save_material(self, material: MaterialDTO):
         """Сохраняет материал с динамическими свойствами."""
+        taxonomy = get_material_taxonomy()
+        material_stage = taxonomy.get_stage(material.material_class).value
         with self.driver.session() as session:
             # Создаем узел Material
             session.run("""
                 MERGE (m:Material {id: $id})
                 SET m.name = $name,
                     m.material_class = $material_class,
+                    m.material_stage = $material_stage,
                     m.state = $state,
                     m.aliases = $aliases,
                     m.microstructure_features = $microstructure_features,
@@ -98,6 +102,7 @@ class GraphDB:
                 "id": str(material.id),
                 "name": material.name,
                 "material_class": material.material_class.value,
+                "material_stage": material_stage,
                 "state": material.state.value,
                 "aliases": material.aliases,
                 "microstructure_features": material.microstructure_features,
@@ -137,8 +142,22 @@ class GraphDB:
                 })
         
         logger.info(f"Saved material: {material.name} ({len(material.properties)} properties)")
-    
-    def save_experiment(self, experiment: ExperimentDTO):
+        if material.source_document_id:
+            self.link_document_material(
+                str(material.source_document_id),
+                str(material.id),
+            )
+
+    def link_document_material(self, document_id: str, material_id: str) -> None:
+        """Connect a material to its source publication (fixes orphan nodes in graph viz)."""
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (d:Document {id: $doc_id})
+                MATCH (m:Material {id: $mat_id})
+                MERGE (d)-[:MENTIONS_MATERIAL]->(m)
+            """, {"doc_id": document_id, "mat_id": material_id})
+
+    def save_experiment(self, experiment: ExperimentDTO) -> None:
         """Сохраняет эксперимент."""
         with self.driver.session() as session:
             # Создаем узел Experiment
@@ -315,12 +334,19 @@ class GraphDB:
                 """, {"eq_id": equipment_id, "proc_id": process_id})
 
     def save_facility(
-        self, facility_id: str, name: str, country: str | None, document_id: str
+        self,
+        facility_id: str,
+        name: str,
+        country: str | None,
+        document_id: str,
+        facility_type: str | None = None,
     ) -> None:
         with self.driver.session() as session:
             session.run("""
                 MERGE (f:Facility {id: $id})
-                SET f.name = $name, f.country = $country
+                SET f.name = $name,
+                    f.country = $country,
+                    f.facility_type = $facility_type
                 WITH f
                 MATCH (d:Document {id: $doc_id})
                 MERGE (d)-[:FROM_FACILITY]->(f)
@@ -328,6 +354,7 @@ class GraphDB:
                 "id": facility_id,
                 "name": name,
                 "country": country,
+                "facility_type": facility_type,
                 "doc_id": document_id,
             })
 
@@ -374,6 +401,22 @@ class GraphDB:
                 MATCH (p:Process {id: $proc_id})
                 MERGE (e)-[:USES_PROCESS]->(p)
             """, {"exp_id": experiment_id, "proc_id": process_id})
+
+    def link_material_process(self, material_id: str, process_id: str) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (m:Material {id: $mat_id})
+                MATCH (p:Process {id: $proc_id})
+                MERGE (m)-[:PROCESSED_IN]->(p)
+            """, {"mat_id": material_id, "proc_id": process_id})
+
+    def delete_document_material_process_links(self, document_id: str) -> None:
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (d:Document {id: $doc_id})-[:DESCRIBES_PROCESS]->(p:Process)
+                MATCH (m:Material)-[r:PROCESSED_IN]->(p)
+                DELETE r
+            """, {"doc_id": document_id})
     
     def save_document(self, document: DocumentDTO):
         """Сохраняет документ как узел в графе."""
@@ -383,6 +426,7 @@ class GraphDB:
                 SET d.title = $title,
                     d.document_type = $document_type,
                     d.authors = $authors,
+                    d.organizations = $organizations,
                     d.year = $year,
                     d.file_path = $file_path,
                     d.content_hash = $content_hash,
@@ -396,6 +440,7 @@ class GraphDB:
                 "title": document.title,
                 "document_type": document.document_type.value,
                 "authors": document.authors,
+                "organizations": document.organizations,
                 "year": document.year,
                 "file_path": document.file_path,
                 "content_hash": document.content_hash,
@@ -640,15 +685,52 @@ class GraphDB:
             """, {"limit": limit})
             return [dict(record) for record in result]
 
+    def delete_document_enrichment_people(self, document_id: str) -> None:
+        """Remove Team and Expert nodes linked to a document before re-enrichment."""
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (d:Document {id: $doc_id})
+                OPTIONAL MATCH (d)-[:AUTHORED_BY]->(x:Expert)
+                OPTIONAL MATCH (t:Team)-[:AUTHORED]->(d)
+                DETACH DELETE x, t
+            """, {"doc_id": document_id})
+
+    def delete_document_topics(self, document_id: str) -> None:
+        """Remove legacy topic tags (stored as RegimeParameter) for a document."""
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (d:Document {id: $doc_id})-[r:HAS_TOPIC]->(rp:RegimeParameter)
+                DELETE r
+                WITH DISTINCT rp
+                WHERE NOT (rp)--()
+                DETACH DELETE rp
+            """, {"doc_id": document_id})
+
     def document_has_entities(self, document_id: str) -> bool:
+        """True when document has enrichment links (process, expert, team, experiment)."""
         with self.driver.session() as session:
             record = session.run("""
                 MATCH (d:Document {id: $id})
-                OPTIONAL MATCH (m:Material {source_document_id: $id})
-                OPTIONAL MATCH (e:Experiment {document_id: $id})
-                RETURN count(m) + count(e) as c
+                OPTIONAL MATCH (d)-[:DESCRIBES_PROCESS]->(p)
+                OPTIONAL MATCH (d)-[:AUTHORED_BY]->(ex)
+                OPTIONAL MATCH (t:Team)-[:AUTHORED]->(d)
+                OPTIONAL MATCH (exp:Experiment)-[:DESCRIBED_IN]->(d)
+                RETURN (p IS NOT NULL OR ex IS NOT NULL OR t IS NOT NULL OR exp IS NOT NULL) AS enriched
             """, {"id": document_id}).single()
-            return bool(record and record["c"] > 0)
+            return bool(record and record["enriched"])
+
+    def backfill_material_document_links(self) -> int:
+        """Link existing materials to documents via source_document_id."""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (m:Material)
+                WHERE m.source_document_id IS NOT NULL
+                MATCH (d:Document {id: m.source_document_id})
+                MERGE (d)-[:MENTIONS_MATERIAL]->(m)
+                RETURN count(m) as linked
+            """)
+            record = result.single()
+            return int(record["linked"] or 0) if record else 0
 
     def load_document_dto(self, document_id: str) -> DocumentDTO | None:
         """Rebuild DocumentDTO from Neo4j for re-enrichment."""
@@ -694,6 +776,7 @@ class GraphDB:
                 title=node.get("title") or "Untitled",
                 document_type=dtype,
                 authors=node.get("authors") or [],
+                organizations=node.get("organizations") or [],
                 year=node.get("year"),
                 file_path=node.get("file_path") or "",
                 content_hash=node.get("content_hash"),
@@ -917,23 +1000,53 @@ class GraphDB:
             return {"nodes": nodes, "edges": edges}
     
     def get_full_graph(self, limit: int = 500) -> dict:
-        """Knowledge graph for visualization: documents, materials, experiments, modes, teams."""
+        """Document-centric knowledge graph for visualization (connected subgraph)."""
         labels = list(VISUAL_NODE_LABELS)
+        skip = list(SKIP_VISUAL_REL_TYPES)
+        doc_limit = max(10, min(40, limit // 12))
+
         with self.driver.session() as session:
             nodes_result = session.run(
                 """
-                MATCH (n)
-                WHERE any(l IN labels(n) WHERE l IN $labels)
-                RETURN n, labels(n)[0] AS label
-                LIMIT $limit
+                MATCH (d:Document)
+                WITH d ORDER BY coalesce(d.created_at, '') DESC, d.title
+                LIMIT $doc_limit
+
+                OPTIONAL MATCH (d)-[r1]-(n1)
+                WHERE NOT type(r1) IN $skip
+                  AND any(l IN labels(n1) WHERE l IN $labels)
+
+                OPTIONAL MATCH (n1)-[r2]-(n2)
+                WHERE NOT type(r2) IN $skip
+                  AND any(l IN labels(n2) WHERE l IN $labels)
+
+                OPTIONAL MATCH (e:Experiment)-[:DESCRIBED_IN]->(d)
+                OPTIONAL MATCH (e)-[:USES_MATERIAL]->(m:Material)
+                OPTIONAL MATCH (e)-[:MEASURED]->(p:Property)
+                OPTIONAL MATCH (e)-[:HAS_REGIME_PARAM]->(rp:RegimeParameter)
+                OPTIONAL MATCH (e)-[:USES_PROCESS]->(pr:Process)
+
+                WITH [x IN collect(DISTINCT d) + collect(DISTINCT n1) + collect(DISTINCT n2)
+                     + collect(DISTINCT e) + collect(DISTINCT m) + collect(DISTINCT p)
+                     + collect(DISTINCT rp) + collect(DISTINCT pr) WHERE x IS NOT NULL] AS raw_nodes
+                UNWIND raw_nodes AS node
+                WITH DISTINCT node
+                WHERE node IS NOT NULL
+                RETURN node, labels(node)[0] AS label
+                LIMIT $node_limit
                 """,
-                {"labels": labels, "limit": limit},
+                {
+                    "labels": labels,
+                    "skip": skip,
+                    "doc_limit": doc_limit,
+                    "node_limit": limit,
+                },
             )
 
             nodes = []
             node_ids: set[str] = set()
             for record in nodes_result:
-                node = record["n"]
+                node = record["node"]
                 node_id = self._visual_node_id(node)
                 if not node_id or node_id in node_ids:
                     continue
@@ -996,10 +1109,71 @@ class GraphDB:
             """, {"name": name, "limit": limit})
             return [dict(r) for r in result]
     
+    def list_material_dtos_for_document(self, document_id: str) -> list[MaterialDTO]:
+        """All materials mentioned by a document (for material–process linking)."""
+        from domain.enums import MaterialState
+
+        materials: list[MaterialDTO] = []
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (d:Document {id: $id})-[:MENTIONS_MATERIAL]->(m:Material)
+                RETURN m
+                ORDER BY toLower(m.name)
+            """, {"id": document_id})
+            for record in result:
+                node = dict(record["m"])
+                state_raw = node.get("state", "solid")
+                state = (
+                    MaterialState(state_raw)
+                    if state_raw in MaterialState._value2member_map_
+                    else MaterialState.SOLID
+                )
+                source_doc = node.get("source_document_id")
+                materials.append(MaterialDTO(
+                    id=UUID(node["id"]),
+                    name=node.get("name") or "Unknown",
+                    aliases=list(node.get("aliases") or []),
+                    material_class=coerce_material_class(
+                        node.get("material_class"),
+                        name=node.get("name") or "",
+                    ),
+                    state=state,
+                    properties={},
+                    source_document_id=UUID(source_doc) if source_doc else None,
+                ))
+        return materials
+
     def get_material_by_id(self, material_id: UUID) -> MaterialDTO | None:
-        """Получает MaterialDTO по ID."""
-        # TODO: Реализовать полную реконструкцию DTO из графа
-        return None
+        """Load a material node from Neo4j for merge during entity resolution."""
+        from domain.enums import MaterialState
+
+        with self.driver.session() as session:
+            record = session.run(
+                "MATCH (m:Material {id: $id}) RETURN m",
+                {"id": str(material_id)},
+            ).single()
+            if not record:
+                return None
+            node = dict(record["m"])
+            state_raw = node.get("state", "solid")
+            state = (
+                MaterialState(state_raw)
+                if state_raw in MaterialState._value2member_map_
+                else MaterialState.SOLID
+            )
+            source_doc = node.get("source_document_id")
+            return MaterialDTO(
+                id=UUID(node["id"]),
+                name=node.get("name") or "Unknown",
+                aliases=list(node.get("aliases") or []),
+                material_class=coerce_material_class(
+                    node.get("material_class"),
+                    name=node.get("name") or "",
+                ),
+                state=state,
+                properties={},
+                source_document_id=UUID(source_doc) if source_doc else None,
+            )
     
     def update_material(self, material: MaterialDTO):
         """Обновляет материал."""
@@ -1099,39 +1273,6 @@ class GraphDB:
         
         return gaps
     
-    def get_coverage_matrix(self) -> dict:
-        """Строит матрицу покрытия: материал × свойство."""
-        labels = self._get_graph_labels()
-        if "Material" not in labels:
-            return {"materials": [], "properties": []}
-
-        with self.driver.session() as session:
-            result = session.run("""
-                MATCH (m:Material)
-                OPTIONAL MATCH (m)-[:HAS_PROPERTY]->(p:Property)
-                WITH m, collect(DISTINCT p.canonical_name) as properties
-                RETURN m.name as material, m.id as id, properties
-                ORDER BY m.name
-                LIMIT 100
-            """)
-            
-            matrix = []
-            all_properties = set()
-            
-            for record in result:
-                props = record["properties"]
-                all_properties.update(props)
-                matrix.append({
-                    "material": record["material"],
-                    "material_id": record["id"],
-                    "properties": props
-                })
-            
-            return {
-                "materials": matrix,
-                "properties": sorted(all_properties)
-            }
-    
     def search_by_text(self, query: str, limit: int = 20) -> list[dict]:
         """Search nodes by string/list properties without coercing arrays via toString()."""
         terms = extract_search_terms(query, limit=12)
@@ -1202,6 +1343,7 @@ class GraphDB:
         self,
         *,
         material: str | None = None,
+        material_class: str | None = None,
         process: str | None = None,
         geography: str | None = None,
         year_from: int | None = None,
@@ -1221,6 +1363,11 @@ class GraphDB:
                 "OR any(a IN coalesce(m.aliases, []) WHERE toLower(a) CONTAINS toLower($material))"
             )
             params["material"] = material
+        if material_class:
+            taxonomy = get_material_taxonomy()
+            expanded = taxonomy.expand_classes(material_class)
+            where.append("m.material_class IN $material_classes")
+            params["material_classes"] = expanded
         if process:
             where.append(
                 "(toLower(coalesce(pr.name, '')) CONTAINS toLower($process) "

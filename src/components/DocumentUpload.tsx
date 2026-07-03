@@ -3,6 +3,7 @@
 import { useState, useRef, useCallback } from "react";
 import { Upload, Link2, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
 import { backendApi } from "@/lib/api/backend";
+import { useI18n } from "@/lib/i18n/I18nProvider";
 
 interface DocumentUploadProps {
   onIngestComplete?: () => void;
@@ -10,6 +11,7 @@ interface DocumentUploadProps {
 }
 
 export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadProps) {
+  const { t } = useI18n();
   const [url, setUrl] = useState("");
   const [uploading, setUploading] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
@@ -37,24 +39,24 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
           return;
         }
         if (task.status === "failed") {
-          throw new Error(task.error ?? "Ingestion failed");
+          throw new Error(task.error ?? t("upload.ingestFailed"));
         }
       }
-      throw new Error("Ingestion timed out");
+      throw new Error(t("upload.timedOut"));
     },
-    [onIngestComplete]
+    [onIngestComplete, t]
   );
 
   const handleFile = async (file: File) => {
     setUploading(true);
     setError(null);
-    setStatus("Uploading…");
+    setStatus(t("upload.uploading"));
     try {
       const task = await backendApi.ingestFile(file);
       setStatus(task.message);
       await pollTask(task.task_id);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Upload failed");
+      setError(e instanceof Error ? e.message : t("upload.uploadFailed"));
       setUploading(false);
     }
   };
@@ -63,26 +65,22 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
     if (!url.trim()) return;
     setUploading(true);
     setError(null);
-    setStatus("Fetching URL…");
+    setStatus(t("upload.fetchingUrl"));
     try {
       const task = await backendApi.ingestUrl(url.trim());
       await pollTask(task.task_id);
       setUrl("");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "URL ingest failed");
+      setError(e instanceof Error ? e.message : t("upload.urlFailed"));
       setUploading(false);
     }
   };
 
   return (
     <div className="rounded-xl border border-slate-700/50 bg-slate-900/40 p-4">
-      <p className="text-sm font-medium text-slate-300">Ingest documents</p>
-      <p className="mt-1 text-xs text-slate-500">
-        PDF/DOCX → MinIO · text → Qdrant · entities → Neo4j
-      </p>
-      <p className="mt-1 text-xs text-slate-600">
-        Paywalled journals (Nature, Springer, etc.) usually block URL ingest — upload the PDF instead.
-      </p>
+      <p className="text-sm font-medium text-slate-300">{t("upload.title")}</p>
+      <p className="mt-1 text-xs text-slate-500">{t("upload.subtitle")}</p>
+      <p className="mt-1 text-xs text-slate-600">{t("upload.paywallHint")}</p>
 
       <div className="mt-3 flex flex-wrap gap-2">
         <input
@@ -102,7 +100,7 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
           className="flex items-center gap-2 rounded-lg bg-cyan-600/20 px-3 py-2 text-xs text-cyan-300 hover:bg-cyan-600/30 disabled:opacity-50"
         >
           {uploading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}
-          Upload PDF/DOCX
+          {t("upload.uploadButton")}
         </button>
       </div>
 
@@ -111,7 +109,7 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
           type="url"
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://…"
+          placeholder={t("upload.urlPlaceholder")}
           disabled={disabled || uploading}
           className="flex-1 rounded-lg border border-slate-700 bg-slate-950/50 px-3 py-2 text-xs text-slate-200 placeholder:text-slate-600"
         />
@@ -122,7 +120,7 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
           className="flex items-center gap-1 rounded-lg border border-slate-600 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-50"
         >
           <Link2 className="h-3.5 w-3.5" />
-          URL
+          {t("upload.urlButton")}
         </button>
       </div>
 

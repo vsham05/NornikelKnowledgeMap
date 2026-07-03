@@ -60,6 +60,7 @@ export interface Material extends BaseEntity {
   type: "material";
   composition: string;
   category: string;
+  components?: string[];
 }
 
 export interface Property extends BaseEntity {
@@ -92,6 +93,12 @@ export interface Team extends BaseEntity {
   members: string[];
 }
 
+export interface Facility extends BaseEntity {
+  type: "facility";
+  country?: string;
+  facilityType?: string;
+}
+
 export interface Conclusion extends BaseEntity {
   type: "conclusion";
   summary: string;
@@ -112,6 +119,7 @@ export type Entity =
   | Setup
   | Equipment
   | Team
+  | Facility
   | Conclusion
   | Topic;
 
@@ -129,7 +137,8 @@ export interface GraphEdge {
     | "concludes"
     | "tagged"
     | "references"
-    | "employs";
+    | "employs"
+    | "processed_in";
 }
 
 export interface GraphNode {
@@ -138,6 +147,13 @@ export interface GraphNode {
   name: string;
   val: number;
   color: string;
+  /** Individual materials when this node is a merged blob */
+  components?: string[];
+  memberIds?: string[];
+  /** Team member names when type is team */
+  members?: string[];
+  country?: string;
+  facilityType?: string;
 }
 
 export interface SourceExcerpt {
@@ -181,6 +197,7 @@ export interface ParsedQuery {
 
 export interface StructuredFilters {
   material?: string;
+  materialClass?: string;
   process?: string;
   geography?: string;
   yearFrom?: number;
@@ -192,10 +209,10 @@ export interface StructuredFilters {
 
 export interface ExperimentResult {
   experiment: Experiment;
-  material: Material;
-  mode: Mode;
+  material?: Material;
+  mode?: Mode;
   properties: Property[];
-  team: Team;
+  team?: Team;
   conclusion?: Conclusion;
   relevance: number;
   effectSummary: string;

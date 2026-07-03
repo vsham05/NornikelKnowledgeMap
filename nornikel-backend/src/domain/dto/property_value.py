@@ -11,7 +11,7 @@ class PropertyValueDTO(BaseModel):
     model_config = {"frozen": True}
     
     # Значение может быть разным типом
-    value: float | int | str | bool | list[float] | dict[str, float]
+    value: float | int | str | bool | list[float] | dict[str, float | str]
     unit: str | None = Field(None, description="Единица измерения (МПа, %, °C, HV...)")
     
     # Для диапазонных значений (температура плавления 1600-1700°C)

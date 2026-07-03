@@ -1,5 +1,6 @@
 import type { BackendDocument } from "@/lib/api/backend";
-import type { Article, Entity, GraphNode } from "@/lib/types";
+import type { Article, Entity, GraphNode, Material, Team, Facility } from "@/lib/types";
+import { parseMaterialComponents } from "@/lib/materialComponents";
 
 function inferFormat(filePath: string): Article["format"] {
   const lower = filePath.toLowerCase();
@@ -10,6 +11,43 @@ function inferFormat(filePath: string): Article["format"] {
 }
 
 export function graphNodeToEntity(node: GraphNode): Entity {
+  if (node.type === "material") {
+    const components =
+      node.components?.length
+        ? node.components
+        : parseMaterialComponents(node.name);
+    return {
+      id: node.id,
+      type: "material",
+      name: node.name,
+      composition: "",
+      category: "",
+      components,
+    } satisfies Material;
+  }
+
+  if (node.type === "team") {
+    const members = node.members ?? [];
+    return {
+      id: node.id,
+      type: "team",
+      name: node.name,
+      lab: node.name,
+      lead: members[0] ?? "",
+      members,
+    } satisfies Team;
+  }
+
+  if (node.type === "facility") {
+    return {
+      id: node.id,
+      type: "facility",
+      name: node.name,
+      country: node.country,
+      facilityType: node.facilityType,
+    } satisfies Facility;
+  }
+
   return {
     id: node.id,
     type: node.type,
@@ -23,8 +61,6 @@ export function backendDocumentToArticle(
 ): Article {
   const filePath = doc.file_path || doc.canonical_source || "";
   const isUrl = filePath.startsWith("http");
-  const chunks = doc.chunks_count ?? 0;
-  const images = doc.images_count ?? 0;
 
   return {
     id: node.id,
@@ -33,13 +69,8 @@ export function backendDocumentToArticle(
     source: "internal",
     format: inferFormat(filePath),
     authors: doc.authors ?? [],
-    publishedAt: doc.year ? String(doc.year) : doc.created_at?.slice(0, 10) ?? "—",
-    textLayer:
-      chunks > 0
-        ? `Indexed document with ${chunks} text chunk${chunks === 1 ? "" : "s"}${
-            images > 0 ? ` and ${images} image${images === 1 ? "" : "s"}` : ""
-          }. Search the knowledge base to see relevant excerpts.`
-        : "Document indexed in the knowledge graph.",
+    publishedAt: doc.year ? String(doc.year) : doc.created_at?.slice(0, 10) ?? "",
+    textLayer: "",
     url: isUrl ? filePath : undefined,
     description: filePath || undefined,
   };

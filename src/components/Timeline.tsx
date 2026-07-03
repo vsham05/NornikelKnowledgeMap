@@ -1,11 +1,15 @@
+"use client";
+
 import type { ExperimentResult } from "@/lib/types";
 import { Calendar } from "lucide-react";
+import { useI18n } from "@/lib/i18n/I18nProvider";
 
 interface TimelineProps {
   experiments: ExperimentResult[];
 }
 
 export function Timeline({ experiments }: TimelineProps) {
+  const { t } = useI18n();
   const sorted = [...experiments].sort(
     (a, b) =>
       new Date(a.experiment.startedAt).getTime() -
@@ -18,7 +22,7 @@ export function Timeline({ experiments }: TimelineProps) {
     <div className="space-y-1">
       <div className="flex items-center gap-2 text-sm font-medium text-slate-300">
         <Calendar className="h-4 w-4 text-cyan-400" />
-        Research History
+        {t("timeline.title")}
       </div>
       <div className="relative ml-3 border-l border-slate-700 pl-5">
         {sorted.map((r, i) => (
@@ -40,11 +44,16 @@ export function Timeline({ experiments }: TimelineProps) {
             </div>
             <div className="text-sm font-medium text-slate-200">{r.experiment.name}</div>
             <div className="text-xs text-slate-400">
-              {r.material.name} / {r.mode.name}
+              {[r.material?.name, r.mode?.name].filter(Boolean).join(" / ") || null}
             </div>
             {i < sorted.length - 1 && (
               <div className="mt-1 text-[10px] text-slate-600">
-                {daysBetween(r.experiment.completedAt ?? r.experiment.startedAt, sorted[i + 1].experiment.startedAt)} days later
+                {t("timeline.daysLater", {
+                  days: daysBetween(
+                    r.experiment.completedAt ?? r.experiment.startedAt,
+                    sorted[i + 1].experiment.startedAt
+                  ),
+                })}
               </div>
             )}
           </div>

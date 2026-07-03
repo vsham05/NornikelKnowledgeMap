@@ -25,6 +25,10 @@ class DocumentDTO(BaseModel):
     title: str
     document_type: DocumentType
     authors: list[str] = Field(default_factory=list)
+    organizations: list[str] = Field(
+        default_factory=list,
+        description="Research institutes / companies from title page or metadata",
+    )
     year: int | None = None
     file_path: str = Field(..., description="Путь к файлу в хранилище")
     content_hash: str | None = Field(None, description="SHA-256 of normalized extracted text")

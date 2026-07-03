@@ -7,6 +7,7 @@ from fastapi import APIRouter, Query, HTTPException, Depends
 
 from api.deps import get_graph_db, get_ingestion_pipeline
 from domain.dto.query import StructuredFiltersDTO
+from domain.material_taxonomy import get_material_taxonomy
 from ingestion.pipeline import IngestionPipeline
 from storage.graph_db import GraphDB
 logger = logging.getLogger(__name__)
@@ -32,10 +33,21 @@ async def enrich_all_documents(
     pipeline: IngestionPipeline = Depends(get_ingestion_pipeline),
 ):
     """
-    Backfill Materials, Experiments, Modes (topics), and Teams
+    Backfill Materials, Experiments, Processes, and Teams
     for documents that were ingested without graph entities.
     """
     return await pipeline.enrich_all_documents()
+
+
+@router.post("/backfill-material-process-links")
+async def backfill_material_process_links(
+    document_id: str | None = Query(
+        None, description="Single document id; omit to backfill all documents"
+    ),
+    pipeline: IngestionPipeline = Depends(get_ingestion_pipeline),
+):
+    """Rebuild Material -> Process links from graph data (no LLM)."""
+    return pipeline.backfill_material_process_links(document_id)
 
 
 @router.get("/explore")
@@ -55,6 +67,25 @@ async def explore_graph(
     return graph_db.get_full_graph(limit=limit)
 
 
+@router.get("/material-classes")
+async def list_material_classes():
+    """Process-material taxonomy for UI filters and extraction prompts."""
+    taxonomy = get_material_taxonomy()
+    classes = []
+    for cls in taxonomy.all_classes():
+        schema = taxonomy.get_schema(cls)
+        classes.append({
+            "id": cls.value,
+            "label": schema.label if schema else cls.value,
+            "stage": taxonomy.get_stage(cls).value,
+            "description": schema.description if schema else "",
+        })
+    return {
+        "taxonomy_version": taxonomy._ontology.material_taxonomy_meta.get("version", "1.0"),
+        "classes": classes,
+    }
+
+
 @router.post("/query")
 async def structured_graph_query(
     filters: StructuredFiltersDTO,
@@ -71,6 +102,7 @@ async def structured_graph_query(
 @router.get("/query")
 async def structured_graph_query_get(
     material: str | None = None,
+    material_class: str | None = None,
     process: str | None = None,
     geography: str | None = None,
     year_from: int | None = Query(None, ge=1900),
@@ -84,6 +116,7 @@ async def structured_graph_query_get(
     """GET variant for structured graph queries."""
     return graph_db.structured_search(
         material=material,
+        material_class=material_class,
         process=process,
         geography=geography,
         year_from=year_from,
@@ -275,17 +308,6 @@ async def get_data_gaps(graph_db: GraphDB = Depends(get_graph_db)):
             "experiments_without_measurements": len([g for g in gaps if g["gap_type"] == "no_measured_properties"])
         }
     }
-
-
-@router.get("/analytics/coverage-matrix")
-async def get_coverage_matrix(graph_db: GraphDB = Depends(get_graph_db)):
-    """
-    Матрица покрытия: материал × свойство.
-    
-    Показывает, какие свойства измерены для каких материалов.
-    Пустые ячейки = пробелы в данных.
-    """
-    return graph_db.get_coverage_matrix()
 
 
 # ================== Properties ==================

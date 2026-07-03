@@ -1,6 +1,9 @@
+"use client";
+
 import type { ExperimentResult } from "@/lib/types";
 import { FlaskConical, Users, ArrowRight, CheckCircle2, Clock, CircleDashed } from "lucide-react";
 import clsx from "clsx";
+import { useI18n } from "@/lib/i18n/I18nProvider";
 
 const STATUS_ICON = {
   completed: CheckCircle2,
@@ -28,6 +31,7 @@ interface ExperimentCardProps {
 }
 
 export function ExperimentCard({ result, selected, onClick }: ExperimentCardProps) {
+  const { t } = useI18n();
   const { experiment, material, mode, team, conclusion, relevance, effectSummary } = result;
   const StatusIcon = STATUS_ICON[experiment.status];
 
@@ -52,19 +56,23 @@ export function ExperimentCard({ result, selected, onClick }: ExperimentCardProp
         </div>
         <div className="flex flex-col items-end gap-1">
           <span className="rounded-full bg-slate-800 px-2 py-0.5 text-xs text-cyan-400">
-            {relevance}% match
+            {t("experiments.match", { pct: relevance })}
           </span>
           <StatusIcon className={clsx("h-4 w-4", STATUS_COLOR[experiment.status])} />
         </div>
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-        <span className="rounded-md bg-pink-500/10 px-2 py-0.5 text-pink-300">{material.name}</span>
-        <ArrowRight className="h-3 w-3" />
-        <span className="rounded-md bg-violet-500/10 px-2 py-0.5 text-violet-300">{mode.name}</span>
+        {material && (
+          <span className="rounded-md bg-pink-500/10 px-2 py-0.5 text-pink-300">{material.name}</span>
+        )}
+        {material && mode && <ArrowRight className="h-3 w-3" />}
+        {mode && (
+          <span className="rounded-md bg-violet-500/10 px-2 py-0.5 text-violet-300">{mode.name}</span>
+        )}
       </div>
 
-      <p className="mt-3 text-sm text-slate-300">{effectSummary}</p>
+      {effectSummary ? <p className="mt-3 text-sm text-slate-300">{effectSummary}</p> : null}
 
       {conclusion && (
         <div className="mt-3 flex items-start gap-2 rounded-lg bg-slate-800/50 p-2">
@@ -74,18 +82,26 @@ export function ExperimentCard({ result, selected, onClick }: ExperimentCardProp
               EFFECT_BADGE[conclusion.effect]
             )}
           >
-            {conclusion.effect}
+            {t(`effect.${conclusion.effect}`)}
           </span>
           <p className="text-xs text-slate-400 line-clamp-2">{conclusion.summary}</p>
         </div>
       )}
 
-      <div className="mt-3 flex items-center gap-1 text-xs text-slate-500">
-        <Users className="h-3 w-3" />
-        {team.name}
-        <span className="mx-1">·</span>
-        {experiment.completedAt ?? experiment.startedAt}
-      </div>
+      {(team?.name || experiment.completedAt || experiment.startedAt) && (
+        <div className="mt-3 flex items-center gap-1 text-xs text-slate-500">
+          {team?.name && (
+            <>
+              <Users className="h-3 w-3" />
+              {team.name}
+            </>
+          )}
+          {team?.name && (experiment.completedAt ?? experiment.startedAt) && (
+            <span className="mx-1">·</span>
+          )}
+          {experiment.completedAt ?? experiment.startedAt}
+        </div>
+      )}
     </button>
   );
 }

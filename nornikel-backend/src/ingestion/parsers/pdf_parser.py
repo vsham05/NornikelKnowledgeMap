@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -8,11 +9,16 @@ from domain.dto.document import DocumentDTO, DocumentChunkDTO
 from domain.dto.image import ImageDTO
 from domain.enums import DocumentType, ImageType
 
+from ingestion.parsers.title_slide_extract import (
+    extract_authors_from_text,
+    extract_organizations_from_text,
+    merge_unique_names,
+)
+
 logger = logging.getLogger(__name__)
 
 
 class PDFParser:
-    """Парсер PDF документов с извлечением текста и изображений."""
     
     def parse(self, file_path: Path) -> DocumentDTO:
         """Парсит PDF файл."""
@@ -23,7 +29,8 @@ class PDFParser:
         # Метаданные
         metadata = doc.metadata
         title = metadata.get("title", file_path.stem)
-        authors = [metadata.get("author", "")] if metadata.get("author") else []
+        authors = self._extract_authors(metadata, doc)
+        organizations = self._extract_organizations(metadata, doc)
         year = self._extract_year(metadata)
         
         # Извлекаем текст постранично
@@ -84,6 +91,7 @@ class PDFParser:
             title=title,
             document_type=DocumentType.ARTICLE,
             authors=authors,
+            organizations=organizations,
             year=year,
             file_path=str(file_path),
             chunks=chunks,
@@ -96,9 +104,58 @@ class PDFParser:
         for image in images:
             image.document_id = document.id
         
-        logger.info(f"Parsed: {len(chunks)} chunks, {len(images)} images")
+        logger.info(
+            "Parsed: %s chunks, %s images, %s author(s), %s org(s)",
+            len(chunks),
+            len(images),
+            len(authors),
+            len(organizations),
+        )
         return document
-    
+
+    def _intro_text(self, doc: fitz.Document, max_pages: int = 4, max_chars: int = 12_000) -> str:
+        parts: list[str] = []
+        total = 0
+        for page_num in range(min(doc.page_count, max_pages)):
+            piece = (doc[page_num].get_text("text") or "").strip()
+            if not piece:
+                continue
+            parts.append(piece)
+            total += len(piece)
+            if total >= max_chars:
+                break
+        return "\n\n".join(parts)[:max_chars]
+
+    def _extract_authors(self, metadata: dict, doc: fitz.Document) -> list[str]:
+        """Collect author names from PDF metadata and opening slides."""
+        authors: list[str] = []
+
+        author_raw = metadata.get("author") or metadata.get("authors") or ""
+        if isinstance(author_raw, str) and author_raw.strip():
+            authors = merge_unique_names([], extract_authors_from_text(author_raw, 500))
+
+        intro = self._intro_text(doc)
+        if intro:
+            authors = merge_unique_names(authors, extract_authors_from_text(intro, 12_000))
+
+        return authors[:20]
+
+    def _extract_organizations(self, metadata: dict, doc: fitz.Document) -> list[str]:
+        """Collect institute / company names from PDF metadata and opening slides."""
+        orgs: list[str] = []
+        meta_bits = " ".join(
+            str(metadata.get(k) or "")
+            for k in ("subject", "keywords", "producer", "creator", "title")
+        )
+        if meta_bits.strip():
+            orgs = merge_unique_names([], extract_organizations_from_text(meta_bits, 2000))
+
+        intro = self._intro_text(doc)
+        if intro:
+            orgs = merge_unique_names(orgs, extract_organizations_from_text(intro, 12_000))
+
+        return orgs[:5]
+
     def _extract_year(self, metadata: dict) -> int | None:
         """Извлекает год из метаданных."""
         creation_date = metadata.get("creationDate", "")

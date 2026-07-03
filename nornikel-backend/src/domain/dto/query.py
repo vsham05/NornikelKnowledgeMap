@@ -11,6 +11,10 @@ class DocumentCandidateDTO(BaseModel):
 class StructuredFiltersDTO(BaseModel):
     """Multi-parameter filters for mining/metallurgy R&D queries."""
     material: str | None = Field(None, description="Material or substance name")
+    material_class: str | None = Field(
+        None,
+        description="Process-material class: ore, concentrate, intermediate, metal, alloy, solution, …",
+    )
     process: str | None = Field(None, description="Process: leaching, electrowinning, …")
     geography: str | None = Field(
         None, description="domestic | international | country name (Russia, CN, …)"

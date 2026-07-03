@@ -2,11 +2,32 @@ from enum import Enum
 
 
 class MaterialClass(str, Enum):
-    """Класс материала."""
+    """
+    Process-material class along the mining → metallurgy value chain.
+    Aligned with ISO TC 102/183 (ores & concentrates) and PMDco material entity types.
+    """
+    ORE = "ore"
+    MINERAL = "mineral"
+    CONCENTRATE = "concentrate"
+    INTERMEDIATE = "intermediate"
+    METAL = "metal"
     ALLOY = "alloy"
+    SOLUTION = "solution"
+    REAGENT = "reagent"
+    COMPOUND = "compound"
+    COMPOSITE = "composite"
     CERAMIC = "ceramic"
     POLYMER = "polymer"
-    COMPOSITE = "composite"
+    OTHER = "other"
+
+
+class MaterialProcessStage(str, Enum):
+    """Where the material sits in the process chain (derived from material_class)."""
+    FEEDSTOCK = "feedstock"
+    BENEFICIATION = "beneficiation"
+    PROCESSING = "processing"
+    PRODUCT = "product"
+    ENGINEERING = "engineering"
     OTHER = "other"
 
 

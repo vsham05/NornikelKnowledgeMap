@@ -1,4 +1,5 @@
 import type { EntityType } from "./types";
+import { translate, type Locale } from "./i18n/translations";
 
 const ENTITY_COLORS: Record<EntityType, string> = {
   article: "#60a5fa",
@@ -20,7 +21,10 @@ export function getEntityColor(type: EntityType): string {
   return ENTITY_COLORS[type];
 }
 
-export function getEntityLabel(type: EntityType): string {
+export function getEntityLabel(type: EntityType, locale?: Locale): string {
+  if (locale) {
+    return translate(locale, `entity.${type}`);
+  }
   const labels: Record<EntityType, string> = {
     article: "Document",
     experiment: "Experiment",
@@ -37,4 +41,33 @@ export function getEntityLabel(type: EntityType): string {
     expert: "Expert",
   };
   return labels[type];
+}
+
+/** Visual radius multiplier — keep in sync with GraphView nodeRadius. */
+export const NODE_RADIUS_SCALE = 5;
+
+/** Minimum gap between node circles (layout + collision). */
+export const NODE_GAP_PX = 22;
+
+export function graphNodeRadius(val: number = 4): number {
+  return Math.sqrt(val) * NODE_RADIUS_SCALE;
+}
+
+/** d3-force collide radius (half-gap + node radius). */
+export function graphCollisionRadius(val: number = 4): number {
+  return graphNodeRadius(val) + NODE_GAP_PX / 2;
+}
+
+/** Minimum center-to-center distance for two nodes with the same val. */
+export function minNodeCenterDistance(val: number = 4): number {
+  return 2 * graphNodeRadius(val) + NODE_GAP_PX;
+}
+
+/** Ring radius so `count` nodes sit at least minNodeCenterDistance apart on the arc. */
+export function ringRadiusForCount(count: number, val: number = 4): number {
+  if (count <= 1) return minNodeCenterDistance(val) * 1.2;
+  return Math.max(
+    minNodeCenterDistance(val) * 1.2,
+    (count * minNodeCenterDistance(val)) / (2 * Math.PI)
+  );
 }

@@ -177,6 +177,7 @@ export interface BackendContradiction {
 
 export interface StructuredFiltersPayload {
   material?: string;
+  material_class?: string;
   process?: string;
   geography?: string;
   year_from?: number;
@@ -237,12 +238,6 @@ export const backendApi = {
     backendFetch<{ gaps: BackendGap[]; count: number }>(
       "/api/v1/graph/analytics/gaps"
     ),
-
-  coverageMatrix: () =>
-    backendFetch<{
-      materials: Array<{ material: string; properties: string[] }>;
-      properties: string[];
-    }>("/api/v1/graph/analytics/coverage-matrix"),
 
   contradictions: () =>
     backendFetch<{ contradictions: BackendContradiction[]; count: number }>(
