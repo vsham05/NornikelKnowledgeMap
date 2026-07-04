@@ -39,14 +39,25 @@ _GENERAL_ORG_HINTS = (
 _LATIN_PERSON = re.compile(
     r"^[A-Z][a-zA-Z\-']+(?:\s+[A-Z]\.){0,2}\s+[A-Z][a-zA-Z\-']+$"
 )
-# Cyrillic: Д. В. Ляпинов, Ляпинов Дмитрий Васильевич
+# Cyrillic: Д. В. Ляпинов, Ляпинов Дмитрий Васильевич, Иванов И. О.
 _CYRILLIC_PERSON = re.compile(
     r"^(?:"
     r"[А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+){1,3}"
     r"|[А-ЯЁ]\.\s*[А-ЯЁ]\.\s*[А-ЯЁ][а-яё\-]+"
+    r"|[А-ЯЁ][а-яё\-]+\s+[А-ЯЁ]\.\s*(?:[А-ЯЁ]\.\s*)?"
     r")$",
     re.UNICODE,
 )
+
+_ROLE_WORDS = (
+    "researcher", "scientist", "engineer", "manager", "director", "specialist",
+    "consultant", "professor", "associate", "assistant", "coordinator",
+    "исследователь", "инженер", "менеджер", "директор", "специалист",
+    "консультант", "профессор", "ассистент", "руководитель", "эксперт",
+    "senior", "junior", "lead", "head", "chief", "principal",
+)
+
+_PERSON_DELIMITERS = re.compile(r"[;,/]|(?:\s+and\s+)|(?:\s+и\s+)|\s{2,}", re.IGNORECASE)
 
 # Numbered roster lines: "1. Ivanov Ivan Ivanovich – senior researcher"
 _EXPERT_LIST_ITEM = re.compile(
@@ -55,6 +66,30 @@ _EXPERT_LIST_ITEM = re.compile(
     r"[А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+){1,3}"
     r"|[A-Z][a-zA-Z\-']+(?:\s+[A-Z]\.){0,2}\s+[A-Z][a-zA-Z\-']+"
     r")\s*[–\-—]",
+    re.UNICODE,
+)
+
+# Require an explicit roster heading — not bare "expert" inside body text ("expertise", etc.)
+_EXPERT_SECTION_HEADING = re.compile(
+    r"(?:^|\n)\s*(?:"
+    r"Experts?(?:\s+of\s+the\s+project)?"
+    r"|Эксперты?(?:\s+проекта)?"
+    r"|Список\s+экспертов"
+    r"|Project\s+team"
+    r"|Team\s+members?"
+    r"|Команда(?:\s+проекта)?"
+    r"|Участники(?:\s+проекта)?"
+    r")\s*[:：]?\s*(?:\n|$)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Numbered roster without role dash: "1. Ivanov Ivan Ivanovich"
+_NUMBERED_PERSON_LINE = re.compile(
+    r"(?m)^\s*\d+\.\s*"
+    r"("
+    r"[А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+){1,3}"
+    r"|[A-Z][a-zA-Z\-']+(?:\s+[A-Z]\.){0,2}\s+[A-Z][a-zA-Z\-']+"
+    r")\s*$",
     re.UNICODE,
 )
 
@@ -67,6 +102,9 @@ _ORG_LINE = re.compile(
     r")",
     re.IGNORECASE | re.UNICODE,
 )
+
+
+from ingestion.nlp.extraction_validate import contains_domain_entity_term, looks_like_section_heading
 
 
 def _clean(text: str) -> str:
@@ -89,6 +127,26 @@ def _has_non_name_noise(text: str) -> bool:
     return False
 
 
+def looks_like_job_title(name: str) -> bool:
+    """Reject role labels mis-tagged as person names."""
+    lower = (name or "").lower()
+    tokens = re.sub(r"[^\w\s]", " ", lower).split()
+    if not tokens:
+        return False
+    role_hits = sum(1 for t in tokens if t in _ROLE_WORDS)
+    return role_hits >= 1 and role_hits >= len(tokens) - 1
+
+
+def split_person_name_line(line: str) -> list[str]:
+    """Split author metadata lines into individual name candidates."""
+    out: list[str] = []
+    for part in _PERSON_DELIMITERS.split(line or ""):
+        cleaned = _clean(part)
+        if cleaned:
+            out.append(cleaned)
+    return out
+
+
 def looks_like_person_name(name: str) -> bool:
     """Name-shaped token suitable for provenance hints (not LLM classification)."""
     cleaned = _clean(name)
@@ -100,7 +158,75 @@ def looks_like_person_name(name: str) -> bool:
         return False
     if _ORG_LINE.search(cleaned):
         return False
+    if contains_domain_entity_term(cleaned):
+        return False
+    if looks_like_job_title(cleaned):
+        return False
     return bool(_LATIN_PERSON.match(cleaned) or _CYRILLIC_PERSON.match(cleaned))
+
+
+_AUTHOR_INITIALS_LATIN = re.compile(
+    r"^[A-Z]\.\s*(?:[A-Z]\.\s*)?[A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']+)?$"
+)
+_LAST_COMMA_FIRST = re.compile(
+    r"^[A-Z][a-zA-Z\-']+,\s+[A-Z][a-zA-Z\-'.]+(?:\s+[A-Z][a-zA-Z\-'.]+)?$"
+)
+_PAGE_HEADER_SKIP = re.compile(
+    r"^(?:abstract|introduction|references|figure|table|page\s+\d+|страница\s+\d+|\d+\s*$|"
+    r"contents|appendix|overview|summary|discussion|conclusion|acknowledgement)",
+    re.IGNORECASE,
+)
+_AUTHOR_LINE_HINT = re.compile(
+    r"\b(?:and|&|и)\b|,"
+)
+
+
+def normalize_person_name(name: str) -> str:
+    """Normalize 'Last, First M.' → 'First M. Last' for downstream matching."""
+    cleaned = _clean(name)
+    if _LAST_COMMA_FIRST.match(cleaned):
+        last, rest = cleaned.split(",", 1)
+        parts = rest.strip().split()
+        if parts:
+            return _clean(f"{' '.join(parts)} {last.strip()}")
+    return cleaned
+
+
+def looks_like_author_name(name: str) -> bool:
+    """Person name incl. academic initials (D. V. Surname) for author/expert lists."""
+    cleaned = normalize_person_name(name)
+    if looks_like_section_heading(cleaned):
+        return False
+    if looks_like_person_name(cleaned):
+        return True
+    if not cleaned or len(cleaned) < 4 or len(cleaned) > 80:
+        return False
+    if _has_non_name_noise(cleaned):
+        return False
+    if _contains_marker(cleaned, _GENERAL_ORG_HINTS):
+        return False
+    if _ORG_LINE.search(cleaned):
+        return False
+    if looks_like_job_title(cleaned):
+        return False
+    return bool(_AUTHOR_INITIALS_LATIN.match(cleaned) or _CYRILLIC_PERSON.match(cleaned))
+
+
+def looks_like_affiliation_name(name: str) -> bool:
+    """Institute / university labels mis-tagged as people."""
+    cleaned = _clean(name)
+    if not cleaned:
+        return False
+    if looks_like_organization_name(cleaned):
+        return True
+    lower = cleaned.lower()
+    return any(
+        hint in lower
+        for hint in (
+            "institute", "university", "laboratory", "department",
+            "институт", "университет", "лаборатор",
+        )
+    )
 
 
 def looks_like_organization_name(name: str) -> bool:
@@ -116,8 +242,7 @@ def looks_like_organization_name(name: str) -> bool:
         return True
     if _contains_marker(cleaned, _GENERAL_ORG_HINTS):
         return True
-    # Multi-word phrase that is not person-shaped
-    return len(cleaned.split()) >= 2 and len(cleaned) >= 8
+    return False
 
 
 def _normalize_org_name(name: str) -> str:
@@ -128,15 +253,20 @@ def _normalize_org_name(name: str) -> str:
     return cleaned
 
 
-def extract_listed_experts_from_text(text: str, limit: int = 12_000) -> list[str]:
+def extract_listed_experts_from_text(text: str, limit: int = 200_000) -> list[str]:
     """Parse numbered expert rosters after an Experts / Эксперты heading."""
-    sample = re.sub(r"\s+", " ", (text or "")[:limit])
+    sample = (text or "")[:limit]
+    heading = _EXPERT_SECTION_HEADING.search(sample)
+    if not heading:
+        return []
+
+    window = sample[heading.end() : heading.end() + 8_000]
     seen: set[str] = set()
     experts: list[str] = []
 
     def add(name: str) -> None:
-        cleaned = _clean(name)
-        if not looks_like_person_name(cleaned):
+        cleaned = normalize_person_name(name)
+        if not looks_like_author_name(cleaned):
             return
         key = cleaned.lower()
         if key in seen:
@@ -144,27 +274,102 @@ def extract_listed_experts_from_text(text: str, limit: int = 12_000) -> list[str
         seen.add(key)
         experts.append(cleaned)
 
-    lower = sample.lower()
-    start = lower.find("эксперт")
-    if start < 0:
-        start = lower.find("expert")
-    window = sample[start:] if start >= 0 else sample
-
     for match in _EXPERT_LIST_ITEM.finditer(window):
         add(match.group(1))
 
-    return experts[:25]
+    for match in _NUMBERED_PERSON_LINE.finditer(window):
+        add(match.group(1))
+
+    return experts[:80]
+
+
+def extract_authors_from_page_header(text: str, *, header_chars: int = 1_400) -> list[str]:
+    """Pull author names from the top of a proceedings / paper page."""
+    sample = (text or "")[:header_chars]
+    if not sample.strip():
+        return []
+
+    seen: set[str] = set()
+    authors: list[str] = []
+
+    def add(name: str) -> None:
+        cleaned = normalize_person_name(name)
+        if not looks_like_author_name(cleaned):
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        authors.append(cleaned)
+
+    for pattern in (
+        r"(?:Authors?|Author|By|Докладчик(?:и)?|Presenter(?:s)?)\s*:?\s*([^\n]+)",
+        r"(?:Авторы?)\s*:?\s*([^\n]+)",
+    ):
+        for match in re.finditer(pattern, sample, re.IGNORECASE | re.UNICODE):
+            for part in split_person_name_line(match.group(1)):
+                add(part)
+
+    lines = [ln.strip() for ln in sample.splitlines() if ln.strip()]
+    for i, line in enumerate(lines[:8]):
+        if len(line) > 100 or _PAGE_HEADER_SKIP.match(line):
+            continue
+        if looks_like_section_heading(line):
+            continue
+        if line.isupper() and len(line.split()) >= 3:
+            continue
+        if re.search(r"\d{4}", line) and len(line) < 50:
+            continue
+        # Single author line followed by affiliation (common in proceedings)
+        if 2 <= len(line.split()) <= 4 and looks_like_author_name(line):
+            next_line = lines[i + 1] if i + 1 < len(lines) else ""
+            if looks_like_affiliation_name(next_line) or looks_like_organization_name(next_line):
+                add(line)
+                continue
+        # Author lists with commas / "and"
+        if not _AUTHOR_LINE_HINT.search(line):
+            continue
+        for part in split_person_name_line(line):
+            add(part)
+
+    return authors[:6]
+
+
+def extract_authors_from_document_chunks(
+    chunks: list,
+    *,
+    header_chars: int = 1_400,
+    max_authors: int = 80,
+    max_chunks: int | None = None,
+) -> list[str]:
+    """Harvest paper authors from per-page headers (conference proceedings)."""
+    seen: set[str] = set()
+    authors: list[str] = []
+    scan = chunks[:max_chunks] if max_chunks is not None else chunks
+
+    for chunk in scan:
+        text = getattr(chunk, "text", None) or (chunk if isinstance(chunk, str) else "")
+        for name in extract_authors_from_page_header(str(text), header_chars=header_chars):
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            authors.append(name)
+            if max_authors > 0 and len(authors) >= max_authors:
+                return authors
+
+    return authors
 
 
 def extract_authors_from_text(text: str, limit: int = 4000) -> list[str]:
-    """Pull names from labeled author fields and structured expert rosters only."""
+    """Pull names from labeled author fields, bare metadata, and expert rosters."""
     seen: set[str] = set()
     authors: list[str] = []
     sample = (text or "")[:limit]
 
     def add(name: str) -> None:
-        cleaned = _clean(name)
-        if not looks_like_person_name(cleaned):
+        cleaned = normalize_person_name(name)
+        if not looks_like_author_name(cleaned):
             return
         key = cleaned.lower()
         if key in seen:
@@ -177,13 +382,18 @@ def extract_authors_from_text(text: str, limit: int = 4000) -> list[str]:
         r"(?:Подготовил[аи]?|Prepared by)\s*:?\s*([^\n]+)",
     ):
         for match in re.finditer(pattern, sample, re.IGNORECASE):
-            for part in re.split(r"[;,/]|(?:\s+and\s+)|\s{2,}", match.group(1)):
+            for part in split_person_name_line(match.group(1)):
                 add(part)
+
+    # Bare metadata author line without "Authors:" label
+    if not authors and sample.strip() and len(sample) < 400:
+        for part in split_person_name_line(sample):
+            add(part)
 
     for name in extract_listed_experts_from_text(text, limit):
         add(name)
 
-    return authors[:20]
+    return authors[:80]
 
 
 def extract_organizations_from_text(text: str, limit: int = 4000) -> list[str]:

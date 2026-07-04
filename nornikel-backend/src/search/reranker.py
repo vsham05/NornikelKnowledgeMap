@@ -84,7 +84,7 @@ def rerank_chunks(
     idf = _idf_weights(terms, corpus)
 
     if model is not None:
-        pairs = [(query, chunk.text[:512]) for chunk in chunks]
+        pairs = [(query, chunk.text[:1024]) for chunk in chunks]
         try:
             ce_scores = model.predict(pairs)
             for chunk, ce_score in zip(chunks, ce_scores):

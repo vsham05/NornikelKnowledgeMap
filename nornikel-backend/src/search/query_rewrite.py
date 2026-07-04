@@ -6,22 +6,27 @@ import logging
 import re
 from dataclasses import dataclass
 
-from search.query_processing import keyword_search_string, significant_terms
+from search.query_processing import (
+    extract_numeric_anchors,
+    extract_search_terms,
+    keyword_search_string,
+    significant_terms,
+)
 
 logger = logging.getLogger(__name__)
 
-REWRITE_SYSTEM = """You help search a scientific document knowledge base (Russian and English articles).
-Given a user question, produce search terms that will retrieve the most relevant passages.
+REWRITE_SYSTEM = """You help search a scientific/mining/metallurgy document knowledge base (Russian and English).
+Given a user question, produce search terms that will retrieve passages with NUMERIC data.
 
 Reply with JSON only:
 {"search_query": "one concise sentence for semantic search", "keywords": ["term1", "term2"]}
 
 Rules:
-- search_query: rephrase the information need clearly (include entities, years, topics).
-- keywords: 4-10 important words/phrases (nouns, names, years, technical terms) in the question's language.
+- search_query: rephrase the information need clearly (processes, materials, geography, years).
+- keywords: 6-12 important words/phrases — include ALL numbers, units (мг/л, %, м/ч), chemical symbols (Ca, Mg, Ni, Au), and technical terms from the question.
 - Keep Russian keywords in Cyrillic; English in Latin script.
 - Do not answer the question — only optimize retrieval.
-- Preserve years and named entities exactly."""
+- Preserve numeric thresholds and ranges exactly (e.g. 200–300 мг/л, ≤1000 мг/дм³)."""
 
 _JSON_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 
@@ -33,15 +38,29 @@ class RewrittenQuery:
     keywords: tuple[str, ...]
 
 
+def should_skip_llm_rewrite(question: str) -> bool:
+    """Long technical questions already carry enough terms — skip rewrite for speed."""
+    q = question.strip()
+    if len(q) < 70:
+        return False
+    terms = significant_terms(q)
+    if re.search(r"\d", q) and len(terms) >= 6:
+        return True
+    return len(terms) >= 10
+
+
 def _heuristic_rewrite(question: str) -> RewrittenQuery:
-    terms = significant_terms(question)
+    terms = extract_search_terms(question, limit=14)
+    anchors = extract_numeric_anchors(question)
+    extra = [a for a in anchors if a.lower() not in {t.lower() for t in terms}]
+    keywords = tuple((terms + extra)[:12])
     search = question.strip()
-    if terms:
-        search = f"{question.strip()} — focus on: {', '.join(terms[:8])}"
+    if keywords:
+        search = f"{question.strip()} — ключевые термины: {', '.join(keywords[:10])}"
     return RewrittenQuery(
         original=question.strip(),
         search_query=search,
-        keywords=tuple(terms[:10]),
+        keywords=keywords or tuple(terms[:10]),
     )
 
 
@@ -76,6 +95,10 @@ async def rewrite_query_for_retrieval(llm_client, question: str) -> RewrittenQue
     question = (question or "").strip()
     if not question:
         return _heuristic_rewrite("")
+
+    if should_skip_llm_rewrite(question):
+        logger.info("Query rewrite: heuristic (long technical question)")
+        return _heuristic_rewrite(question)
 
     try:
         raw = await llm_client.chat(

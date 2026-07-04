@@ -1,39 +1,80 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo, type Dispatch, type SetStateAction } from "react";
+import dynamic from "next/dynamic";
 import { SearchBar } from "@/components/SearchBar";
-import { GraphView } from "@/components/GraphView";
 import { ExperimentCard } from "@/components/ExperimentCard";
-import { GapAnalysis } from "@/components/GapAnalysis";
 import { Timeline } from "@/components/Timeline";
 import { EntityPanel } from "@/components/EntityPanel";
 import { StatsBar } from "@/components/StatsBar";
 import { DocumentUpload } from "@/components/DocumentUpload";
 import { DocumentFilter, type DocumentOption } from "@/components/DocumentFilter";
 import { SourceExcerpts } from "@/components/SourceExcerpts";
-import { checkBackendHealth, backendApi } from "@/lib/api/backend";
+import { checkBackendHealth, backendApi, GRAPH_OVERVIEW_LIMIT, GRAPH_TYPE_PAGE_LIMIT } from "@/lib/api/backend";
 import { backendSearch, backendGraphToFrontend } from "@/lib/adapters/backend";
-import { backendDocumentToArticle, graphNodeToEntity } from "@/lib/entityFromGraph";
+import { backendDocumentToArticle, experimentDetailsToEntity, graphNodeToEntity, propertyDetailsToEntity } from "@/lib/entityFromGraph";
 import { getNodeConnections, type NodeConnection } from "@/lib/graphConnections";
+import { computeSearchFocus } from "@/lib/graphSearchFocus";
+import { INGEST_COMPLETE_EVENT, INGEST_START_EVENT } from "@/lib/ingestRouteEvents";
+import { mergeGraphSnapshots } from "@/lib/graphMerge";
+import {
+  buildTypeClusterGraph,
+  entityTypeToNeo4jLabel,
+  expandedTypeKey,
+  isTypeClusterNode,
+  parseTypeClusterId,
+  removeDocumentHierarchy,
+  snapshotTypeClusterMembers,
+} from "@/lib/graphHierarchy";
+import { fetchAllTypeClusterMembers } from "@/lib/graphTypeMembers";
+import { getEntityLabel } from "@/lib/graph";
 import { QueryFilters } from "@/components/QueryFilters";
 import { ContradictionsPanel } from "@/components/ContradictionsPanel";
 import { downloadText, exportSearchJson, exportSearchMarkdown } from "@/lib/exportResults";
 import { parseQuery, parsedToStructured } from "@/lib/query";
 import type { Entity, GraphEdge, GraphNode, SearchResult, EntityType, StructuredFilters } from "@/lib/types";
-import { Network, MessageSquareQuote, Server, ServerOff, AlertCircle, Download } from "lucide-react";
+import { Network, MessageSquareQuote, Server, ServerOff, AlertCircle, Download, Loader2 } from "lucide-react";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
+import { ModelSwitcher } from "@/components/ModelSwitcher";
 import { useI18n } from "@/lib/i18n/I18nProvider";
 
+const GraphView = dynamic(
+  () => import("@/components/GraphView").then((m) => m.GraphView),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex min-h-[420px] items-center justify-center rounded-xl border border-slate-700/60 bg-slate-950/40 text-sm text-slate-500">
+        Loading graph…
+      </div>
+    ),
+  }
+);
+
+type PanelSnapshot = {
+  selectedNodeId: string;
+  panelEntity: Entity;
+  panelGroupMembers: GraphNode[];
+  panelGroupMembersTotal: number;
+  panelGroupMembersLoading: boolean;
+  panelConnections: NodeConnection[];
+  panelLoading: boolean;
+};
+
 export function Dashboard() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [result, setResult] = useState<SearchResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [selectedExpId, setSelectedExpId] = useState<string | null>(null);
   const [panelEntity, setPanelEntity] = useState<Entity | null>(null);
   const [panelConnections, setPanelConnections] = useState<NodeConnection[]>([]);
+  const [panelGroupMembers, setPanelGroupMembers] = useState<GraphNode[] | undefined>(undefined);
+  const [panelGroupMembersTotal, setPanelGroupMembersTotal] = useState(0);
+  const [panelGroupMembersLoading, setPanelGroupMembersLoading] = useState(false);
+  const [panelBack, setPanelBack] = useState<PanelSnapshot | null>(null);
   const [panelLoading, setPanelLoading] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
   const [backendOnline, setBackendOnline] = useState(false);
+  const [ingestActive, setIngestActive] = useState(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [statsRefreshKey, setStatsRefreshKey] = useState(0);
@@ -41,29 +82,161 @@ export function Dashboard() {
     nodes: GraphNode[];
     links: GraphEdge[];
   }>({ nodes: [], links: [] });
-  const [graphVersion, setGraphVersion] = useState(0);
+  const [graphLoading, setGraphLoading] = useState(false);
   const [graphTypeFilter, setGraphTypeFilter] = useState<EntityType | null>(null);
+  const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(() => new Set());
   const [documents, setDocuments] = useState<DocumentOption[]>([]);
   const [selectedDocumentId, setSelectedDocumentId] = useState("");
   const [lastQuery, setLastQuery] = useState("");
   const [structuredFilters, setStructuredFilters] = useState<StructuredFilters>({});
+  const [graphFocusDismissed, setGraphFocusDismissed] = useState(false);
+  const [expandingDocId, setExpandingDocId] = useState<string | null>(null);
+  const [expandedTypeKeys, setExpandedTypeKeys] = useState<Set<string>>(() => new Set());
+  const [expandingTypeKey, setExpandingTypeKey] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const entityDedupeDoneRef = useRef(false);
+  const loadedDocSummariesRef = useRef<Set<string>>(new Set());
+  const loadedTypeKeysRef = useRef<Set<string>>(new Set());
+  const panelFetchGenRef = useRef(0);
+  const mountedRef = useRef(true);
 
-  const refreshBackendStatus = useCallback(async () => {
-    const ok = await checkBackendHealth();
-    setBackendOnline(ok);
-    return ok;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const onStart = () => setIngestActive(true);
+    const onComplete = () => setIngestActive(false);
+    window.addEventListener(INGEST_START_EVENT, onStart);
+    window.addEventListener(INGEST_COMPLETE_EVENT, onComplete);
+    return () => {
+      window.removeEventListener(INGEST_START_EVENT, onStart);
+      window.removeEventListener(INGEST_COMPLETE_EVENT, onComplete);
+    };
+  }, []);
+
+  const effectiveBackendOnline = backendOnline || ingestActive;
+
+  const searchFocus = useMemo(
+    () => computeSearchFocus(graphSnapshot.nodes, graphSnapshot.links, result),
+    [graphSnapshot.nodes, graphSnapshot.links, result]
+  );
+
+  const loadDocumentSubgraph = useCallback(
+    async (docId: string) => {
+      if (loadedDocSummariesRef.current.has(docId)) return;
+      setExpandingDocId(docId);
+      try {
+        const summary = await backendApi.documentEntitySummary(docId).catch(() => null);
+        if (!summary) return;
+        loadedDocSummariesRef.current.add(docId);
+        const virtual = buildTypeClusterGraph(docId, summary.types, (type) =>
+          getEntityLabel(type, locale)
+        );
+        setGraphSnapshot((prev) => mergeGraphSnapshots(prev, virtual));
+      } finally {
+        setExpandingDocId(null);
+      }
+    },
+    [locale]
+  );
+
+  const loadTypeClusterEntities = useCallback(async (docId: string, entityType: EntityType) => {
+    const key = expandedTypeKey(docId, entityType);
+    if (loadedTypeKeysRef.current.has(key)) {
+      setExpandedTypeKeys((prev) => new Set(prev).add(key));
+      return;
+    }
+    setExpandingTypeKey(key);
+    try {
+      const neo4jLabel = entityTypeToNeo4jLabel(entityType);
+      if (!neo4jLabel) return;
+
+      let offset = 0;
+      const pageSize = GRAPH_TYPE_PAGE_LIMIT;
+      const allNodes: GraphNode[] = [];
+      const allLinks: GraphEdge[] = [];
+
+      while (true) {
+        const page = await backendApi
+          .documentEntitiesByType(docId, neo4jLabel, pageSize, offset)
+          .catch(() => null);
+        if (!page) break;
+
+        const graph = backendGraphToFrontend({ nodes: page.nodes, edges: page.edges });
+        for (const node of graph.nodes) {
+          allNodes.push({
+            ...node,
+            hubId: docId,
+            documentId: docId,
+          });
+        }
+        for (const link of graph.links) {
+          allLinks.push(link);
+        }
+
+        if (!page.has_more) break;
+        offset += pageSize;
+      }
+
+      loadedTypeKeysRef.current.add(key);
+      setExpandedTypeKeys((prev) => new Set(prev).add(key));
+      setGraphSnapshot((prev) => mergeGraphSnapshots(prev, { nodes: allNodes, links: allLinks }));
+    } finally {
+      setExpandingTypeKey(null);
+    }
+  }, []);
+
+  const handleDocumentCollapse = useCallback((docId: string) => {
+    loadedDocSummariesRef.current.delete(docId);
+    for (const key of [...loadedTypeKeysRef.current]) {
+      if (key.startsWith(`${docId}:`)) loadedTypeKeysRef.current.delete(key);
+    }
+    setExpandedTypeKeys((prev) => {
+      const next = new Set(prev);
+      for (const key of prev) {
+        if (key.startsWith(`${docId}:`)) next.delete(key);
+      }
+      return next;
+    });
+    setGraphSnapshot((prev) => removeDocumentHierarchy(prev, docId));
   }, []);
 
   const refreshGraphSnapshot = useCallback(async () => {
-    const explore = await backendApi.exploreGraph(300).catch(() => null);
-    if (!explore) return;
+    setGraphLoading(true);
+    try {
+      loadedDocSummariesRef.current.clear();
+      loadedTypeKeysRef.current.clear();
 
-    const graph = backendGraphToFrontend(explore);
-    setGraphSnapshot(graph);
-    setGraphVersion((v) => v + 1);
-    setResult((prev) => (prev ? { ...prev, graph } : prev));
+      const hubs = await backendApi
+        .exploreGraph(GRAPH_OVERVIEW_LIMIT, undefined, true)
+        .catch(() => null);
+      if (!hubs) return;
+      const graph = backendGraphToFrontend(hubs);
+      setGraphSnapshot(graph);
+      setExpandedDocIds(new Set());
+      setExpandedTypeKeys(new Set());
+      setResult((prev) => (prev ? { ...prev, graph } : prev));
+
+      if (!entityDedupeDoneRef.current) {
+        entityDedupeDoneRef.current = true;
+        void backendApi.reconcileDuplicateEntities().catch(() => null);
+      }
+    } finally {
+      setGraphLoading(false);
+    }
   }, []);
+
+  const refreshBackendStatus = useCallback(async () => {
+    const ok = await checkBackendHealth();
+    if (ok || !ingestActive) {
+      setBackendOnline(ok);
+    }
+    return ok || ingestActive;
+  }, [ingestActive]);
 
   const refreshAfterIngest = useCallback(async () => {
     await refreshBackendStatus();
@@ -85,19 +258,33 @@ export function Dashboard() {
   }, [refreshBackendStatus]);
 
   useEffect(() => {
-    if (backendOnline) {
-      void refreshGraphSnapshot();
-      setStatsRefreshKey((k) => k + 1);
-      void backendApi.listDocuments().then((docs) => {
-        setDocuments(
-          docs.map((d) => ({
-            id: d.id,
-            title: d.title || d.id.slice(0, 8),
-          }))
-        );
-      }).catch(() => setDocuments([]));
-    }
-  }, [backendOnline, refreshGraphSnapshot]);
+    if (!effectiveBackendOnline) return;
+    void refreshGraphSnapshot();
+    setStatsRefreshKey((k) => k + 1);
+    void backendApi.listDocuments().then((docs) => {
+      setDocuments(
+        docs.map((d) => ({
+          id: d.id,
+          title: d.title || d.id.slice(0, 8),
+        }))
+      );
+      if (docs.length === 0) {
+        setGraphSnapshot({ nodes: [], links: [] });
+        setResult(null);
+        setSelectedNodeId(null);
+        setPanelEntity(null);
+        loadedDocSummariesRef.current.clear();
+        loadedTypeKeysRef.current.clear();
+        setExpandedDocIds(new Set());
+        setExpandedTypeKeys(new Set());
+      }
+    }).catch(() => {
+      setDocuments([]);
+      setGraphSnapshot({ nodes: [], links: [] });
+      loadedDocSummariesRef.current.clear();
+      loadedTypeKeysRef.current.clear();
+    });
+  }, [effectiveBackendOnline, refreshGraphSnapshot]);
 
   const handleSearch = useCallback(
     async (query: string, documentId?: string) => {
@@ -121,11 +308,15 @@ export function Dashboard() {
         setResult(res);
         if (res.graph.nodes.length > 0) {
           setGraphSnapshot(res.graph);
-          setGraphVersion((v) => v + 1);
         }
+        setExpandedDocIds(new Set());
+        setGraphFocusDismissed(false);
         setSelectedExpId(res.experiments[0]?.experiment.id ?? null);
         setPanelEntity(null);
         setPanelConnections([]);
+        setPanelGroupMembers(undefined);
+        setPanelGroupMembersTotal(0);
+        setPanelBack(null);
         setSelectedNodeId(null);
       } catch (e) {
         setSearchError(e instanceof Error ? e.message : t("search.failed"));
@@ -135,6 +326,32 @@ export function Dashboard() {
       }
     },
     [refreshBackendStatus, selectedDocumentId, structuredFilters, t]
+  );
+
+  const handleDeleteDocument = useCallback(
+    async (documentId: string) => {
+      try {
+        await backendApi.deleteDocument(documentId);
+        if (selectedDocumentId === documentId) {
+          setSelectedDocumentId("");
+        }
+        setExpandedDocIds((prev) => {
+          if (!prev.has(documentId)) return prev;
+          const next = new Set(prev);
+          next.delete(documentId);
+          return next;
+        });
+        setPanelEntity((prev) =>
+          prev?.type === "article" && prev.id === documentId ? null : prev
+        );
+        setSearchError(null);
+        await refreshAfterIngest();
+      } catch (e) {
+        setSearchError(e instanceof Error ? e.message : t("documentFilter.deleteFailed"));
+        throw e;
+      }
+    },
+    [selectedDocumentId, refreshAfterIngest, t]
   );
 
   const handlePickDocument = useCallback(
@@ -147,45 +364,244 @@ export function Dashboard() {
     [lastQuery, handleSearch]
   );
 
-  const handleNodeClick = useCallback(async (node: GraphNode) => {
-    setSelectedNodeId(node.id);
-    setPanelEntity(graphNodeToEntity(node));
-    setPanelConnections(
-      getNodeConnections(node.id, graphSnapshot.nodes, graphSnapshot.links)
-    );
-    setPanelLoading(node.type === "article");
-
-    requestAnimationFrame(() => {
-      panelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  const handleCollapseDocumentGraph = useCallback((documentId: string) => {
+    setExpandedDocIds((prev) => {
+      if (!prev.has(documentId)) return prev;
+      const next = new Set(prev);
+      next.delete(documentId);
+      return next;
     });
+  }, []);
+
+  const handleNodeClick = useCallback(async (node: GraphNode) => {
+    const fetchGen = ++panelFetchGenRef.current;
+
+    const applyPanel = (updater: () => void) => {
+      if (!mountedRef.current || fetchGen !== panelFetchGenRef.current) return;
+      updater();
+    };
+
+    setSelectedNodeId(node.id);
+    if (node.type === "article") {
+      setSelectedDocumentId(node.id);
+    }
+
+    if (isTypeClusterNode(node)) {
+      const parsed = parseTypeClusterId(node.id);
+      setPanelBack(null);
+      setPanelEntity(graphNodeToEntity(node));
+      setPanelConnections([]);
+      setPanelLoading(false);
+
+      if (!parsed) {
+        setPanelGroupMembers(undefined);
+        setPanelGroupMembersTotal(0);
+        setPanelGroupMembersLoading(false);
+        return;
+      }
+
+      const snapshotMembers = snapshotTypeClusterMembers(
+        graphSnapshot.nodes,
+        parsed.documentId,
+        parsed.entityType
+      );
+      setPanelGroupMembers(snapshotMembers);
+      setPanelGroupMembersTotal(node.typeClusterCount ?? snapshotMembers.length);
+      setPanelGroupMembersLoading(true);
+
+      if (typeof window !== "undefined" && window.innerWidth < 1024) {
+        requestAnimationFrame(() => {
+          panelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        });
+      }
+
+      try {
+        const { nodes: allMembers, total } = await fetchAllTypeClusterMembers(
+          parsed.documentId,
+          parsed.entityType
+        );
+        applyPanel(() => {
+          setPanelGroupMembers(allMembers);
+          setPanelGroupMembersTotal(total);
+        });
+      } catch {
+        applyPanel(() => {
+          setPanelGroupMembers(snapshotMembers);
+          setPanelGroupMembersTotal(node.typeClusterCount ?? snapshotMembers.length);
+        });
+      } finally {
+        applyPanel(() => setPanelGroupMembersLoading(false));
+      }
+      return;
+    }
+
+    setPanelGroupMembers(undefined);
+    setPanelGroupMembersTotal(0);
+    setPanelGroupMembersLoading(false);
+    setPanelEntity(graphNodeToEntity(node));
+    setPanelConnections([]);
+    setPanelLoading(node.type === "article" || node.type === "experiment" || node.type === "property");
+
+    if (typeof window !== "undefined" && window.innerWidth < 1024) {
+      requestAnimationFrame(() => {
+        panelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      });
+    }
+
+    if (node.type !== "property") {
+      void backendApi
+        .getNodeNeighbors(node.id)
+        .then((graph) => {
+          const { nodes, links } = backendGraphToFrontend(graph);
+          applyPanel(() => setPanelConnections(getNodeConnections(node.id, nodes, links)));
+        })
+        .catch(() => {
+          applyPanel(() =>
+            setPanelConnections(
+              getNodeConnections(node.id, graphSnapshot.nodes, graphSnapshot.links)
+            )
+          );
+        });
+    }
 
     if (node.type === "experiment") {
       setSelectedExpId(node.id);
-      setPanelLoading(false);
+      try {
+        const details = await backendApi.getExperiment(node.id);
+        applyPanel(() => setPanelEntity(experimentDetailsToEntity(node, details)));
+      } catch {
+        // Keep graph-node fallback entity
+      } finally {
+        applyPanel(() => setPanelLoading(false));
+      }
+      return;
+    }
+
+    if (node.type === "property") {
+      try {
+        const propertyKey = node.id.startsWith("prop:") ? node.id : `prop:${node.id}`;
+        const details = await backendApi.getProperty(propertyKey);
+        applyPanel(() => setPanelEntity(propertyDetailsToEntity(node, details)));
+      } catch {
+        // Keep graph-node fallback entity
+      } finally {
+        applyPanel(() => setPanelLoading(false));
+      }
       return;
     }
 
     if (node.type === "article") {
       try {
         const doc = await backendApi.getDocument(node.id);
-        setPanelEntity(backendDocumentToArticle(doc, node));
+        applyPanel(() => setPanelEntity(backendDocumentToArticle(doc, node)));
       } catch {
         // Keep minimal node info if fetch fails
       } finally {
-        setPanelLoading(false);
+        applyPanel(() => setPanelLoading(false));
       }
       return;
     }
 
     setPanelLoading(false);
-  }, [graphSnapshot]);
+  }, [graphSnapshot.nodes, graphSnapshot.links]);
+
+  const handlePanelBack = useCallback(() => {
+    if (!panelBack) return;
+    panelFetchGenRef.current += 1;
+    setSelectedNodeId(panelBack.selectedNodeId);
+    setPanelEntity(panelBack.panelEntity);
+    setPanelGroupMembers(panelBack.panelGroupMembers);
+    setPanelGroupMembersTotal(panelBack.panelGroupMembersTotal);
+    setPanelGroupMembersLoading(panelBack.panelGroupMembersLoading);
+    setPanelConnections(panelBack.panelConnections);
+    setPanelLoading(panelBack.panelLoading);
+    setPanelBack(null);
+  }, [panelBack]);
+
+  const handleGroupMemberClick = useCallback(
+    (nodeId: string) => {
+      if (panelGroupMembers !== undefined && panelEntity) {
+        setPanelBack({
+          selectedNodeId: panelEntity.id,
+          panelEntity,
+          panelGroupMembers,
+          panelGroupMembersTotal,
+          panelGroupMembersLoading,
+          panelConnections,
+          panelLoading,
+        });
+      }
+      const member =
+        graphSnapshot.nodes.find((n) => n.id === nodeId) ??
+        panelGroupMembers?.find((n) => n.id === nodeId);
+      if (!member) return;
+
+      const hubId = member.hubId ?? member.documentId;
+      if (hubId) {
+        setExpandedDocIds((prev) => {
+          if (prev.has(hubId)) return prev;
+          const next = new Set(prev);
+          next.add(hubId);
+          return next;
+        });
+        if (!loadedDocSummariesRef.current.has(hubId)) {
+          void loadDocumentSubgraph(hubId);
+        }
+      }
+
+      const typeKey = hubId ? expandedTypeKey(hubId, member.type) : null;
+      if (typeKey) {
+        setExpandedTypeKeys((prev) => {
+          if (prev.has(typeKey)) return prev;
+          const next = new Set(prev);
+          next.add(typeKey);
+          return next;
+        });
+        if (hubId && !loadedTypeKeysRef.current.has(typeKey)) {
+          void loadTypeClusterEntities(hubId, member.type);
+        }
+      }
+
+      if (!graphSnapshot.nodes.some((n) => n.id === nodeId)) {
+        setGraphSnapshot((prev) =>
+          mergeGraphSnapshots(prev, {
+            nodes: [
+              {
+                ...member,
+                hubId: hubId ?? member.hubId,
+                documentId: hubId ?? member.documentId,
+              },
+            ],
+            links: [],
+          })
+        );
+      }
+
+      setSelectedNodeId(nodeId);
+      void handleNodeClick(member);
+    },
+    [
+      graphSnapshot.nodes,
+      handleNodeClick,
+      loadDocumentSubgraph,
+      loadTypeClusterEntities,
+      panelConnections,
+      panelEntity,
+      panelGroupMembers,
+      panelGroupMembersLoading,
+      panelGroupMembersTotal,
+      panelLoading,
+    ]
+  );
 
   const handleConnectionClick = useCallback(
     (nodeId: string) => {
-      const node = graphSnapshot.nodes.find((n) => n.id === nodeId);
+      const node =
+        graphSnapshot.nodes.find((n) => n.id === nodeId) ??
+        panelGroupMembers?.find((n) => n.id === nodeId);
       if (node) void handleNodeClick(node);
     },
-    [graphSnapshot.nodes, handleNodeClick]
+    [graphSnapshot.nodes, panelGroupMembers, handleNodeClick]
   );
 
   const handleExpClick = useCallback(
@@ -202,12 +618,14 @@ export function Dashboard() {
   const displayGraph = graphSnapshot;
 
   const graphEmptyMessage =
-    displayGraph.nodes.length === 0
-      ? !backendOnline
-        ? t("graph.emptyOffline")
-        : !hasSearched
-          ? t("graph.emptyLoading")
-          : t("graph.emptyNoData")
+    graphSnapshot.nodes.length === 0
+      ? graphLoading
+        ? t("graph.emptyLoading")
+        : !effectiveBackendOnline
+          ? t("graph.emptyOffline")
+          : !hasSearched
+            ? t("graph.emptyNoData")
+            : t("graph.emptyNoData")
       : undefined;
 
   return (
@@ -227,18 +645,26 @@ export function Dashboard() {
               </div>
             </div>
             <div className="flex items-center gap-3">
+              <ModelSwitcher />
               <LanguageSwitcher />
               <div
               className={`flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${
                 backendOnline
                   ? "border-emerald-500/30 text-emerald-400"
-                  : "border-amber-500/30 text-amber-400"
+                  : ingestActive
+                    ? "border-cyan-500/30 text-cyan-400"
+                    : "border-amber-500/30 text-amber-400"
               }`}
             >
               {backendOnline ? (
                 <>
                   <Server className="h-3.5 w-3.5" />
                   {t("header.backendConnected")}
+                </>
+              ) : ingestActive ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  {t("header.backendProcessing")}
                 </>
               ) : (
                 <>
@@ -250,7 +676,7 @@ export function Dashboard() {
             </div>
           </div>
 
-          {!backendOnline && (
+          {!effectiveBackendOnline && (
             <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
               <p>{t("header.backendHint")}</p>
@@ -262,18 +688,19 @@ export function Dashboard() {
               documents={documents}
               value={selectedDocumentId}
               onChange={setSelectedDocumentId}
-              disabled={!backendOnline}
+              onDelete={effectiveBackendOnline ? handleDeleteDocument : undefined}
+              disabled={!effectiveBackendOnline}
               loading={loading}
             />
           </div>
 
-          <SearchBar onSearch={handleSearch} loading={loading} disabled={!backendOnline} />
+          <SearchBar onSearch={handleSearch} loading={loading} disabled={!effectiveBackendOnline} />
 
           <div className="mt-3">
             <QueryFilters
               value={structuredFilters}
               onChange={setStructuredFilters}
-              disabled={!backendOnline || loading}
+              disabled={!effectiveBackendOnline || loading}
             />
           </div>
 
@@ -300,7 +727,7 @@ export function Dashboard() {
           )}
           <div className="mt-4">
             <StatsBar
-              useBackend={backendOnline}
+              useBackend={effectiveBackendOnline}
               refreshKey={statsRefreshKey}
               activeFilter={graphTypeFilter}
               onFilterChange={setGraphTypeFilter}
@@ -308,7 +735,7 @@ export function Dashboard() {
           </div>
           <div className="mt-4">
             <DocumentUpload
-              disabled={!backendOnline}
+              disabled={!effectiveBackendOnline}
               onIngestComplete={() => {
                 void refreshAfterIngest();
               }}
@@ -427,15 +854,26 @@ export function Dashboard() {
                 {t("graph.caption")}
               </p>
             </div>
-            <div className="min-h-[420px] flex-1">
+            <div className="min-h-[420px] flex-1 bg-slate-950">
             <GraphView
-              key={graphVersion}
               nodes={displayGraph.nodes}
               links={displayGraph.links}
               onNodeClick={handleNodeClick}
-              highlightId={selectedNodeId ?? selectedExpId ?? undefined}
+              onDocumentExpand={loadDocumentSubgraph}
+              onTypeClusterExpand={loadTypeClusterEntities}
+              onDocumentCollapse={handleDocumentCollapse}
+              highlightId={selectedNodeId ?? selectedExpId ?? selectedDocumentId ?? undefined}
               emptyMessage={graphEmptyMessage}
               typeFilter={graphTypeFilter}
+              focusNodeId={selectedNodeId ?? selectedDocumentId ?? undefined}
+              expandingDocId={expandingDocId}
+              expandingTypeKey={expandingTypeKey}
+              expandedDocIds={expandedDocIds}
+              onExpandedDocIdsChange={setExpandedDocIds}
+              expandedTypeKeys={expandedTypeKeys}
+              onExpandedTypeKeysChange={setExpandedTypeKeys}
+              searchFocus={graphFocusDismissed ? null : searchFocus}
+              onDismissSearchFocus={() => setGraphFocusDismissed(true)}
             />
             </div>
           </div>
@@ -455,10 +893,32 @@ export function Dashboard() {
                 entity={panelEntity}
                 loading={panelLoading}
                 connections={panelConnections}
+                groupMembers={panelGroupMembers}
+                groupMembersTotal={panelGroupMembersTotal}
+                groupMembersLoading={panelGroupMembersLoading}
                 onConnectionClick={handleConnectionClick}
+                onGroupMemberClick={handleGroupMemberClick}
+                onBack={panelBack ? handlePanelBack : undefined}
+                backLabel={
+                  panelBack
+                    ? t("entityPanel.backToGroup", { name: panelBack.panelEntity.name })
+                    : undefined
+                }
+                documentGraphExpanded={
+                  panelEntity.type === "article" && expandedDocIds.has(panelEntity.id)
+                }
+                onCollapseDocumentGraph={
+                  panelEntity.type === "article"
+                    ? () => handleCollapseDocumentGraph(panelEntity.id)
+                    : undefined
+                }
                 onClose={() => {
                   setPanelEntity(null);
                   setPanelConnections([]);
+                  setPanelGroupMembers(undefined);
+                  setPanelGroupMembersTotal(0);
+                  setPanelGroupMembersLoading(false);
+                  setPanelBack(null);
                   setSelectedNodeId(null);
                 }}
               />
@@ -489,13 +949,7 @@ export function Dashboard() {
 
           {result && <Timeline experiments={result.experiments} />}
 
-          <ContradictionsPanel enabled={backendOnline} />
-
-          {result && (
-            <div className="rounded-xl border border-slate-700/50 bg-slate-900/40 p-4">
-              <GapAnalysis gaps={result.gaps} />
-            </div>
-          )}
+          <ContradictionsPanel enabled={effectiveBackendOnline} />
         </aside>
       </main>
     </div>

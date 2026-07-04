@@ -37,12 +37,16 @@ export function StatsBar({
   useEffect(() => {
     if (!useBackend) {
       setBackendStats(null);
+      enrichAttempted.current = false;
       return;
     }
     backendApi
       .graphStats()
       .then((s) => {
         const status = s.experiment_status ?? {};
+        if ((s.documents ?? 0) === 0) {
+          enrichAttempted.current = false;
+        }
         const emptyGraph =
           (s.documents ?? 0) > 0 &&
           (s.materials ?? 0) === 0 &&

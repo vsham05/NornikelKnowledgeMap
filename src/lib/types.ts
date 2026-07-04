@@ -11,7 +11,8 @@ export type EntityType =
   | "equipment"
   | "process"
   | "facility"
-  | "expert";
+  | "expert"
+  | "figures";
 
 export interface BaseEntity {
   id: string;
@@ -67,6 +68,18 @@ export interface Property extends BaseEntity {
   type: "property";
   unit: string;
   higherIsBetter: boolean;
+  canonicalName?: string;
+  measurements?: PropertyMeasurement[];
+}
+
+export interface PropertyMeasurement {
+  value: string;
+  unit: string;
+  source: "experiment" | "material";
+  experimentName?: string;
+  materialName?: string;
+  documentTitle?: string;
+  sourceText?: string;
 }
 
 export interface Mode extends BaseEntity {
@@ -110,6 +123,22 @@ export interface Topic extends BaseEntity {
   type: "topic";
 }
 
+export interface DocumentFigure {
+  id: string;
+  caption?: string;
+  page_number?: number;
+  image_type?: string;
+  storage_key?: string;
+}
+
+export interface Figures extends BaseEntity {
+  type: "figures";
+  documentId: string;
+  imageCount: number;
+  typeSummary?: string;
+  items: DocumentFigure[];
+}
+
 export type Entity =
   | Article
   | Experiment
@@ -121,7 +150,8 @@ export type Entity =
   | Team
   | Facility
   | Conclusion
-  | Topic;
+  | Topic
+  | Figures;
 
 export interface GraphEdge {
   id: string;
@@ -138,7 +168,8 @@ export interface GraphEdge {
     | "tagged"
     | "references"
     | "employs"
-    | "processed_in";
+    | "processed_in"
+    | "has_figures";
 }
 
 export interface GraphNode {
@@ -154,6 +185,20 @@ export interface GraphNode {
   members?: string[];
   country?: string;
   facilityType?: string;
+  figures?: DocumentFigure[];
+  documentId?: string;
+  imageCount?: number;
+  typeSummary?: string;
+  regimeName?: string;
+  regimeDescription?: string;
+  experimentStatus?: Experiment["status"];
+  conclusionText?: string;
+  sampleValue?: string;
+  sampleUnit?: string;
+  /** Virtual capsule node grouping entities of one type under a document hub. */
+  isTypeCluster?: boolean;
+  typeClusterCount?: number;
+  hubId?: string;
 }
 
 export interface SourceExcerpt {
@@ -171,6 +216,16 @@ export interface RetrievalScope {
   graphMatchCount?: number;
 }
 
+export interface StructuredExperimentRow {
+  experiment_id?: string;
+  material?: string;
+  process?: string;
+  regime?: string;
+  document_id?: string;
+  document_title?: string;
+  year?: number;
+}
+
 export interface SearchResult {
   query: string;
   parsed: ParsedQuery;
@@ -184,6 +239,10 @@ export interface SearchResult {
   needsDisambiguation?: boolean;
   documentCandidates?: Array<{ documentId: string; title?: string | null; score?: number }>;
   retrievalScope?: RetrievalScope;
+  /** Graph node IDs from text search on the knowledge graph. */
+  graphMatchIds?: string[];
+  /** Rows from structured graph query (filters / experiments). */
+  structuredExperiments?: StructuredExperimentRow[];
 }
 
 export interface ParsedQuery {

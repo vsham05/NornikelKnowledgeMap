@@ -1,14 +1,28 @@
 "use client";
 
-import { useEffect, useRef, useCallback, useMemo, useState } from "react";
-import dynamic from "next/dynamic";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import { Maximize2, ZoomIn, ZoomOut } from "lucide-react";
 import type { GraphEdge, GraphNode } from "@/lib/types";
-import { getEntityLabel, graphCollisionRadius, graphNodeRadius, minNodeCenterDistance } from "@/lib/graph";
-import { prepareDocumentHubGraph } from "@/lib/graphLayout";
-import { relationLabel } from "@/lib/adapters/backend";
+import { getEntityLabel } from "@/lib/graph";
+import { prepareForceGraphLayout, filterGraphByDocumentExpansion, filterVisualGraphLinks } from "@/lib/graphLayout";
+import { filterNodesForLayout } from "@/lib/graphLayoutInput";
+import type { GraphSearchFocus } from "@/lib/graphSearchFocus";
+import { isTypeClusterNode, parseTypeClusterId } from "@/lib/graphHierarchy";
 import { useI18n } from "@/lib/i18n/I18nProvider";
 import type { EntityType } from "@/lib/types";
+import {
+  ForceGraphCanvas,
+  type ForceGraphCanvasHandle,
+  type ForceGraphNode,
+} from "@/components/ForceGraphCanvas";
 
 function displayName(node: GraphNode, unknownLabel: string): string {
   const name = node.name?.trim();
@@ -22,21 +36,25 @@ function truncateLabel(name: string, max = 22): string {
   return name.length > max ? `${name.slice(0, max - 1)}…` : name;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), { ssr: false }) as any;
-
-async function loadForceCollide() {
-  const mod = await import("d3-force-3d");
-  return mod.forceCollide;
-}
-
 interface GraphViewProps {
   nodes: GraphNode[];
   links: GraphEdge[];
   onNodeClick?: (node: GraphNode) => void;
+  onDocumentExpand?: (documentId: string) => void | Promise<void>;
+  onTypeClusterExpand?: (documentId: string, entityType: EntityType) => void | Promise<void>;
+  onDocumentCollapse?: (documentId: string) => void;
   highlightId?: string;
   emptyMessage?: string;
   typeFilter?: EntityType | null;
+  focusNodeId?: string;
+  expandingDocId?: string | null;
+  expandingTypeKey?: string | null;
+  expandedDocIds: Set<string>;
+  onExpandedDocIdsChange: Dispatch<SetStateAction<Set<string>>>;
+  expandedTypeKeys: Set<string>;
+  onExpandedTypeKeysChange: Dispatch<SetStateAction<Set<string>>>;
+  searchFocus?: GraphSearchFocus | null;
+  onDismissSearchFocus?: () => void;
 }
 
 const LEGEND_TYPES: EntityType[] = [
@@ -48,6 +66,7 @@ const LEGEND_TYPES: EntityType[] = [
   "facility",
   "expert",
   "team",
+  "figures",
   "property",
 ];
 
@@ -65,26 +84,33 @@ const LEGEND_COLORS: Record<EntityType, string> = {
   process: "#38bdf8",
   facility: "#c084fc",
   expert: "#fdba74",
+  figures: "#a855f7",
 };
 
 function useContainerSize(ref: React.RefObject<HTMLDivElement | null>) {
-  const [size, setSize] = useState({ width: 0, height: 0 });
+  const [size, setSize] = useState({ width: 800, height: 420 });
 
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
 
     const update = () => {
-      const { width, height } = el.getBoundingClientRect();
+      const rect = el.getBoundingClientRect();
+      const width = Math.floor(rect.width);
+      const height = Math.floor(rect.height);
       if (width > 0 && height > 0) {
-        setSize({ width: Math.floor(width), height: Math.floor(height) });
+        setSize({ width, height });
       }
     };
 
     update();
     const observer = new ResizeObserver(update);
     observer.observe(el);
-    return () => observer.disconnect();
+    window.addEventListener("resize", update);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", update);
+    };
   }, [ref]);
 
   return size;
@@ -94,203 +120,265 @@ export function GraphView({
   nodes,
   links,
   onNodeClick,
+  onDocumentExpand,
+  onTypeClusterExpand,
+  onDocumentCollapse,
   highlightId,
   emptyMessage,
   typeFilter,
+  focusNodeId,
+  expandingDocId,
+  expandingTypeKey,
+  expandedDocIds,
+  onExpandedDocIdsChange,
+  expandedTypeKeys,
+  onExpandedTypeKeysChange,
+  searchFocus,
+  onDismissSearchFocus,
 }: GraphViewProps) {
   const { t, locale } = useI18n();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const fgRef = useRef<any>(null);
+  const lastArticleClickRef = useRef<{ id: string; at: number } | null>(null);
+  const canvasRef = useRef<ForceGraphCanvasHandle>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const initialFitDone = useRef(false);
   const { width, height } = useContainerSize(containerRef);
-  const ready = width > 0 && height > 0;
 
-  const hubLayout = useMemo(
-    () => prepareDocumentHubGraph(nodes, links),
-    [nodes, links]
+  const layoutInput = useMemo(
+    () => filterNodesForLayout(nodes, links, expandedDocIds, expandedTypeKeys),
+    [nodes, links, expandedDocIds, expandedTypeKeys]
   );
 
+  const hubLayout = useMemo(
+    () => prepareForceGraphLayout(layoutInput.nodes, layoutInput.links),
+    [layoutInput.nodes, layoutInput.links]
+  );
+
+  useEffect(() => {
+    if (!searchFocus?.documentIds?.length) return;
+    onExpandedDocIdsChange((prev) => {
+      const next = new Set(prev);
+      let changed = false;
+      for (const id of searchFocus.documentIds!) {
+        if (!next.has(id)) {
+          next.add(id);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [searchFocus, onExpandedDocIdsChange]);
+
+  const expansionLayout = useMemo(() => {
+    const layout = filterGraphByDocumentExpansion(hubLayout, expandedDocIds);
+    const entityCounts = new Map<string, number>();
+    for (const node of nodes) {
+      if (node.type === "article") continue;
+      const hub = node.hubId ?? node.documentId;
+      if (!hub) continue;
+      if (node.isTypeCluster && (node.typeClusterCount ?? 0) > 0) {
+        entityCounts.set(hub, (entityCounts.get(hub) ?? 0) + (node.typeClusterCount ?? 0));
+      }
+    }
+    const docIds = new Set(nodes.filter((n) => n.type === "article").map((n) => n.id));
+    if (entityCounts.size === 0) {
+      for (const link of links) {
+        const src = String(link.source);
+        const tgt = String(link.target);
+        if (docIds.has(src) && !docIds.has(tgt)) {
+          entityCounts.set(src, (entityCounts.get(src) ?? 0) + 1);
+        } else if (docIds.has(tgt) && !docIds.has(src)) {
+          entityCounts.set(tgt, (entityCounts.get(tgt) ?? 0) + 1);
+        }
+      }
+    }
+    return {
+      nodes: layout.nodes.map((node) => {
+        if (node.type !== "article") return node;
+        const count = entityCounts.get(node.id) ?? node.collapsedChildCount ?? 0;
+        if (count <= 0 || expandedDocIds.has(node.id)) return node;
+        return {
+          ...node,
+          val: Math.max(node.val ?? 12, 16),
+          collapsedChildCount: count,
+          isCollapsedHub: true,
+        };
+      }),
+      links: layout.links,
+    };
+  }, [hubLayout, expandedDocIds, nodes, links]);
+
+  const searchFocusSet = useMemo(
+    () => (searchFocus?.visibleIds.length ? new Set(searchFocus.visibleIds) : null),
+    [searchFocus]
+  );
+  const searchPrimarySet = useMemo(
+    () => new Set(searchFocus?.primaryIds ?? []),
+    [searchFocus?.primaryIds]
+  );
+  const focusActive = Boolean(searchFocusSet && searchFocusSet.size > 0);
+
+  const focusLayout = useMemo(() => {
+    if (!searchFocusSet || searchFocusSet.size === 0) {
+      return expansionLayout;
+    }
+    const hasVisibleChild = (docId: string) =>
+      expansionLayout.nodes.some(
+        (n) => n.hubId === docId && n.type !== "article" && searchFocusSet.has(n.id)
+      );
+
+    const visibleNodes = expansionLayout.nodes.filter((n) => {
+      if (!searchFocusSet.has(n.id)) return false;
+      if (n.type === "article" && hasVisibleChild(n.id)) return false;
+      return true;
+    });
+    const visibleIds = new Set(visibleNodes.map((n) => n.id));
+    const visibleLinks = expansionLayout.links.filter((link) => {
+      const src = String(link.source);
+      const tgt = String(link.target);
+      return visibleIds.has(src) && visibleIds.has(tgt);
+    });
+    return { nodes: visibleNodes, links: visibleLinks };
+  }, [expansionLayout, searchFocusSet]);
+
+  const collapsedDocCount = useMemo(() => {
+    const docs = hubLayout.nodes.filter((n) => n.type === "article");
+    return docs.filter((d) => !expandedDocIds.has(d.id)).length;
+  }, [hubLayout.nodes, expandedDocIds]);
+
   const visibleIds = useMemo(() => {
-    const layoutNodes = hubLayout.nodes;
-    const layoutLinks = hubLayout.links;
     if (!typeFilter) return null;
     const ids = new Set<string>();
-    for (const n of layoutNodes) {
+    for (const n of focusLayout.nodes) {
       if (n.type === typeFilter) ids.add(n.id);
     }
-    for (const link of layoutLinks) {
+    for (const link of focusLayout.links) {
       const src = typeof link.source === "string" ? link.source : String(link.source);
       const tgt = typeof link.target === "string" ? link.target : String(link.target);
       if (ids.has(src)) ids.add(tgt);
       if (ids.has(tgt)) ids.add(src);
     }
     return ids;
-  }, [hubLayout.nodes, hubLayout.links, typeFilter]);
+  }, [focusLayout.nodes, focusLayout.links, typeFilter]);
 
   const presentLegendTypes = useMemo(() => {
-    const types = new Set(hubLayout.nodes.map((n) => n.type));
-    return LEGEND_TYPES.filter((t) => types.has(t));
-  }, [hubLayout.nodes]);
+    const types = new Set(focusLayout.nodes.map((n) => n.type));
+    return LEGEND_TYPES.filter((ty) => types.has(ty));
+  }, [focusLayout.nodes]);
 
-  const graphData = useMemo(
-    () => ({
-      nodes: hubLayout.nodes.map((n) => ({
-        ...n,
-        color:
-          visibleIds && !visibleIds.has(n.id) ? "rgba(100, 116, 139, 0.2)" : n.color,
-      })),
-      links: hubLayout.links
-        .filter((l) => {
-          if (!visibleIds) return true;
-          const src = typeof l.source === "string" ? l.source : String(l.source);
-          const tgt = typeof l.target === "string" ? l.target : String(l.target);
-          return visibleIds.has(src) && visibleIds.has(tgt);
-        })
-        .map((l) => ({
-          source: l.source,
-          target: l.target,
-          relation: l.relation,
-        })),
-    }),
-    [hubLayout, visibleIds]
+  const graphNodes: ForceGraphNode[] = useMemo(
+    () =>
+      focusLayout.nodes
+        .filter((n) => !visibleIds || visibleIds.has(n.id))
+        .map((n) => {
+          const isPrimary = searchPrimarySet.has(n.id);
+          const isSearchFocus = focusActive && searchFocusSet!.has(n.id);
+          const dimmed = visibleIds && !visibleIds.has(n.id);
+          return {
+            ...n,
+            val: (n.val ?? 4) * (isPrimary ? 1.15 : 1),
+            color: dimmed
+              ? "rgba(100, 116, 139, 0.2)"
+              : isSearchFocus && !isPrimary
+                ? `${n.color}99`
+                : n.color,
+            isSearchFocus,
+            isPrimaryFocus: isPrimary,
+          };
+        }),
+    [focusLayout.nodes, visibleIds, searchFocusSet, searchPrimarySet, focusActive]
   );
 
-  const fitGraph = useCallback(() => {
-    if (!fgRef.current) return;
-    fgRef.current.zoomToFit(400, 28);
-    const z = fgRef.current.zoom() ?? 1;
-    if (z < 0.55) {
-      fgRef.current.zoom(0.58, 0);
+  const graphLinks = useMemo(() => {
+    // Entity–entity edges are for Q&A focus mode only; default view is nodes-only grids.
+    if (!focusActive) return [];
+
+    const nodeById = new Map(focusLayout.nodes.map((n) => [n.id, n]));
+    let filtered = filterVisualGraphLinks(focusLayout.links, nodeById);
+    if (visibleIds) {
+      filtered = filtered.filter((l) => {
+        const src = typeof l.source === "string" ? l.source : String(l.source);
+        const tgt = typeof l.target === "string" ? l.target : String(l.target);
+        return visibleIds.has(src) && visibleIds.has(tgt);
+      });
     }
-  }, []);
+    return filtered;
+  }, [focusActive, focusLayout.links, focusLayout.nodes, visibleIds]);
 
-  const zoomBy = useCallback((factor: number) => {
-    if (!fgRef.current) return;
-    const current = fgRef.current.zoom() ?? 1;
-    const next = Math.min(8, Math.max(0.15, current * factor));
-    fgRef.current.zoom(next, 300);
-  }, []);
-
-  useEffect(() => {
-    initialFitDone.current = false;
-  }, [nodes, links, typeFilter]);
-
-  useEffect(() => {
-    const fg = fgRef.current;
-    if (!fg) return;
-
-    let cancelled = false;
-    void loadForceCollide().then((forceCollide) => {
-      if (cancelled || !fgRef.current) return;
-      const g = fgRef.current;
-
-      g.d3Force("charge")?.strength(-25);
-      g.d3Force(
-        "collision",
-        forceCollide<GraphNode & { val?: number }>()
-          .radius((n: GraphNode & { val?: number }) => graphCollisionRadius(n.val ?? 4))
-          .strength(1)
-          .iterations(3)
-      );
-      g.d3Force("link")
-        ?.distance((link: { source: GraphNode | string; target: GraphNode | string }) => {
-          const srcType = typeof link.source === "object" ? link.source?.type : undefined;
-          const tgtType = typeof link.target === "object" ? link.target?.type : undefined;
-          const types = new Set([srcType, tgtType]);
-          if (types.has("material") && types.has("process")) {
-            return minNodeCenterDistance(7);
-          }
-          if (types.has("expert") || types.has("team")) {
-            return minNodeCenterDistance(5);
-          }
-          if (types.has("material") && types.has("article")) {
-            return minNodeCenterDistance(7) + minNodeCenterDistance(9) * 0.5;
-          }
-          if (types.has("article")) return minNodeCenterDistance(7) * 1.4;
-          if (types.has("experiment")) return minNodeCenterDistance(8);
-          return minNodeCenterDistance(7);
-        })
-        .strength((link: { source: GraphNode | string; target: GraphNode | string }) => {
-          const srcType = typeof link.source === "object" ? link.source?.type : undefined;
-          const tgtType = typeof link.target === "object" ? link.target?.type : undefined;
-          const types = new Set([srcType, tgtType]);
-          if (types.has("material") && types.has("process")) return 0.85;
-          if (types.has("expert") || types.has("team")) return 0.5;
-          if (types.has("article")) return 0.35;
-          return 0.4;
-        });
-      g.d3Force("center")?.strength(0.002);
-      g.d3VelocityDecay(0.55);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [ready, nodes.length, graphData.nodes.length]);
-
-  const handleEngineStop = useCallback(() => {
-    if (initialFitDone.current) return;
-    fitGraph();
-    initialFitDone.current = true;
-  }, [fitGraph]);
-
-  useEffect(() => {
-    if (!ready || nodes.length === 0) return;
-    const t = setTimeout(() => {
-      if (!initialFitDone.current) fitGraph();
-    }, 150);
-    return () => clearTimeout(t);
-  }, [ready, nodes, links, typeFilter, width, height, fitGraph]);
-
-  const nodeRadius = useCallback((n: GraphNode) => graphNodeRadius(n.val ?? 4), []);
-
-  const paintPointerArea = useCallback(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (node: any, color: string, ctx: CanvasRenderingContext2D) => {
-      const n = node as GraphNode & { x?: number; y?: number };
-      const r = nodeRadius(n);
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(n.x ?? 0, n.y ?? 0, r + 8, 0, 2 * Math.PI);
-      ctx.fill();
-    },
-    [nodeRadius]
+  const clusterLabel = useCallback(
+    (type: EntityType) => getEntityLabel(type, locale),
+    [locale]
   );
 
-  const paintNode = useCallback(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (node: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
-      const n = node as GraphNode & { x?: number; y?: number };
-      const label = truncateLabel(displayName(n, t("graph.unknown")));
-      const fontSize = Math.min(13, Math.max(5, 10 / Math.sqrt(globalScale)));
-      const r = nodeRadius(n);
-      const isHighlight = highlightId === n.id;
+  const fitGraph = useCallback(() => canvasRef.current?.fitView(), []);
+  const zoomBy = useCallback((factor: number) => canvasRef.current?.zoomBy(factor), []);
 
-      ctx.beginPath();
-      ctx.arc(n.x ?? 0, n.y ?? 0, r, 0, 2 * Math.PI);
-      ctx.fillStyle = n.color;
-      ctx.globalAlpha = isHighlight ? 1 : 0.88;
-      ctx.fill();
-      if (isHighlight) {
-        ctx.strokeStyle = "#fff";
-        ctx.lineWidth = 2.5 / globalScale;
-        ctx.stroke();
-      }
-      ctx.globalAlpha = 1;
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+    };
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleWheel);
+  }, []);
 
-      if (globalScale > 0.1) {
-        ctx.font = `${fontSize}px system-ui, sans-serif`;
-        ctx.textAlign = "center";
-        ctx.textBaseline = "top";
-        ctx.fillStyle =
-          globalScale < 0.45
-            ? "rgba(226, 232, 240, 0.78)"
-            : "rgba(226, 232, 240, 0.92)";
-        ctx.fillText(label, n.x ?? 0, (n.y ?? 0) + r + 2 / globalScale);
-      }
+  const updateExpandedDocs = useCallback(
+    (updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+      onExpandedDocIdsChange(updater);
     },
-    [highlightId, nodeRadius, t]
+    [onExpandedDocIdsChange]
+  );
+
+  const handleGraphNodeClick = useCallback(
+    (node: ForceGraphNode) => {
+      if (isTypeClusterNode(node)) {
+        const parsed = parseTypeClusterId(node.id);
+        if (parsed) void onTypeClusterExpand?.(parsed.documentId, parsed.entityType);
+        onExpandedTypeKeysChange((prev) => {
+          const key = `${parsed!.documentId}:${parsed!.entityType}`;
+          if (prev.has(key)) return prev;
+          const next = new Set(prev);
+          next.add(key);
+          return next;
+        });
+        onNodeClick?.(node);
+        window.setTimeout(() => fitGraph(), 180);
+        return;
+      }
+
+      if (node.type === "article") {
+        const now = Date.now();
+        const last = lastArticleClickRef.current;
+        if (expandedDocIds.has(node.id) && last?.id === node.id && now - last.at < 450) {
+          updateExpandedDocs((prev) => {
+            const next = new Set(prev);
+            next.delete(node.id);
+            return next;
+          });
+          onDocumentCollapse?.(node.id);
+          lastArticleClickRef.current = null;
+          window.setTimeout(() => fitGraph(), 80);
+          return;
+        }
+        lastArticleClickRef.current = { id: node.id, at: now };
+
+        if (!expandedDocIds.has(node.id)) {
+          void onDocumentExpand?.(node.id);
+          updateExpandedDocs((prev) => {
+            const next = new Set(prev);
+            next.add(node.id);
+            return next;
+          });
+          window.setTimeout(() => fitGraph(), 120);
+        }
+      }
+      onNodeClick?.(node);
+    },
+    [expandedDocIds, fitGraph, onDocumentCollapse, onDocumentExpand, onTypeClusterExpand, onNodeClick, onExpandedTypeKeysChange, updateExpandedDocs]
+  );
+
+  const nameForNode = useCallback(
+    (node: GraphNode) => displayName(node, t("graph.unknown")),
+    [t]
   );
 
   if (nodes.length === 0) {
@@ -301,6 +389,8 @@ export function GraphView({
     );
   }
 
+  const focusLayoutMode = focusActive && graphNodes.length > 0;
+
   return (
     <div className="flex h-full min-h-[420px] flex-col overflow-hidden rounded-xl border border-slate-700/60 bg-gradient-to-b from-slate-950/90 to-slate-900/50 shadow-inner shadow-black/20">
       <div className="flex items-center justify-between gap-2 border-b border-slate-800/80 px-3 py-2">
@@ -309,17 +399,36 @@ export function GraphView({
           <span className="mx-2 text-slate-700">·</span>
           <span className="tabular-nums">
             {t("graph.nodesLinks", {
-              nodes: graphData.nodes.length,
-              links: graphData.links.length,
+              nodes: graphNodes.length,
+              links: graphLinks.length,
             })}
             {hubLayout.hiddenOrphans > 0 && (
               <span className="text-slate-600">
                 {t("graph.hiddenOrphans", { count: hubLayout.hiddenOrphans })}
               </span>
             )}
+            {collapsedDocCount > 0 && (
+              <span className="text-slate-600">
+                {t("graph.collapsedDocs", { count: collapsedDocCount })}
+              </span>
+            )}
+            {searchFocusSet && searchFocusSet.size > 0 && (
+              <span className="text-cyan-500">
+                {t("graph.searchFocus", { count: graphNodes.length })}
+              </span>
+            )}
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-1">
+          {focusLayoutMode && onDismissSearchFocus && (
+            <button
+              type="button"
+              onClick={onDismissSearchFocus}
+              className="mr-1 rounded-md border border-cyan-500/40 bg-cyan-950/50 px-2 py-1 text-[10px] font-medium text-cyan-200 transition hover:border-cyan-400/60 hover:bg-cyan-900/50"
+            >
+              {t("graph.showFullGraph")}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => zoomBy(1.35)}
@@ -350,53 +459,35 @@ export function GraphView({
         </div>
       </div>
 
-      <div ref={containerRef} className="relative min-h-0 flex-1">
-        {ready && (
-          <ForceGraph2D
-            ref={fgRef}
-            width={width}
-            height={height}
-            graphData={graphData}
-            nodeLabel={(n: GraphNode) => {
-              const name = displayName(n, t("graph.unknown"));
-              return `<div style="padding:6px 10px;background:#1e293b;border-radius:6px;font-size:12px">
-            <strong>${name}</strong><br/>
-            <span style="color:#94a3b8">${getEntityLabel(n.type, locale)}</span>
-          </div>`;
-            }}
-            nodeCanvasObject={paintNode}
-            nodePointerAreaPaint={paintPointerArea}
-            linkColor={(l: { source: GraphNode | string; target: GraphNode | string }) => {
-              const src = typeof l.source === "object" ? l.source : null;
-              const tgt = typeof l.target === "object" ? l.target : null;
-              const types = new Set([src?.type, tgt?.type]);
-              if (types.has("material")) return "rgba(244, 114, 182, 0.55)";
-              return "rgba(100, 116, 139, 0.45)";
-            }}
-            linkWidth={(l: { source: GraphNode | string; target: GraphNode | string }) => {
-              const src = typeof l.source === "object" ? l.source : null;
-              const tgt = typeof l.target === "object" ? l.target : null;
-              return src?.type === "material" || tgt?.type === "material" ? 1.8 : 1.1;
-            }}
-            linkLabel={(l: { relation?: GraphEdge["relation"] }) =>
-              l.relation ? relationLabel(l.relation, locale) : ""
-            }
-            linkDirectionalParticles={1}
-            linkDirectionalParticleWidth={2}
-            linkDirectionalParticleColor={() => "rgba(34, 211, 238, 0.55)"}
-            onNodeClick={(n: GraphNode) => onNodeClick?.(n)}
-            onEngineStop={handleEngineStop}
-            onNodeDragEnd={(node: GraphNode & { x?: number; y?: number; fx?: number; fy?: number }) => {
-              node.fx = node.x;
-              node.fy = node.y;
-            }}
-            backgroundColor="rgba(2, 6, 23, 0)"
-            cooldownTicks={80}
-            warmupTicks={20}
-            minZoom={0.25}
-            maxZoom={10}
-            enableNodeDrag
-          />
+      <div
+        ref={containerRef}
+        className="relative min-h-[360px] w-full flex-1 overscroll-contain"
+        style={{ overscrollBehavior: "contain", touchAction: "none" }}
+      >
+        <ForceGraphCanvas
+          ref={canvasRef}
+          nodes={graphNodes}
+          links={graphLinks}
+          width={width}
+          height={height}
+          highlightId={highlightId}
+          focusNodeId={focusNodeId}
+          onNodeClick={handleGraphNodeClick}
+          displayName={nameForNode}
+          truncateLabel={truncateLabel}
+          clusterLabel={clusterLabel}
+        />
+
+        {expandingDocId && (
+          <div className="pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-lg border border-cyan-500/40 bg-slate-900/95 px-3 py-1.5 text-xs text-cyan-200">
+            {t("graph.loadingDocument")}
+          </div>
+        )}
+
+        {expandingTypeKey && (
+          <div className="pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-lg border border-violet-500/40 bg-slate-900/95 px-3 py-1.5 text-xs text-violet-200">
+            {t("graph.loadingType")}
+          </div>
         )}
 
         <div className="pointer-events-none absolute inset-0 rounded-b-xl ring-1 ring-inset ring-slate-800/40" />
@@ -415,7 +506,12 @@ export function GraphView({
           ))}
         </div>
 
-        {typeFilter && (
+        {searchFocusSet && searchFocusSet.size > 0 && (
+          <div className="absolute right-3 top-3 rounded-lg border border-cyan-500/40 bg-slate-900/90 px-2.5 py-1 text-[10px] text-cyan-300 backdrop-blur-sm">
+            {t("graph.searchFocusBadge")}
+          </div>
+        )}
+        {typeFilter && !searchFocusSet && (
           <div className="absolute right-3 top-3 rounded-lg border border-cyan-500/30 bg-slate-900/90 px-2.5 py-1 text-[10px] text-cyan-300 backdrop-blur-sm">
             {t("graph.filterBadge", {
               type: getEntityLabel(typeFilter, locale),

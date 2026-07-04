@@ -17,14 +17,19 @@ from infra.llm_client import LLMClient
 from search.citations import (
     build_answer_system,
     build_index_to_document,
+    build_numeric_answer_instruction,
     citation_coverage,
     enforce_citation_document_isolation,
     extract_person_facts_from_chunks,
+    extract_technical_facts_with_llm,
+    facts_address_question,
     format_grounded_answer,
     is_name_question,
+    is_technical_quantitative_question,
+    prune_unsupported_heading_bullets,
     validate_facts,
 )
-from search.context import compress_chunks
+from search.context import compress_chunks, fit_chunks_to_context_budget, resolve_rag_max_chars, resolve_rag_chunk_max_chars, resolve_context_tokens
 from search.document_scope import (
     DocumentScope,
     aggregate_document_scores,
@@ -35,7 +40,12 @@ from search.document_scope import (
     resolve_document_scope,
     scope_instruction,
 )
-from search.query_processing import answer_language_instruction, resolve_answer_language
+from search.query_processing import (
+    answer_language_instruction,
+    requests_experiment_list,
+    resolve_answer_language,
+    significant_terms,
+)
 from search.query_rewrite import auxiliary_retrieval_queries, rewrite_query_for_retrieval
 from search.relevance import compute_confidence
 from search.retrieval import HybridRetriever, RetrievedChunk
@@ -45,7 +55,8 @@ from storage.vector_db import VectorDB
 
 logger = logging.getLogger(__name__)
 
-RETRIEVAL_LIMIT = 8
+RETRIEVAL_LIMIT = 10
+RETRIEVAL_LIMIT_TECHNICAL = 16
 AGGREGATE_CHUNKS_PER_DOC = 4
 MAX_AGGREGATE_DOCS = 12
 
@@ -68,16 +79,19 @@ class RAGService:
         question = (query.text or "").strip()
         forced_doc_id = (query.document_id or query.filters.get("document_id") or "").strip() or None
 
-        rewritten = await rewrite_query_for_retrieval(self.llm_client, question)
+        filter_payload, filter_doc_ids, _graph_ctx, _ = (
+            self._resolve_structured_filters(query, question)
+        )
+        has_structured_filters = bool(filter_payload) and not forced_doc_id
+        retrieval_question = self._focus_retrieval_query(question, filter_payload)
+        focus_terms = self._focus_terms(filter_payload, question)
+        retrieval_limit = self._retrieval_limit(question)
+
+        rewritten = await rewrite_query_for_retrieval(self.llm_client, retrieval_question)
         aux = [] if is_name_question(question) else auxiliary_retrieval_queries(rewritten)
 
         all_documents = self.graph_db.list_documents()
         answer_lang = resolve_answer_language(question)
-
-        filter_payload, filter_doc_ids, graph_ctx, _ = (
-            self._resolve_structured_filters(query, question)
-        )
-        has_structured_filters = bool(filter_payload) and not forced_doc_id
 
         if query_requests_aggregate(question) and not forced_doc_id:
             return await self._answer_aggregate(question, aux, answer_lang, all_documents)
@@ -94,16 +108,32 @@ class RAGService:
             return disambiguation
 
         retrieved, scope, retrieval_scope = await self._retrieve_scoped(
-            question,
+            retrieval_question,
             aux,
             forced_document_id=forced_doc_id,
             all_documents=all_documents,
             structured_document_ids=filter_doc_ids if has_structured_filters else None,
             structured_filters_active=has_structured_filters,
             filter_payload=filter_payload,
+            retrieval_limit=retrieval_limit,
         )
         context_chunks = [chunk.as_context_dict() for chunk in retrieved]
-        context_chunks = compress_chunks(context_chunks, question)
+        context_chunks = self._append_graph_experiments_context(
+            question, context_chunks, filter_payload
+        )
+        context_chunks = compress_chunks(
+            context_chunks,
+            retrieval_question,
+            max_chunk_chars=resolve_rag_chunk_max_chars(
+                self.settings, len(context_chunks) or retrieval_limit
+            ),
+        )
+        context_chunks = fit_chunks_to_context_budget(
+            context_chunks,
+            retrieval_question,
+            max_total_chars=resolve_rag_max_chars(self.settings),
+            settings=self.settings,
+        )
         if scope.mode in ("multi", "aggregate"):
             context_chunks = self._sort_chunks_by_document(context_chunks)
 
@@ -111,14 +141,22 @@ class RAGService:
             return self._empty_result(answer_lang, retrieval_scope)
 
         full_context = self._assemble_context(context_chunks, scope)
-        if graph_ctx:
-            full_context = graph_ctx + "\n\n" + full_context
         answer, used_grounded = await self._generate_answer(
-            question, full_context, context_chunks, answer_lang, scope
+            question,
+            full_context,
+            context_chunks,
+            answer_lang,
+            scope,
+            filter_payload=filter_payload,
         )
 
         index_to_doc = build_index_to_document(context_chunks)
         answer, had_cross_doc = enforce_citation_document_isolation(answer, index_to_doc)
+        answer = prune_unsupported_heading_bullets(
+            answer,
+            context_chunks,
+            focus_terms=focus_terms,
+        )
         if had_cross_doc:
             logger.info("Split cross-document citations in answer")
 
@@ -176,7 +214,7 @@ class RAGService:
 
         probe = await self.retriever.retrieve(
             question,
-            limit=RETRIEVAL_LIMIT,
+            limit=self._retrieval_limit(question),
             auxiliary_queries=auxiliary_queries,
         )
         probe_chunks = [chunk.as_context_dict() for chunk in probe]
@@ -258,7 +296,17 @@ class RAGService:
                 continue
 
             chunks = compress_chunks(
-                [c.as_context_dict() for c in retrieved], question
+                [c.as_context_dict() for c in retrieved],
+                question,
+                max_chunk_chars=resolve_rag_chunk_max_chars(
+                    self.settings, AGGREGATE_CHUNKS_PER_DOC
+                ),
+            )
+            chunks = fit_chunks_to_context_budget(
+                chunks,
+                question,
+                max_total_chars=resolve_rag_max_chars(self.settings) // MAX_AGGREGATE_DOCS,
+                settings=self.settings,
             )
             title = doc.get("title") or self.graph_db.get_document_title(doc_id)
             for chunk in chunks:
@@ -269,7 +317,7 @@ class RAGService:
                 chunks, scope, start_index=start_index
             )
             section = await self._generate_direct_answer(
-                question, context, answer_lang, scope
+                question, context, answer_lang, scope, context_chunks=chunks
             )
             index_to_doc = {
                 start_index + i: doc_id
@@ -352,6 +400,7 @@ class RAGService:
         structured_document_ids: list[str] | None = None,
         structured_filters_active: bool = False,
         filter_payload: dict | None = None,
+        retrieval_limit: int = RETRIEVAL_LIMIT,
     ) -> tuple[list[RetrievedChunk], DocumentScope, RetrievalScopeDTO]:
         """Probe retrieval, then focus on one document unless comparison is requested."""
         all_documents = all_documents or self.graph_db.list_documents()
@@ -360,7 +409,7 @@ class RAGService:
         if forced_document_id:
             probe = await self.retriever.retrieve(
                 question,
-                limit=RETRIEVAL_LIMIT,
+                limit=retrieval_limit,
                 auxiliary_queries=auxiliary_queries,
                 document_id=forced_document_id,
             )
@@ -383,7 +432,7 @@ class RAGService:
             if structured_document_ids:
                 scoped = await self.retriever.retrieve(
                     question,
-                    limit=RETRIEVAL_LIMIT,
+                    limit=retrieval_limit,
                     auxiliary_queries=auxiliary_queries,
                     document_ids=structured_document_ids,
                 )
@@ -403,7 +452,7 @@ class RAGService:
 
             probe = await self.retriever.retrieve(
                 question,
-                limit=RETRIEVAL_LIMIT,
+                limit=retrieval_limit,
                 auxiliary_queries=auxiliary_queries,
             )
             probe_chunks = [chunk.as_context_dict() for chunk in probe]
@@ -423,7 +472,7 @@ class RAGService:
 
         probe = await self.retriever.retrieve(
             question,
-            limit=RETRIEVAL_LIMIT,
+            limit=retrieval_limit,
             auxiliary_queries=auxiliary_queries,
         )
         probe_chunks = [chunk.as_context_dict() for chunk in probe]
@@ -441,10 +490,10 @@ class RAGService:
         if scope.mode in ("single", "explicit") and scope.primary_document_id:
             focused = await self.retriever.retrieve(
                 question,
-                limit=RETRIEVAL_LIMIT,
+                limit=retrieval_limit,
                 auxiliary_queries=auxiliary_queries,
                 document_id=scope.primary_document_id,
-                max_per_document=RETRIEVAL_LIMIT,
+                max_per_document=retrieval_limit,
             )
             if focused:
                 return focused, scope, retrieval_scope
@@ -457,7 +506,7 @@ class RAGService:
                 if str(chunk.document_id) in allowed
             ]
             if filtered:
-                return filtered[:RETRIEVAL_LIMIT], scope, retrieval_scope
+                return filtered[:retrieval_limit], scope, retrieval_scope
 
         return probe, scope, retrieval_scope
 
@@ -474,6 +523,8 @@ class RAGService:
         context_chunks: list[dict],
         answer_lang: str,
         scope: DocumentScope,
+        *,
+        filter_payload: dict | None = None,
     ) -> tuple[str, bool]:
         num_sources = len(context_chunks)
 
@@ -487,8 +538,22 @@ class RAGService:
             if facts:
                 return format_grounded_answer(facts, lang=answer_lang), True
 
+        if is_technical_quantitative_question(question):
+            facts = validate_facts(
+                await extract_technical_facts_with_llm(
+                    self.llm_client,
+                    question,
+                    context,
+                    answer_lang=answer_lang,
+                ),
+                num_sources,
+            )
+            if facts and facts_address_question(question, facts):
+                return format_grounded_answer(facts, lang=answer_lang), True
+
         answer = await self._generate_direct_answer(
-            question, context, answer_lang, scope
+            question, context, answer_lang, scope, filter_payload=filter_payload or {},
+            context_chunks=context_chunks,
         )
         return answer, False
 
@@ -498,11 +563,18 @@ class RAGService:
         context: str,
         answer_lang: str,
         scope: DocumentScope,
+        *,
+        filter_payload: dict | None = None,
+        context_chunks: list[dict] | None = None,
     ) -> str:
         lang_line = answer_language_instruction(answer_lang)
         doc_line = scope_instruction(scope, answer_lang)
+        focus_line = self._answer_focus_instruction(filter_payload or {}, answer_lang)
+        numeric_line = build_numeric_answer_instruction(question, answer_lang)
         user_message = f"""{lang_line}
 {doc_line}
+{focus_line}
+{numeric_line}
 
 QUESTION: {question}
 
@@ -510,14 +582,38 @@ EXCERPTS:
 {context}
 
 Answer the question directly using only the excerpts above.
+Include specific numbers with units for every technical claim.
+Do not list bare section or process titles — write full factual sentences with citations.
 {doc_line}
+{focus_line}
+{numeric_line}
 {lang_line}"""
 
-        return await self.llm_client.chat(
-            user_message=user_message,
-            system_message=build_answer_system(answer_lang),
-            temperature=0.1,
-        )
+        try:
+            return await self.llm_client.chat(
+                user_message=user_message,
+                system_message=build_answer_system(answer_lang),
+                temperature=0.0,
+            )
+        except Exception as exc:
+            if not self.llm_client.is_context_overflow(exc) or not context_chunks:
+                raise
+            logger.warning(
+                "Answer generation exceeded context window; retrying with tighter excerpts"
+            )
+            trimmed = fit_chunks_to_context_budget(
+                context_chunks,
+                question,
+                max_total_chars=resolve_rag_max_chars(self.settings) // 2,
+                settings=self.settings,
+            )
+            retry_context = self._assemble_context(trimmed, scope)
+            retry_message = user_message.replace(context, retry_context)
+            return await self.llm_client.chat(
+                user_message=retry_message,
+                system_message=build_answer_system(answer_lang),
+                temperature=0.0,
+            )
 
     def _assemble_context(
         self,
@@ -656,10 +752,158 @@ Answer the question directly using only the excerpts above.
                 filters["geography"] = scope
                 break
         import re
+        from datetime import datetime
+
         year_match = re.search(r"(20\d{2})\s*[-–]\s*(20\d{2})", question)
         if year_match:
             filters["year_from"] = int(year_match.group(1))
             filters["year_to"] = int(year_match.group(2))
-        elif re.search(r"last\s+5\s+years", lower):
-            filters["year_from"] = 2021
+        elif re.search(r"last\s+5\s+years|последн\w*\s+5\s+лет", lower):
+            filters["year_from"] = datetime.now().year - 5
         return filters
+
+    @staticmethod
+    def _focus_retrieval_query(question: str, filter_payload: dict) -> str:
+        parts: list[str] = []
+        material = (filter_payload.get("material") or "").strip()
+        process = (filter_payload.get("process") or "").strip()
+        if material:
+            parts.append(material)
+        if process:
+            parts.append(process)
+        if not parts:
+            return question
+        return f"{' '.join(parts)} {question}".strip()
+
+    @staticmethod
+    def _focus_terms(filter_payload: dict, question: str) -> list[str]:
+        terms: list[str] = []
+        for key in ("material", "process", "property_name"):
+            value = (filter_payload.get(key) or "").strip()
+            if value:
+                terms.append(value.lower())
+        terms.extend(significant_terms(question, min_length=4))
+        seen: set[str] = set()
+        out: list[str] = []
+        for term in terms:
+            if term not in seen:
+                seen.add(term)
+                out.append(term)
+        return out
+
+    @staticmethod
+    def _answer_focus_instruction(filter_payload: dict, answer_lang: str) -> str:
+        material = (filter_payload.get("material") or "").strip()
+        process = (filter_payload.get("process") or "").strip()
+        if not material and not process:
+            return ""
+        if answer_lang == "ru":
+            if material and process:
+                return (
+                    f"ФОКУС: отвечайте только о материале «{material}» и процессе «{process}» "
+                    "с конкретными фактами из выдержек (цифры, условия, результаты)."
+                )
+            if material:
+                return (
+                    f"ФОКУС: отвечайте только о материале «{material}» с конкретными фактами "
+                    "из выдержек (содержание, извлечение, условия, результаты)."
+                )
+            return (
+                f"ФОКУС: отвечайте только о процессе «{process}» с конкретными фактами из выдержек."
+            )
+        if material and process:
+            return (
+                f"FOCUS: answer only about material '{material}' and process '{process}' "
+                "with concrete facts from excerpts (numbers, conditions, outcomes)."
+            )
+        if material:
+            return (
+                f"FOCUS: answer only about material '{material}' with concrete facts from excerpts "
+                "(grades, extraction, conditions, results) — not unrelated section titles."
+            )
+        return (
+            f"FOCUS: answer only about process '{process}' with concrete facts from excerpts."
+        )
+
+    def _retrieval_limit(self, question: str) -> int:
+        if is_technical_quantitative_question(question):
+            base = RETRIEVAL_LIMIT_TECHNICAL
+        else:
+            base = RETRIEVAL_LIMIT
+        ctx = resolve_context_tokens(self.settings)
+        if ctx <= 8192:
+            return min(base, 6)
+        if ctx <= 32_768:
+            return min(base, 12)
+        return base
+
+    def _append_graph_experiments_context(
+        self,
+        question: str,
+        chunks: list[dict],
+        filter_payload: dict | None,
+    ) -> list[dict]:
+        """Prepend graph experiment index for list-all-experiments questions."""
+        if not requests_experiment_list(question):
+            return chunks
+
+        payload = dict(filter_payload or {})
+        payload.update(self._infer_filters_from_question(question))
+
+        material_terms = self._detect_material_terms(question)
+        if material_terms and not payload.get("material"):
+            payload["material"] = material_terms[0]
+
+        if not payload:
+            return chunks
+
+        try:
+            kwargs = {k: v for k, v in payload.items() if v is not None}
+            result = self.graph_db.structured_search(limit=20, **kwargs)
+        except Exception as exc:
+            logger.warning("Graph experiment index failed: %s", exc)
+            return chunks
+
+        rows = result.get("experiments") or []
+        if not rows:
+            return chunks
+
+        lines = [
+            "INDEX OF MATCHING EXPERIMENTS FROM KNOWLEDGE GRAPH "
+            "(use alongside numbered excerpts; cite excerpts for numeric values):"
+        ]
+        for row in rows[:18]:
+            lines.append(
+                f"- Material: {row.get('material')} | Process: {row.get('process') or row.get('regime')} "
+                f"| Document: {row.get('document_title')} ({row.get('year') or 'n/d'}) "
+                f"| Scope: {row.get('scope') or row.get('country') or 'n/d'}"
+            )
+
+        doc_id = str(rows[0].get("document_id") or "")
+        synth = {
+            "chunk_id": "graph-experiment-index",
+            "text": "\n".join(lines),
+            "document_id": doc_id,
+            "title": rows[0].get("document_title"),
+            "score": 1.0,
+        }
+        return [synth] + chunks
+
+    @staticmethod
+    def _detect_material_terms(question: str) -> list[str]:
+        lower = question.lower()
+        terms: list[str] = []
+        markers = (
+            ("золот", "gold"),
+            ("серебр", "silver"),
+            ("никел", "nickel"),
+            ("мед", "copper"),
+            ("мпг", "pgm"),
+            ("platinum", "platinum"),
+            ("au", "gold"),
+            ("ag", "silver"),
+        )
+        for marker, canonical in markers:
+            if marker in lower and canonical not in terms:
+                terms.append(canonical)
+        return terms

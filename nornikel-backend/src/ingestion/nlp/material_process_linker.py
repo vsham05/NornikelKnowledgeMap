@@ -207,4 +207,4 @@ def build_material_process_links(
             if _score_material_process(mat, best_proc, text_lower) > 0:
                 add(mat.name, best_proc["id"])
 
-    return links[:80]
+    return links

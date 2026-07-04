@@ -86,6 +86,9 @@ class MaterialDTO(BaseModel):
         """
         merged_properties = {**self.properties, **other.properties}
         merged_aliases = list(set(self.aliases + other.aliases))
+        if other.name.strip() and other.name.strip().lower() != self.name.strip().lower():
+            merged_aliases.append(other.name.strip())
+        merged_aliases = list(set(merged_aliases))
         merged_microstructure = list(set(
             self.microstructure_features + other.microstructure_features
         ))

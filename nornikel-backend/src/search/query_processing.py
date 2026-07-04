@@ -55,10 +55,60 @@ TEMPORAL_QUERY_RE = re.compile(
 )
 QUANT_QUERY_RE = re.compile(
     r"\b(how\s+many|how\s+much|percent|percentage|number|count|total|average|median|rate|"
-    r"сколько|процент|процентов|число|количество|сумм|средн|медиан)\b",
+    r"сколько|процент|процентов|число|количество|сумм|средн|медиан|показател)\b",
     re.IGNORECASE,
 )
+TECHNICAL_QUANT_RE = re.compile(
+    r"(?:"
+    r"мг/л|mg/l|мг/дм|mg/dm|ppm|г/л|g/l|"
+    r"≤|≥|<|>|"
+    r"\bph\b|ph\s*range|concentration|retention\s+time|"
+    r"de-?zn|zinc\s+removal|coral\s+bay|"
+    r"оптимальн|скорост\w*\s+поток|технико-эконом|"
+    r"распределени|содержани|извлечен|концентрац|"
+    r"сухой\s+остаток|обессолив|католит|электроэкстракц|"
+    r"штейн|шлак|мпг|pgm|precious|"
+    r"flow\s+rate|desalination|electrowinning|catholyte"
+    r")",
+    re.IGNORECASE,
+)
+LIST_EXPERIMENTS_RE = re.compile(
+    r"(?:"
+    r"покажите\s+все|все\s+эксперимент|все\s+публикац|"
+    r"list\s+all|show\s+all\s+experiment"
+    r")",
+    re.IGNORECASE,
+)
+NUMERIC_ANCHOR_RE = re.compile(
+    r"[\d]+(?:[.,]\d+)?(?:\s*[-–—]\s*[\d]+(?:[.,]\d+)?)?"
+    r"(?:\s*(?:мг/л|mg/l|мг/дм³?|mg/dm³?|%|°c|℃|м/ч|м³/ч|m3/h|мм/с))?",
+    re.IGNORECASE,
+)
+CHEM_SYMBOL_RE = re.compile(
+    r"\b(?:Ca|Mg|Na|Ni|Cu|Au|Ag|Fe|Al|Zn|Co|SO4|Cl|H2SO4|pH|"
+    r"сульфат|хлорид|никел|мед|золот|серебр)\w*\b",
+    re.IGNORECASE,
+)
+PROPER_NOUN_PHRASE_RE = re.compile(
+    r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b"
+)
+HYPHEN_TERM_RE = re.compile(r"\b[A-Za-z]+(?:-[A-Za-z0-9]+)+\b")
+TECH_SHORT_TERMS = frozenset({
+    "ph", "zn", "ni", "cu", "au", "ag", "fe", "al", "co", "mg", "na", "ca",
+    "hpal", "hcl", "h2so4", "ppm",
+})
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+PAGE_REF_RE = re.compile(
+    r"(?:\bpage|\bpages|\bp\.|\bpp\.|\bстр\.?|\bстраниц(?:а|е|ы)?)\s*[#:]?\s*(\d{1,4})\b",
+    re.IGNORECASE,
+)
+SPELLING_VARIANTS: dict[str, str] = {
+    "sulphuric": "sulfuric",
+    "sulphur": "sulfur",
+    "sulphate": "sulfate",
+    "aluminium": "aluminum",
+    "artefact": "artifact",
+}
 
 HARM_TERMS = (
     "harm", "damage", "overcharge", "hurt", "loss",
@@ -73,8 +123,12 @@ class QueryIntent:
     is_name: bool
     is_temporal: bool
     is_quantitative: bool
+    is_technical: bool
+    wants_experiment_list: bool
     harm_related: bool
     content_terms: tuple[str, ...]
+    numeric_anchors: tuple[str, ...]
+    page_refs: tuple[int, ...]
 
 
 def detect_language(text: str) -> str:
@@ -150,25 +204,56 @@ def significant_terms(query: str, *, min_length: int = 2) -> list[str]:
     return [fallback] if fallback else []
 
 
-def extract_search_terms(query: str, *, limit: int = 12) -> list[str]:
+def extract_search_terms(query: str, *, limit: int = 16) -> list[str]:
     """Terms for Neo4j CONTAINS / sparse keyword retrieval."""
-    terms = significant_terms(query)
-    if len(terms) >= 2:
-        return terms[:limit]
+    terms = significant_terms(query, min_length=2)
+    seen = set(t.lower() for t in terms)
 
-    # Fallback: keep Cyrillic/Latin tokens even if short
+    def push(value: str) -> None:
+        v = value.strip().lower()
+        if not v or v in seen:
+            return
+        seen.add(v)
+        terms.append(v)
+
+    for match in PROPER_NOUN_PHRASE_RE.finditer(query):
+        push(match.group(0))
+        for part in match.group(0).split():
+            if len(part) >= 3:
+                push(part)
+
+    for match in HYPHEN_TERM_RE.finditer(query):
+        push(match.group(0))
+        for part in re.split(r"[-/]", match.group(0)):
+            if len(part) >= 2:
+                push(part)
+
+    for match in CHEM_SYMBOL_RE.finditer(query):
+        push(match.group(0))
+
+    if re.search(r"\bph\b", query, re.IGNORECASE):
+        push("ph")
+
+    for token in tokenize(query, min_length=2):
+        if token in TECH_SHORT_TERMS:
+            push(token)
+
+    if len(terms) >= 2:
+        return expand_spelling_variants(terms[:limit])
+
     extra = [t for t in tokenize(query, min_length=2) if not is_stopword(t)]
     merged: list[str] = []
-    seen: set[str] = set()
+    seen2: set[str] = set()
     for t in terms + extra:
-        if t not in seen:
-            seen.add(t)
+        key = t.lower()
+        if key not in seen2:
+            seen2.add(key)
             merged.append(t)
     if merged:
-        return merged[:limit]
+        return expand_spelling_variants(merged[:limit])
 
     q = query.lower().strip()
-    return [q[:60]] if q else []
+    return expand_spelling_variants([q[:60]]) if q else []
 
 
 def is_name_question(query: str) -> bool:
@@ -180,22 +265,92 @@ def query_harm_related(query: str) -> bool:
     return any(term in lower for term in HARM_TERMS)
 
 
+def extract_page_refs(query: str) -> list[int]:
+    """Page numbers explicitly cited in the question (e.g. 'Page 228')."""
+    pages: list[int] = []
+    seen: set[int] = set()
+    for match in PAGE_REF_RE.finditer(query):
+        try:
+            page = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if page <= 0 or page in seen:
+            continue
+        seen.add(page)
+        pages.append(page)
+    return pages[:8]
+
+
+def expand_spelling_variants(terms: list[str]) -> list[str]:
+    """Add US/UK spelling variants so keyword search hits both forms."""
+    out = list(terms)
+    seen = {t.lower() for t in terms}
+    for term in terms:
+        alt = SPELLING_VARIANTS.get(term.lower())
+        if alt and alt not in seen:
+            seen.add(alt)
+            out.append(alt)
+    return out
+
+
+def extract_numeric_anchors(query: str) -> list[str]:
+    """Numbers, ranges, and units from the question for retrieval anchoring."""
+    anchors: list[str] = []
+    seen: set[str] = set()
+    for match in NUMERIC_ANCHOR_RE.finditer(query):
+        token = match.group(0).strip()
+        if token and token not in seen:
+            seen.add(token)
+            anchors.append(token)
+    for match in CHEM_SYMBOL_RE.finditer(query):
+        token = match.group(0).strip()
+        key = token.lower()
+        if key not in seen:
+            seen.add(key)
+            anchors.append(token)
+    return anchors[:16]
+
+
+def is_technical_quantitative_question(query: str) -> bool:
+    if not query.strip():
+        return False
+    if TECHNICAL_QUANT_RE.search(query):
+        return True
+    if QUANT_QUERY_RE.search(query) and re.search(r"\d", query):
+        return True
+    if LIST_EXPERIMENTS_RE.search(query):
+        return True
+    anchors = extract_numeric_anchors(query)
+    return len(anchors) >= 2 and len(significant_terms(query)) >= 5
+
+
+def requests_experiment_list(query: str) -> bool:
+    return bool(LIST_EXPERIMENTS_RE.search(query))
+
+
 def analyze_intent(query: str) -> QueryIntent:
-    terms = tuple(significant_terms(query))
+    terms = tuple(extract_search_terms(query, limit=16))
+    anchors = tuple(extract_numeric_anchors(query))
+    pages = tuple(extract_page_refs(query))
+    technical = is_technical_quantitative_question(query)
     return QueryIntent(
         original=query.strip(),
         language=detect_language(query),
         is_name=bool(NAME_QUERY_RE.search(query)),
         is_temporal=bool(TEMPORAL_QUERY_RE.search(query)),
-        is_quantitative=bool(QUANT_QUERY_RE.search(query)),
+        is_quantitative=bool(QUANT_QUERY_RE.search(query)) or technical or bool(pages),
+        is_technical=technical,
+        wants_experiment_list=requests_experiment_list(query),
         harm_related=query_harm_related(query),
         content_terms=terms,
+        numeric_anchors=anchors,
+        page_refs=pages,
     )
 
 
 def keyword_search_string(query: str, extra_keywords: list[str] | None = None) -> str:
     """Build a keyword-focused string for sparse retrieval."""
-    parts = list(significant_terms(query))
+    parts = list(extract_search_terms(query, limit=14))
     for kw in extra_keywords or []:
         for token in tokenize(kw, min_length=2):
             if not is_stopword(token) and token not in parts:

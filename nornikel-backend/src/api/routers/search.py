@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Form
+import logging
 
 from domain.dto.query import UserQueryDTO
 from search.rag_service import RAGService
 from settings import get_settings
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _result_payload(query: str, result) -> dict:
@@ -24,7 +26,38 @@ def _result_payload(query: str, result) -> dict:
 async def _run_rag(query: UserQueryDTO):
     settings = get_settings()
     rag_service = RAGService(settings)
-    result = await rag_service.answer_question(query)
+    try:
+        result = await rag_service.answer_question(query)
+    except Exception as exc:
+        logger.exception("RAG search failed: %s", exc)
+        lang = "ru" if any("\u0400" <= c <= "\u04FF" for c in (query.text or "")) else "en"
+        if lang == "ru":
+            answer = (
+                "Не удалось сформировать ответ — контекст модели переполнен или LLM недоступен. "
+                "Попробуйте сузить запрос или переключитесь на модель с большим контекстом."
+            )
+        else:
+            answer = (
+                "Could not generate an answer — the model context was exceeded or the LLM is unavailable. "
+                "Try a narrower query or switch to a model with a larger context window."
+            )
+        return {
+            "query": query.text or "",
+            "answer": answer,
+            "document_ids": [],
+            "experiment_ids": [],
+            "confidence": 0.0,
+            "sources": [],
+            "needs_disambiguation": False,
+            "document_candidates": [],
+            "retrieval_scope": {
+                "mode": "full_corpus",
+                "filter_document_ids": [],
+                "filter_document_titles": [],
+                "filters_applied": {},
+                "graph_match_count": 0,
+            },
+        }
     return _result_payload(query.text or "", result)
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Depends
+from fastapi.responses import Response
 from pydantic import BaseModel, Field, HttpUrl
 
 from urllib.parse import urlparse
@@ -50,6 +51,8 @@ class TaskStatus(BaseModel):
     status: Literal["pending", "processing", "completed", "failed"]
     progress: float = Field(0.0, ge=0.0, le=1.0)
     message: str = ""
+    ingest_llm_provider: str | None = None
+    ingest_llm_model: str | None = None
     result: dict | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=datetime.now)
@@ -227,7 +230,13 @@ async def delete_document(
     except Exception as e:
         logger.warning(f"Qdrant cleanup for {document_id}: {e}")
 
-    return {"status": "deleted", "document_id": document_id}
+    orphans = graph_db.purge_orphan_entities()
+
+    return {
+        "status": "deleted",
+        "document_id": document_id,
+        "orphans": orphans,
+    }
 
 
 @router.delete("/documents")
@@ -237,7 +246,7 @@ async def delete_all_documents(
 ):
     """
     Delete ALL ingested documents and derived graph entities (full knowledge reset).
-    Clears Neo4j ingestion graph + Qdrant text/visual collections.
+    Clears Neo4j ingestion graph + Qdrant text/visual collections + orphan residue.
     """
     graph_result = graph_db.purge_all_ingested_data()
     vector_status = "cleared"
@@ -247,9 +256,12 @@ async def delete_all_documents(
         logger.warning(f"Qdrant full clear failed: {e}")
         vector_status = f"failed: {e}"
 
+    orphans = graph_db.purge_orphan_entities()
+
     return {
         "status": "purged",
         "graph": graph_result,
+        "orphans": orphans,
         "vectors": vector_status,
         "message": "All documents and derived knowledge graph data were removed.",
     }
@@ -265,16 +277,10 @@ async def get_document(
     with db.driver.session() as session:
         result = session.run("""
             MATCH (d:Document {id: $id})
-            OPTIONAL MATCH (d)-[:CONTAINS_IMAGE]->(i:Image)
+            OPTIONAL MATCH (d)-[:HAS_FIGURES]->(g:FigureGallery)
             OPTIONAL MATCH (e:Experiment)-[:DESCRIBED_IN]->(d)
             OPTIONAL MATCH (m:Material)<-[:USES_MATERIAL]-(e)
             RETURN d,
-                   collect(DISTINCT {
-                       id: i.id,
-                       type: i.image_type,
-                       caption: i.caption,
-                       description: i.ai_description
-                   }) as images,
                    collect(DISTINCT {
                        experiment_id: e.id,
                        regime: e.regime_name,
@@ -287,10 +293,39 @@ async def get_document(
             raise HTTPException(status_code=404, detail="Document not found")
         
         doc = dict(record["d"])
-        doc["images"] = [img for img in record["images"] if img.get("id")]
+        doc["images"] = graph_db.list_document_figures(document_id)
+        doc["images_count"] = len(doc["images"])
         doc["experiments"] = [exp for exp in record["experiments"] if exp.get("experiment_id")]
         
         return doc
+
+
+@router.get("/documents/{document_id}/figures")
+async def list_document_figures(
+    document_id: str,
+    graph_db=Depends(get_graph_db),
+):
+    """List figures extracted from a document (metadata for the Figures blob)."""
+    items = graph_db.list_document_figures(document_id)
+    return {"document_id": document_id, "figures": items, "count": len(items)}
+
+
+@router.get("/documents/{document_id}/images/{image_id}")
+async def get_document_image(
+    document_id: str,
+    image_id: str,
+    graph_db=Depends(get_graph_db),
+    document_db: DocumentDB = Depends(get_document_db),
+):
+    """Serve stored figure bytes from MinIO."""
+    storage_key = graph_db.get_image_storage_key(document_id, image_id)
+    if not storage_key:
+        raise HTTPException(status_code=404, detail="Image not found")
+    try:
+        data, content_type = document_db.get_image_bytes(storage_key)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Image file missing: {exc}") from exc
+    return Response(content=data, media_type=content_type)
 
 
 # ================== Background Tasks ==================
@@ -315,6 +350,18 @@ def _task_result_from_ingest(result, source_label: str) -> dict:
     }
 
 
+async def _run_pipeline_in_thread(async_fn, /, *args, **kwargs):
+    """Run ingest coroutine off the main FastAPI loop so /health stays responsive."""
+
+    def _runner() -> object:
+        async def _inner():
+            return await async_fn(*args, **kwargs)
+
+        return asyncio.run(_inner())
+
+    return await asyncio.to_thread(_runner)
+
+
 async def _process_file_task(
     task_id: str,
     file_path: Path,
@@ -324,11 +371,25 @@ async def _process_file_task(
     """Фоновая задача обработки файла."""
     task = _tasks[task_id]
     task.status = "processing"
-    task.progress = 0.1
+    task.progress = 0.05
     task.message = f"Parsing {original_filename}..."
-    
+
+    def on_progress(progress: float, message: str, meta: dict | None = None) -> None:
+        task.progress = min(0.99, max(task.progress, progress))
+        task.message = message
+        if meta:
+            if meta.get("llm_provider"):
+                task.ingest_llm_provider = str(meta["llm_provider"])
+            if meta.get("llm_model"):
+                task.ingest_llm_model = str(meta["llm_model"])
+
     try:
-        result = await pipeline.process_file(file_path, original_filename=original_filename)
+        result = await _run_pipeline_in_thread(
+            pipeline.process_file,
+            file_path,
+            original_filename=original_filename,
+            on_progress=on_progress,
+        )
         task.progress = 1.0
         task.status = "completed"
         task.completed_at = datetime.now()
@@ -362,17 +423,31 @@ async def _process_url_task(
     task.status = "processing"
     task.progress = 0.1
     task.message = f"Scraping {url}..."
-    
+
+    def on_progress(progress: float, message: str, meta: dict | None = None) -> None:
+        task.progress = min(0.99, max(task.progress, progress))
+        task.message = message
+        if meta:
+            if meta.get("llm_provider"):
+                task.ingest_llm_provider = str(meta["llm_provider"])
+            if meta.get("llm_model"):
+                task.ingest_llm_model = str(meta["llm_model"])
+
     try:
         scraper = WebScraper(use_playwright=use_playwright)
         try:
-            task.progress = 0.3
+            task.progress = 0.2
             task.message = f"Scraping {url}..."
             document = await scraper.scrape(url)
 
-            task.progress = 0.7
+            task.progress = 0.35
             task.message = "Checking for duplicates..."
-            result = await pipeline.ingest_url_document(document, url)
+            result = await _run_pipeline_in_thread(
+                pipeline.ingest_url_document,
+                document,
+                url,
+                on_progress=on_progress,
+            )
 
             task.progress = 1.0
             task.status = "completed"

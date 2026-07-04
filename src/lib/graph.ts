@@ -15,6 +15,7 @@ const ENTITY_COLORS: Record<EntityType, string> = {
   process: "#38bdf8",
   facility: "#c084fc",
   expert: "#fdba74",
+  figures: "#a855f7",
 };
 
 export function getEntityColor(type: EntityType): string {
@@ -39,6 +40,7 @@ export function getEntityLabel(type: EntityType, locale?: Locale): string {
     process: "Process",
     facility: "Facility",
     expert: "Expert",
+    figures: "Figures",
   };
   return labels[type];
 }
@@ -46,8 +48,11 @@ export function getEntityLabel(type: EntityType, locale?: Locale): string {
 /** Visual radius multiplier — keep in sync with GraphView nodeRadius. */
 export const NODE_RADIUS_SCALE = 5;
 
-/** Minimum gap between node circles (layout + collision). */
-export const NODE_GAP_PX = 22;
+/** Minimum gap between node circles (~1 cm at typical screen DPI when zoomed to fit). */
+export const NODE_GAP_PX = 38;
+
+/** Layout val for expanded entity nodes — keep in sync with ForceGraphCanvas ENTITY_NODE_VAL. */
+export const LAYOUT_ENTITY_VAL = 2.2;
 
 export function graphNodeRadius(val: number = 4): number {
   return Math.sqrt(val) * NODE_RADIUS_SCALE;

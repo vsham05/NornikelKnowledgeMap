@@ -1,4 +1,5 @@
 import logging
+import json
 from uuid import UUID
 
 from neo4j import AsyncGraphDatabase, GraphDatabase
@@ -8,6 +9,7 @@ from domain.material_taxonomy import coerce_material_class, get_material_taxonom
 from domain.dto.experiment import ExperimentDTO
 from domain.dto.document import DocumentDTO, DocumentChunkDTO
 from domain.enums import DOCUMENT_RELIABILITY, DocumentType
+from domain.property_labels import property_display_label
 from settings import Settings
 from search.query_processing import extract_search_terms
 
@@ -17,21 +19,48 @@ VISUAL_NODE_LABELS = (
     "Document",
     "Material",
     "Experiment",
-    "RegimeParameter",
     "Team",
-    "Property",
     "Process",
     "Equipment",
     "Facility",
     "Expert",
+    "FigureGallery",
 )
 SKIP_VISUAL_REL_TYPES = frozenset({"HAS_CHUNK", "CONTAINS_IMAGE"})
+
+
+def _neo4j_scalar(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [
+            item if isinstance(item, (str, int, float, bool)) else str(item)
+            for item in value
+        ]
+    return str(value)
+
+
+def _neo4j_conditions(conditions: dict | None) -> str | None:
+    """Neo4j node properties cannot be maps — store conditions as JSON text."""
+    if not conditions:
+        return None
+    clean = {
+        str(key): _neo4j_scalar(val)
+        for key, val in conditions.items()
+        if val is not None
+    }
+    if not clean:
+        return None
+    return json.dumps(clean, ensure_ascii=False)
 
 
 class GraphDB:
     """Работа с Neo4j графовой БД."""
     
     def __init__(self, settings: Settings):
+        self.settings = settings
         self.driver = GraphDatabase.driver(
             settings.neo4j_uri,
             auth=(settings.neo4j_user, settings.neo4j_password)
@@ -53,9 +82,82 @@ class GraphDB:
             return f"prop:{props['canonical_name']}"
         return None
 
-    @staticmethod
-    def _visual_node_label(node) -> str:
+    def _default_display_lang(self) -> str:
+        configured = (self.settings.extraction_language or "auto").strip().lower()
+        if configured in ("ru", "en"):
+            return configured
+        return "en"
+
+    def _load_property_languages(
+        self, session, property_names: set[str] | None = None
+    ) -> dict[str, str]:
+        """Map property canonical_name -> display language from linked documents."""
+        if property_names:
+            result = session.run(
+                """
+                MATCH (p:Property)<-[:MEASURED]-(e:Experiment)-[:DESCRIBED_IN]->(d:Document)
+                WHERE p.canonical_name IN $names
+                RETURN p.canonical_name AS name,
+                       collect(DISTINCT d.content_language) AS langs
+                """,
+                {"names": list(property_names)},
+            )
+        else:
+            result = session.run(
+                """
+                MATCH (p:Property)<-[:MEASURED]-(e:Experiment)-[:DESCRIBED_IN]->(d:Document)
+                WHERE p.canonical_name IS NOT NULL
+                RETURN p.canonical_name AS name,
+                       collect(DISTINCT d.content_language) AS langs
+                """
+            )
+        out: dict[str, str] = {}
+        for row in result:
+            langs = [lang for lang in (row.get("langs") or []) if lang in ("ru", "en")]
+            if not langs:
+                continue
+            if len(langs) == 1:
+                out[str(row["name"])] = langs[0]
+            else:
+                out[str(row["name"])] = "ru" if langs.count("ru") >= langs.count("en") else "en"
+        return out
+
+    def _lang_from_doc_langs(self, langs: list[str] | None) -> str:
+        cleaned = [lang for lang in (langs or []) if lang in ("ru", "en")]
+        if not cleaned:
+            return self._default_display_lang()
+        if len(cleaned) == 1:
+            return cleaned[0]
+        return "ru" if cleaned.count("ru") >= cleaned.count("en") else "en"
+
+    def _resolve_property_lang(
+        self, canonical_name: str | None, property_langs: dict[str, str] | None
+    ) -> str:
+        if canonical_name and property_langs and canonical_name in property_langs:
+            return property_langs[canonical_name]
+        return self._default_display_lang()
+
+    def _visual_node_label(
+        self,
+        node,
+        *,
+        display_value: str | None = None,
+        display_unit: str | None = None,
+        property_langs: dict[str, str] | None = None,
+    ) -> str:
         props = dict(node)
+        labels = list(node.labels)
+        if "Property" in labels and props.get("canonical_name"):
+            canonical = str(props["canonical_name"])
+            lang = self._resolve_property_lang(canonical, property_langs)
+            base = property_display_label(canonical, lang=lang)
+            if display_value:
+                raw = str(display_value).strip()
+                if raw.startswith("{") or raw.startswith("{'") or len(raw) > 48:
+                    return base
+                unit = (display_unit or props.get("unit") or "").strip()
+                return f"{base}: {display_value}{(' ' + unit) if unit else ''}"
+            return base
         return (
             props.get("title")
             or props.get("name")
@@ -82,15 +184,18 @@ class GraphDB:
     
     # ================== WRITE ==================
     
-    def save_material(self, material: MaterialDTO):
-        """Сохраняет материал с динамическими свойствами."""
+    def save_material(self, material: MaterialDTO) -> str:
+        """Сохраняет материал с динамическими свойствами. Returns resolved node id."""
+        from domain.entity_glossary import canonical_entity_key as ckey
+
         taxonomy = get_material_taxonomy()
         material_stage = taxonomy.get_stage(material.material_class).value
+        canonical_key = ckey(material.name) or material.name.lower().strip().replace(" ", "_")
         with self.driver.session() as session:
-            # Создаем узел Material
-            session.run("""
-                MERGE (m:Material {id: $id})
-                SET m.name = $name,
+            record = session.run("""
+                MERGE (m:Material {canonical_key: $canonical_key})
+                ON CREATE SET m.id = $id,
+                    m.name = $name,
                     m.material_class = $material_class,
                     m.material_stage = $material_stage,
                     m.state = $state,
@@ -98,7 +203,16 @@ class GraphDB:
                     m.microstructure_features = $microstructure_features,
                     m.source_document_id = $source_document_id,
                     m.created_at = $created_at
+                ON MATCH SET m.name = $name,
+                    m.material_class = $material_class,
+                    m.material_stage = $material_stage,
+                    m.state = $state,
+                    m.aliases = [x IN coalesce(m.aliases, []) + $aliases WHERE x IS NOT NULL | x],
+                    m.microstructure_features = coalesce(m.microstructure_features, $microstructure_features),
+                    m.source_document_id = coalesce(m.source_document_id, $source_document_id)
+                RETURN m.id AS id
             """, {
+                "canonical_key": canonical_key,
                 "id": str(material.id),
                 "name": material.name,
                 "material_class": material.material_class.value,
@@ -108,9 +222,9 @@ class GraphDB:
                 "microstructure_features": material.microstructure_features,
                 "source_document_id": str(material.source_document_id) if material.source_document_id else None,
                 "created_at": material.created_at.isoformat()
-            })
-            
-            # Создаем узлы свойств и связи
+            }).single()
+            mat_id = str(record["id"]) if record else str(material.id)
+
             for prop_name, prop in material.properties.items():
                 session.run("""
                     MATCH (m:Material {id: $mat_id})
@@ -128,15 +242,15 @@ class GraphDB:
                         v.confidence = $confidence
                     MERGE (p)-[:HAS_VALUE]->(v)
                 """, {
-                    "mat_id": str(material.id),
+                    "mat_id": mat_id,
                     "name": prop_name,
                     "category": prop.category,
                     "unit": prop.value.unit,
-                    "val_id": f"{str(material.id)}_{prop_name}",
+                    "val_id": f"{mat_id}_{prop_name}",
                     "value": prop.value.value if not isinstance(prop.value.value, (dict, list)) else str(prop.value.value),
                     "value_min": prop.value.value_min,
                     "value_max": prop.value.value_max,
-                    "conditions": prop.value.conditions,
+                    "conditions": _neo4j_conditions(prop.value.conditions),
                     "source_text": prop.value.source_text,
                     "confidence": prop.value.confidence
                 })
@@ -145,8 +259,9 @@ class GraphDB:
         if material.source_document_id:
             self.link_document_material(
                 str(material.source_document_id),
-                str(material.id),
+                mat_id,
             )
+        return mat_id
 
     def link_document_material(self, document_id: str, material_id: str) -> None:
         """Connect a material to its source publication (fixes orphan nodes in graph viz)."""
@@ -247,22 +362,33 @@ class GraphDB:
         name: str,
         members: list[str],
         document_id: str,
-    ) -> None:
+    ) -> str:
+        from domain.entity_glossary import canonical_entity_key as ckey
+
+        key = ckey(name) or name.lower().strip().replace(" ", "_")
         with self.driver.session() as session:
-            session.run("""
-                MERGE (t:Team {id: $id})
-                SET t.name = $name,
-                    t.members = $members
+            record = session.run("""
+                MERGE (t:Team {canonical_key: $key})
+                ON CREATE SET t.id = $id,
+                    t.name = $name,
+                    t.members = $members,
+                    t.canonical_key = $key
+                ON MATCH SET t.name = $name,
+                    t.members = [x IN coalesce(t.members, []) + $members WHERE x IS NOT NULL | x]
                 WITH t
                 MATCH (d:Document {id: $doc_id})
                 MERGE (t)-[:AUTHORED]->(d)
+                RETURN t.id AS id
             """, {
+                "key": key,
                 "id": team_id,
                 "name": name,
                 "members": members,
                 "doc_id": document_id,
-            })
+            }).single()
+            resolved_id = str(record["id"]) if record else team_id
         logger.info("Saved team: %s", name)
+        return resolved_id
 
     def link_document_topic(self, document_id: str, topic: str) -> None:
         topic = (topic or "").strip()[:120]
@@ -300,38 +426,52 @@ class GraphDB:
                 "domain": domain,
             })
 
-    def save_process(self, process_id: str, name: str, document_id: str, aliases: list[str] | None = None) -> None:
+    def save_process(self, process_id: str, name: str, document_id: str, aliases: list[str] | None = None, canonical_key: str | None = None) -> str:
+        from domain.entity_glossary import canonical_entity_key as ckey
+        key = canonical_key or ckey(name)
         with self.driver.session() as session:
-            session.run("""
-                MERGE (p:Process {id: $id})
-                SET p.name = $name, p.aliases = $aliases
+            record = session.run("""
+                MERGE (p:Process {canonical_key: $key})
+                ON CREATE SET p.id = $id, p.name = $name, p.aliases = $aliases
+                ON MATCH SET p.name = $name,
+                    p.aliases = [x IN coalesce(p.aliases, []) + $aliases WHERE x IS NOT NULL | x]
                 WITH p
                 MATCH (d:Document {id: $doc_id})
                 MERGE (d)-[:DESCRIBES_PROCESS]->(p)
+                RETURN p.id AS id
             """, {
+                "key": key,
                 "id": process_id,
                 "name": name,
                 "aliases": aliases or [],
                 "doc_id": document_id,
-            })
+            }).single()
+            return str(record["id"]) if record else process_id
 
     def save_equipment(
         self, equipment_id: str, name: str, document_id: str, process_id: str | None = None
-    ) -> None:
+    ) -> str:
+        from domain.entity_glossary import canonical_entity_key as ckey
+
+        key = ckey(name) or name.lower().strip().replace(" ", "_")
         with self.driver.session() as session:
-            session.run("""
-                MERGE (eq:Equipment {id: $id})
-                SET eq.name = $name
+            record = session.run("""
+                MERGE (eq:Equipment {canonical_key: $key})
+                ON CREATE SET eq.id = $id, eq.name = $name
+                ON MATCH SET eq.name = $name
                 WITH eq
                 MATCH (d:Document {id: $doc_id})
                 MERGE (d)-[:MENTIONS_EQUIPMENT]->(eq)
-            """, {"id": equipment_id, "name": name, "doc_id": document_id})
+                RETURN eq.id AS id
+            """, {"key": key, "id": equipment_id, "name": name, "doc_id": document_id}).single()
+            resolved_id = str(record["id"]) if record else equipment_id
             if process_id:
                 session.run("""
                     MATCH (eq:Equipment {id: $eq_id})
                     MATCH (p:Process {id: $proc_id})
                     MERGE (p)-[:USES_EQUIPMENT]->(eq)
-                """, {"eq_id": equipment_id, "proc_id": process_id})
+                """, {"eq_id": resolved_id, "proc_id": process_id})
+        return resolved_id
 
     def save_facility(
         self,
@@ -340,23 +480,33 @@ class GraphDB:
         country: str | None,
         document_id: str,
         facility_type: str | None = None,
-    ) -> None:
+    ) -> str:
+        from domain.entity_glossary import canonical_entity_key as ckey
+
+        key = ckey(name) or name.lower().strip().replace(" ", "_")
         with self.driver.session() as session:
-            session.run("""
-                MERGE (f:Facility {id: $id})
-                SET f.name = $name,
+            record = session.run("""
+                MERGE (f:Facility {canonical_key: $key})
+                ON CREATE SET f.id = $id,
+                    f.name = $name,
                     f.country = $country,
                     f.facility_type = $facility_type
+                ON MATCH SET f.name = $name,
+                    f.country = coalesce($country, f.country),
+                    f.facility_type = coalesce($facility_type, f.facility_type)
                 WITH f
                 MATCH (d:Document {id: $doc_id})
                 MERGE (d)-[:FROM_FACILITY]->(f)
+                RETURN f.id AS id
             """, {
+                "key": key,
                 "id": facility_id,
                 "name": name,
                 "country": country,
                 "facility_type": facility_type,
                 "doc_id": document_id,
-            })
+            }).single()
+            return str(record["id"]) if record else facility_id
 
     def save_expert(
         self,
@@ -365,26 +515,38 @@ class GraphDB:
         field: str | None,
         document_id: str,
         team_id: str | None = None,
-    ) -> None:
+    ) -> str:
+        from domain.entity_glossary import canonical_entity_key as ckey
+
+        key = ckey(name) or name.lower().strip().replace(" ", "_")
         with self.driver.session() as session:
-            session.run("""
-                MERGE (x:Expert {id: $id})
-                SET x.name = $name, x.field = $field
+            record = session.run("""
+                MERGE (x:Expert {canonical_key: $key})
+                ON CREATE SET x.id = $id,
+                    x.name = $name,
+                    x.field = $field,
+                    x.canonical_key = $key
+                ON MATCH SET x.name = $name,
+                    x.field = coalesce($field, x.field)
                 WITH x
                 MATCH (d:Document {id: $doc_id})
                 MERGE (d)-[:AUTHORED_BY]->(x)
+                RETURN x.id AS id
             """, {
+                "key": key,
                 "id": expert_id,
                 "name": name,
                 "field": field,
                 "doc_id": document_id,
-            })
+            }).single()
+            resolved_id = str(record["id"]) if record else expert_id
             if team_id:
                 session.run("""
                     MATCH (x:Expert {id: $expert_id})
                     MATCH (t:Team {id: $team_id})
                     MERGE (x)-[:MEMBER_OF]->(t)
-                """, {"expert_id": expert_id, "team_id": team_id})
+                """, {"expert_id": resolved_id, "team_id": team_id})
+        return resolved_id
 
     def link_team_facility(self, team_id: str, facility_id: str) -> None:
         with self.driver.session() as session:
@@ -418,8 +580,11 @@ class GraphDB:
                 DELETE r
             """, {"doc_id": document_id})
     
-    def save_document(self, document: DocumentDTO):
+    def save_document(self, document: DocumentDTO, *, content_language: str | None = None):
         """Сохраняет документ как узел в графе."""
+        lang = (content_language or self._default_display_lang()).strip().lower()
+        if lang not in ("ru", "en"):
+            lang = self._default_display_lang()
         with self.driver.session() as session:
             session.run("""
                 MERGE (d:Document {id: $id})
@@ -434,6 +599,7 @@ class GraphDB:
                     d.file_hash = $file_hash,
                     d.chunks_count = $chunks_count,
                     d.images_count = $images_count,
+                    d.content_language = $content_language,
                     d.created_at = $created_at
             """, {
                 "id": str(document.id),
@@ -448,27 +614,9 @@ class GraphDB:
                 "file_hash": document.file_hash,
                 "chunks_count": len(document.chunks),
                 "images_count": len(document.images),
+                "content_language": lang,
                 "created_at": document.created_at.isoformat()
             })
-            
-            # Связь Material -> Document
-            for image in document.images:
-                session.run("""
-                    MATCH (d:Document {id: $doc_id})
-                    MERGE (i:Image {id: $img_id})
-                    SET i.image_type = $image_type,
-                        i.file_path = $file_path,
-                        i.caption = $caption,
-                        i.ai_description = $ai_description
-                    MERGE (d)-[:CONTAINS_IMAGE]->(i)
-                """, {
-                    "doc_id": str(document.id),
-                    "img_id": str(image.id),
-                    "image_type": image.image_type.value,
-                    "file_path": image.file_path,
-                    "caption": image.caption,
-                    "ai_description": image.ai_description
-                })
 
             for chunk in document.chunks:
                 if not chunk.text or not chunk.text.strip():
@@ -488,6 +636,151 @@ class GraphDB:
                     "chunk_index": chunk.chunk_index,
                     "doc_id": str(document.id),
                 })
+
+    def save_figure_gallery(self, document_id: str, images: list) -> None:
+        """One Figures blob per document + individual Image nodes (not shown on graph)."""
+        seen_keys: set[str] = set()
+        unique_images: list = []
+        for image in images:
+            dedupe_key = (image.file_path or "").strip() or str(image.id)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            unique_images.append(image)
+        images = unique_images
+
+        if not images:
+            with self.driver.session() as session:
+                session.run("""
+                    MATCH (d:Document {id: $doc_id})-[:HAS_FIGURES]->(g:FigureGallery)
+                    OPTIONAL MATCH (g)-[:CONTAINS_IMAGE]->(i:Image)
+                    DETACH DELETE i, g
+                """, {"doc_id": document_id})
+            return
+
+        gallery_id = f"{document_id}:figures"
+        items = []
+        for image in images:
+            items.append({
+                "id": str(image.id),
+                "caption": image.caption or "",
+                "page_number": image.page_number,
+                "image_type": image.image_type.value,
+                "storage_key": image.file_path,
+            })
+        items_json = json.dumps(items, ensure_ascii=False)
+
+        type_counts: dict[str, int] = {}
+        for image in images:
+            key = image.image_type.value
+            type_counts[key] = type_counts.get(key, 0) + 1
+        summary = ", ".join(f"{v} {k}" for k, v in sorted(type_counts.items()))
+
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (d:Document {id: $doc_id})
+                OPTIONAL MATCH (d)-[:HAS_FIGURES]->(old:FigureGallery)
+                OPTIONAL MATCH (old)-[:CONTAINS_IMAGE]->(oi:Image)
+                DETACH DELETE oi, old
+            """, {"doc_id": document_id})
+
+            session.run("""
+                MATCH (d:Document {id: $doc_id})
+                MERGE (g:FigureGallery {id: $gallery_id})
+                SET g.name = $name,
+                    g.document_id = $doc_id,
+                    g.image_count = $count,
+                    g.type_summary = $summary,
+                    g.items_json = $items_json
+                MERGE (d)-[:HAS_FIGURES]->(g)
+            """, {
+                "doc_id": document_id,
+                "gallery_id": gallery_id,
+                "name": f"Figures ({len(images)})",
+                "count": len(images),
+                "summary": summary,
+                "items_json": items_json,
+            })
+
+            for image in images:
+                session.run("""
+                    MATCH (g:FigureGallery {id: $gallery_id})
+                    MERGE (i:Image {id: $img_id})
+                    SET i.image_type = $image_type,
+                        i.file_path = $file_path,
+                        i.caption = $caption,
+                        i.ai_description = $ai_description,
+                        i.page_number = $page_number,
+                        i.document_id = $doc_id
+                    MERGE (g)-[:CONTAINS_IMAGE]->(i)
+                """, {
+                    "gallery_id": gallery_id,
+                    "img_id": str(image.id),
+                    "image_type": image.image_type.value,
+                    "file_path": image.file_path,
+                    "caption": image.caption,
+                    "ai_description": image.ai_description or "",
+                    "page_number": image.page_number,
+                    "doc_id": document_id,
+                })
+
+    def get_image_storage_key(self, document_id: str, image_id: str) -> str | None:
+        with self.driver.session() as session:
+            record = session.run("""
+                MATCH (d:Document {id: $doc_id})-[:HAS_FIGURES]->(:FigureGallery)
+                      -[:CONTAINS_IMAGE]->(i:Image {id: $img_id})
+                RETURN i.file_path AS path
+                LIMIT 1
+            """, {"doc_id": document_id, "img_id": image_id}).single()
+            if record and record.get("path"):
+                return str(record["path"])
+            legacy = session.run("""
+                MATCH (d:Document {id: $doc_id})-[:CONTAINS_IMAGE]->(i:Image {id: $img_id})
+                RETURN i.file_path AS path
+                LIMIT 1
+            """, {"doc_id": document_id, "img_id": image_id}).single()
+            if legacy and legacy.get("path"):
+                return str(legacy["path"])
+        return None
+
+    def list_document_figures(self, document_id: str) -> list[dict]:
+        with self.driver.session() as session:
+            record = session.run("""
+                MATCH (d:Document {id: $doc_id})-[:HAS_FIGURES]->(g:FigureGallery)
+                RETURN g.items_json AS items_json, g.items AS items_legacy
+            """, {"doc_id": document_id}).single()
+            if record and record.get("items_json"):
+                try:
+                    parsed = json.loads(str(record["items_json"]))
+                    if isinstance(parsed, list):
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+            if record and record.get("items_legacy"):
+                legacy = record["items_legacy"]
+                if isinstance(legacy, list):
+                    return list(legacy)
+
+            rows = session.run("""
+                MATCH (d:Document {id: $doc_id})-[:HAS_FIGURES]->(:FigureGallery)
+                      -[:CONTAINS_IMAGE]->(i:Image)
+                RETURN i.id AS id,
+                       i.caption AS caption,
+                       i.page_number AS page_number,
+                       i.image_type AS image_type,
+                       i.file_path AS storage_key
+                ORDER BY i.page_number, i.id
+            """, {"doc_id": document_id})
+            return [
+                {
+                    "id": str(r["id"]),
+                    "caption": r.get("caption") or "",
+                    "page_number": r.get("page_number"),
+                    "image_type": r.get("image_type") or "other",
+                    "storage_key": r.get("storage_key") or "",
+                }
+                for r in rows
+            ]
     
     def find_document_by_file_path(self, file_path: str) -> dict | None:
         """Find an ingested document by source path or URL."""
@@ -609,7 +902,7 @@ class GraphDB:
             return record["title"] if record else None
 
     def delete_document(self, document_id: str) -> bool:
-        """Remove a document and its chunks/images from the graph."""
+        """Remove a document and all ingestion entities owned exclusively by it."""
         with self.driver.session() as session:
             exists = session.run(
                 "MATCH (d:Document {id: $id}) RETURN d.id AS id",
@@ -618,13 +911,107 @@ class GraphDB:
             if not exists:
                 return False
 
-            session.run("""
+            session.run(
+                """
+                MATCH (d:Document {id: $id})<-[:DESCRIBED_IN]-(e:Experiment)
+                DETACH DELETE e
+                """,
+                {"id": document_id},
+            )
+            session.run(
+                """
+                MATCH (d:Document {id: $id})-[:MENTIONS_MATERIAL]->(m:Material)
+                WHERE NOT EXISTS {
+                    MATCH (other:Document)-[:MENTIONS_MATERIAL]->(m)
+                    WHERE other.id <> $id
+                }
+                DETACH DELETE m
+                """,
+                {"id": document_id},
+            )
+            session.run(
+                """
+                MATCH (m:Material)
+                WHERE m.source_document_id = $id
+                  AND NOT EXISTS {
+                    MATCH (:Document)-[:MENTIONS_MATERIAL]->(m)
+                  }
+                DETACH DELETE m
+                """,
+                {"id": document_id},
+            )
+            session.run(
+                """
+                MATCH (d:Document {id: $id})-[:DESCRIBES_PROCESS]->(p:Process)
+                WHERE NOT EXISTS {
+                    MATCH (other:Document)-[:DESCRIBES_PROCESS]->(p)
+                    WHERE other.id <> $id
+                }
+                DETACH DELETE p
+                """,
+                {"id": document_id},
+            )
+            session.run(
+                """
+                MATCH (d:Document {id: $id})-[:MENTIONS_EQUIPMENT]->(eq:Equipment)
+                WHERE NOT EXISTS {
+                    MATCH (:Document)-[:MENTIONS_EQUIPMENT]->(eq)
+                }
+                DETACH DELETE eq
+                """,
+                {"id": document_id},
+            )
+            session.run(
+                """
+                MATCH (d:Document {id: $id})-[:FROM_FACILITY]->(f:Facility)
+                WHERE NOT EXISTS {
+                    MATCH (:Document)-[:FROM_FACILITY]->(f)
+                }
+                DETACH DELETE f
+                """,
+                {"id": document_id},
+            )
+            session.run(
+                """
+                MATCH (t:Team)-[:AUTHORED]->(d:Document {id: $id})
+                WHERE NOT EXISTS {
+                    MATCH (t)-[:AUTHORED]->(other:Document)
+                    WHERE other.id <> $id
+                }
+                DETACH DELETE t
+                """,
+                {"id": document_id},
+            )
+            session.run(
+                """
+                MATCH (d:Document {id: $id})-[:AUTHORED_BY]->(x:Expert)
+                WHERE NOT EXISTS {
+                    MATCH (other:Document)-[:AUTHORED_BY]->(x)
+                    WHERE other.id <> $id
+                }
+                DETACH DELETE x
+                """,
+                {"id": document_id},
+            )
+
+        self.delete_document_topics(document_id)
+        self.delete_document_material_process_links(document_id)
+
+        with self.driver.session() as session:
+            session.run(
+                """
                 MATCH (d:Document {id: $id})
                 OPTIONAL MATCH (d)-[:HAS_CHUNK]->(c:DocumentChunk)
-                OPTIONAL MATCH (d)-[:CONTAINS_IMAGE]->(i:Image)
-                DETACH DELETE c, i, d
-            """, {"id": document_id})
-            return True
+                OPTIONAL MATCH (d)-[:HAS_FIGURES]->(g:FigureGallery)
+                OPTIONAL MATCH (g)-[:CONTAINS_IMAGE]->(i:Image)
+                OPTIONAL MATCH (d)-[:CONTAINS_IMAGE]->(i2:Image)
+                DETACH DELETE c, i, i2, g, d
+                """,
+                {"id": document_id},
+            )
+
+        self.purge_orphan_entities()
+        return True
 
     def purge_all_ingested_data(self) -> dict:
         """
@@ -642,6 +1029,7 @@ class GraphDB:
             "Equipment": "equipment",
             "Facility": "facilities",
             "Expert": "experts",
+            "FigureGallery": "figure_galleries",
             "RegimeParameter": "regime_parameters",
             "Property": "properties",
             "PropertyValue": "property_values",
@@ -663,22 +1051,176 @@ class GraphDB:
             deleted["remaining_edges"] = 0
 
         total_nodes = sum(v for k, v in deleted.items() if k != "remaining_edges")
+        orphans = self.purge_orphan_entities()
+        deleted["orphans_removed"] = orphans.get("total", 0)
+
+        remaining = self._count_ingestion_nodes()
+        if any(remaining.values()):
+            logger.warning("Residual ingestion nodes after purge: %s", remaining)
+            with self.driver.session() as session:
+                session.run(
+                    """
+                    MATCH (n)
+                    WHERE any(l IN labels(n) WHERE l IN $labels)
+                    DETACH DELETE n
+                    """,
+                    {"labels": list(label_keys.keys())},
+                )
+            orphans = self.purge_orphan_entities()
+            remaining = self._count_ingestion_nodes()
+        deleted["remaining"] = remaining
+
         logger.info("Purged knowledge graph: %s", deleted)
-        return {"deleted": deleted, "total_nodes_removed": total_nodes}
+        return {
+            "deleted": deleted,
+            "total_nodes_removed": total_nodes + orphans.get("total", 0),
+            "remaining": remaining,
+        }
+
+    def _count_ingestion_nodes(self) -> dict[str, int]:
+        labels = [
+            "Document", "DocumentChunk", "Image", "Experiment", "Material",
+            "Team", "Process", "Equipment", "Facility", "Expert",
+            "FigureGallery", "RegimeParameter", "Property", "PropertyValue",
+        ]
+        counts: dict[str, int] = {}
+        with self.driver.session() as session:
+            for label in labels:
+                record = session.run(f"MATCH (n:{label}) RETURN count(n) AS c").single()
+                counts[label.lower()] = int(record["c"]) if record else 0
+        return counts
+
+    def purge_orphan_entities(self) -> dict:
+        """Remove ingestion entities not connected to any Document."""
+        removed: dict[str, int] = {}
+        with self.driver.session() as session:
+            queries = {
+                "materials": """
+                    MATCH (m:Material)
+                    WHERE NOT (m)<-[:MENTIONS_MATERIAL]-(:Document)
+                      AND NOT EXISTS {
+                        MATCH (e:Experiment)-[:USES_MATERIAL]->(m)
+                        MATCH (e)-[:DESCRIBED_IN]->(:Document)
+                      }
+                      AND NOT EXISTS {
+                        MATCH (:Document {id: m.source_document_id})
+                      }
+                    DETACH DELETE m
+                    RETURN count(m) AS c
+                """,
+                "experiments": """
+                    MATCH (e:Experiment)
+                    WHERE NOT (e)-[:DESCRIBED_IN]->(:Document)
+                    DETACH DELETE e
+                    RETURN count(e) AS c
+                """,
+                "processes": """
+                    MATCH (p:Process)
+                    WHERE NOT ()-[:DESCRIBES_PROCESS|USES_PROCESS|PROCESSED_IN]->(p)
+                    DETACH DELETE p
+                    RETURN count(p) AS c
+                """,
+                "teams": """
+                    MATCH (t:Team)
+                    WHERE NOT (t)-[:AUTHORED]->(:Document)
+                    DETACH DELETE t
+                    RETURN count(t) AS c
+                """,
+                "experts": """
+                    MATCH (x:Expert)
+                    WHERE NOT (x)-[:AUTHORED_BY]->(:Document)
+                      AND NOT (x)<-[:MEMBER_OF]-(:Team)-[:AUTHORED]->(:Document)
+                    DETACH DELETE x
+                    RETURN count(x) AS c
+                """,
+                "equipment": """
+                    MATCH (e:Equipment)
+                    WHERE NOT ()-[:MENTIONS_EQUIPMENT|USES_EQUIPMENT]->(e)
+                    DETACH DELETE e
+                    RETURN count(e) AS c
+                """,
+                "facilities": """
+                    MATCH (f:Facility)
+                    WHERE NOT ()-[:FROM_FACILITY|REFERENCES]->(f)
+                    DETACH DELETE f
+                    RETURN count(f) AS c
+                """,
+                "properties": """
+                    MATCH (p:Property)
+                    WHERE NOT ()-[:HAS_PROPERTY|MEASURED|HAS_VALUE]->(p)
+                    OPTIONAL MATCH (p)-[:HAS_VALUE]->(v:PropertyValue)
+                    DETACH DELETE p, v
+                    RETURN count(p) AS c
+                """,
+                "property_values": """
+                    MATCH (v:PropertyValue)
+                    WHERE NOT ()-[:HAS_VALUE]->(v)
+                    DETACH DELETE v
+                    RETURN count(v) AS c
+                """,
+                "regime_parameters": """
+                    MATCH (rp:RegimeParameter)
+                    WHERE NOT ()-[:HAS_REGIME_PARAM|HAS_TOPIC]->(rp)
+                    DETACH DELETE rp
+                    RETURN count(rp) AS c
+                """,
+                "figure_galleries": """
+                    MATCH (g:FigureGallery)
+                    WHERE NOT ()-[:HAS_FIGURES]->(g)
+                    OPTIONAL MATCH (g)-[:CONTAINS_IMAGE]->(i:Image)
+                    DETACH DELETE g, i
+                    RETURN count(g) AS c
+                """,
+                "images": """
+                    MATCH (i:Image)
+                    WHERE NOT ()-[:CONTAINS_IMAGE]->(i)
+                    DETACH DELETE i
+                    RETURN count(i) AS c
+                """,
+                "chunks": """
+                    MATCH (c:DocumentChunk)
+                    WHERE NOT ()-[:HAS_CHUNK]->(c)
+                    DETACH DELETE c
+                    RETURN count(c) AS c
+                """,
+            }
+            for key, query in queries.items():
+                record = session.run(query).single()
+                count = int(record["c"]) if record and record.get("c") is not None else 0
+                if count:
+                    removed[key] = count
+
+            stray = session.run("""
+                MATCH (n)
+                WHERE any(l IN labels(n) WHERE l IN [
+                  'Document','DocumentChunk','Image','Experiment','Material','Team',
+                  'Process','Equipment','Facility','Expert','FigureGallery',
+                  'RegimeParameter','Property','PropertyValue'
+                ])
+                RETURN labels(n)[0] AS label, count(n) AS c
+            """)
+            removed["remaining_by_label"] = {
+                str(r["label"]): int(r["c"]) for r in stray if r["c"]
+            }
+
+        total = sum(v for k, v in removed.items() if k != "remaining_by_label")
+        if total:
+            logger.info("Purged orphan entities: %s", removed)
+        return {"removed": removed, "total": total}
 
     def list_documents(self, limit: int = 100) -> list[dict]:
         """List ingested documents."""
         with self.driver.session() as session:
             result = session.run("""
                 MATCH (d:Document)
-                OPTIONAL MATCH (d)-[:CONTAINS_IMAGE]->(i:Image)
+                OPTIONAL MATCH (d)-[:HAS_FIGURES]->(g:FigureGallery)
                 RETURN d.id as id, d.title as title,
                        d.document_type as document_type,
                        d.authors as authors,
                        d.year as year,
                        d.file_path as file_path,
                        d.chunks_count as chunks_count,
-                       count(i) as images_count,
+                       coalesce(g.image_count, d.images_count, 0) as images_count,
                        d.created_at as created_at
                 ORDER BY d.created_at DESC
                 LIMIT $limit
@@ -944,6 +1486,89 @@ class GraphDB:
             exp["measured_properties"] = [dict(r) for r in props_result]
             
             return exp
+
+    def get_property_details(self, canonical_name: str) -> dict | None:
+        """Measured values for a property (from experiments and materials)."""
+        name = (canonical_name or "").strip()
+        if name.startswith("prop:"):
+            name = name[5:]
+        if not name:
+            return None
+
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (p:Property {canonical_name: $name})
+                OPTIONAL MATCH (e:Experiment)-[mr:MEASURED]->(p)
+                OPTIONAL MATCH (e)-[:DESCRIBED_IN]->(d:Document)
+                WITH p,
+                     collect(DISTINCT {
+                         source: 'experiment',
+                         experiment_id: e.id,
+                         experiment_name: coalesce(e.regime_name, e.regime_type, e.id),
+                         document_title: d.title,
+                         value: mr.value,
+                         unit: mr.unit,
+                         source_text: mr.source_text
+                     }) AS experiment_values
+                OPTIONAL MATCH (m:Material)-[:HAS_PROPERTY]->(p)
+                OPTIONAL MATCH (p)-[:HAS_VALUE]->(v:PropertyValue)
+                WHERE v.id = m.id + '_' + p.canonical_name
+                WITH p, experiment_values,
+                     collect(DISTINCT {
+                         source: 'material',
+                         material_id: m.id,
+                         material_name: m.name,
+                         value: v.value,
+                         unit: coalesce(v.unit, p.unit),
+                         source_text: v.source_text
+                     }) AS material_values
+                OPTIONAL MATCH (p)<-[:MEASURED]-(:Experiment)-[:DESCRIBED_IN]->(doc:Document)
+                RETURN p,
+                       collect(DISTINCT doc.content_language) AS doc_langs,
+                       experiment_values,
+                       material_values
+                """,
+                {"name": name},
+            ).single()
+            if not record:
+                return None
+
+            prop = dict(record["p"])
+            lang = self._lang_from_doc_langs(record.get("doc_langs"))
+            measurements: list[dict] = []
+            seen: set[tuple] = set()
+
+            def _append(row: dict | None) -> None:
+                if not row or not row.get("value"):
+                    return
+                if row.get("source") == "experiment" and not row.get("experiment_id"):
+                    return
+                if row.get("source") == "material" and not row.get("material_id"):
+                    return
+                key = (
+                    row.get("source"),
+                    row.get("experiment_id"),
+                    row.get("material_id"),
+                    str(row.get("value")),
+                )
+                if key in seen:
+                    return
+                seen.add(key)
+                measurements.append(dict(row))
+
+            for row in record["experiment_values"] or []:
+                _append(row)
+            for row in record["material_values"] or []:
+                _append(row)
+
+            return {
+                "canonical_name": name,
+                "display_label": property_display_label(name, lang=lang),
+                "category": prop.get("category"),
+                "unit": prop.get("unit"),
+                "measurements": measurements,
+            }
     
     def get_subgraph(self, center_node_id: str, depth: int = 2, max_nodes: int = 100) -> dict:
         """
@@ -999,11 +1624,55 @@ class GraphDB:
             
             return {"nodes": nodes, "edges": edges}
     
-    def get_full_graph(self, limit: int = 500) -> dict:
-        """Document-centric knowledge graph for visualization (connected subgraph)."""
-        labels = list(VISUAL_NODE_LABELS)
+    def get_node_neighbors(self, node_id: str, limit: int = 40) -> dict:
+        """1-hop neighbors for the entity panel (canvas stays link-free)."""
         skip = list(SKIP_VISUAL_REL_TYPES)
-        doc_limit = max(10, min(40, limit // 12))
+        edge_labels = list(VISUAL_NODE_LABELS) + ["Property", "RegimeParameter"]
+        with self.driver.session() as session:
+            center = session.run(
+                """
+                MATCH (n {id: $id})
+                RETURN n AS node, labels(n)[0] AS label
+                LIMIT 1
+                """,
+                {"id": node_id},
+            ).single()
+            if not center:
+                return {"nodes": [], "edges": []}
+
+            neighbors = list(
+                session.run(
+                    """
+                    MATCH (n {id: $id})-[r]-(m)
+                    WHERE NOT type(r) IN $skip
+                    WITH DISTINCT m AS node, labels(m)[0] AS label
+                    ORDER BY toLower(
+                        coalesce(node.name, node.title, node.regime_name, node.canonical_name, node.id)
+                    )
+                    LIMIT $limit
+                    RETURN node, label
+                    """,
+                    {"id": node_id, "skip": skip, "limit": limit},
+                )
+            )
+            rows = [center, *neighbors]
+            return self._build_visual_graph(session, rows, edge_labels)
+
+    def get_full_graph(
+        self,
+        limit: int = 3_000,
+        document_id: str | None = None,
+        doc_limit: int = 25,
+        hub_only: bool = False,
+    ) -> dict:
+        """Knowledge graph for visualization. Pass document_id for the full document subgraph."""
+        if document_id:
+            return self._get_document_graph(document_id, node_limit=max(limit, 10_000))
+        if hub_only:
+            return self._get_document_hubs(doc_limit)
+        labels = list(VISUAL_NODE_LABELS)
+        edge_labels = labels + ["Property", "RegimeParameter"]
+        skip = list(SKIP_VISUAL_REL_TYPES)
 
         with self.driver.session() as session:
             nodes_result = session.run(
@@ -1016,17 +1685,13 @@ class GraphDB:
                 WHERE NOT type(r1) IN $skip
                   AND any(l IN labels(n1) WHERE l IN $labels)
 
-                OPTIONAL MATCH (n1)-[r2]-(n2)
-                WHERE NOT type(r2) IN $skip
-                  AND any(l IN labels(n2) WHERE l IN $labels)
-
                 OPTIONAL MATCH (e:Experiment)-[:DESCRIBED_IN]->(d)
                 OPTIONAL MATCH (e)-[:USES_MATERIAL]->(m:Material)
                 OPTIONAL MATCH (e)-[:MEASURED]->(p:Property)
                 OPTIONAL MATCH (e)-[:HAS_REGIME_PARAM]->(rp:RegimeParameter)
                 OPTIONAL MATCH (e)-[:USES_PROCESS]->(pr:Process)
 
-                WITH [x IN collect(DISTINCT d) + collect(DISTINCT n1) + collect(DISTINCT n2)
+                WITH [x IN collect(DISTINCT d) + collect(DISTINCT n1)
                      + collect(DISTINCT e) + collect(DISTINCT m) + collect(DISTINCT p)
                      + collect(DISTINCT rp) + collect(DISTINCT pr) WHERE x IS NOT NULL] AS raw_nodes
                 UNWIND raw_nodes AS node
@@ -1042,61 +1707,385 @@ class GraphDB:
                     "node_limit": limit,
                 },
             )
+            return self._build_visual_graph(session, nodes_result, edge_labels)
 
-            nodes = []
-            node_ids: set[str] = set()
-            for record in nodes_result:
-                node = record["node"]
-                node_id = self._visual_node_id(node)
-                if not node_id or node_id in node_ids:
-                    continue
-                nodes.append({
-                    "id": node_id,
-                    "label": self._visual_node_label(node),
-                    "type": record["label"],
-                    "properties": {
-                        k: v for k, v in dict(node).items()
-                        if k not in ("id", "title", "name", "canonical_name")
-                    },
-                })
-                node_ids.add(node_id)
+    def _get_document_hubs(self, doc_limit: int = 25) -> dict:
+        """Recent document nodes only — fast first paint for collapsed hub view."""
+        with self.driver.session() as session:
+            nodes_result = session.run(
+                """
+                MATCH (d:Document)
+                WITH d ORDER BY coalesce(d.created_at, '') DESC, d.title
+                LIMIT $doc_limit
+                RETURN d AS node, labels(d)[0] AS label
+                """,
+                {"doc_limit": doc_limit},
+            )
+            return self._build_visual_graph(session, nodes_result, ["Document"])
 
-            edges = []
-            if node_ids:
-                edges_result = session.run(
-                    """
-                    MATCH (a)-[r]->(b)
-                    WHERE any(l IN labels(a) WHERE l IN $labels)
-                      AND any(l IN labels(b) WHERE l IN $labels)
-                      AND NOT type(r) IN $skip
-                    RETURN a, b, type(r) AS type
-                    """,
-                    {
-                        "labels": labels,
-                        "skip": list(SKIP_VISUAL_REL_TYPES),
-                    },
+    def _get_document_graph(self, document_id: str, node_limit: int = 10_000) -> dict:
+        """Entities linked to one document (direct links + experiment chains)."""
+        edge_labels = list(VISUAL_NODE_LABELS) + ["Property", "RegimeParameter"]
+        skip = list(SKIP_VISUAL_REL_TYPES)
+
+        with self.driver.session() as session:
+            nodes_result = session.run(
+                """
+                MATCH (d:Document {id: $doc_id})
+
+                OPTIONAL MATCH (d)-[r1]-(n1)
+                WHERE NOT type(r1) IN $skip
+
+                OPTIONAL MATCH (e:Experiment)-[:DESCRIBED_IN]->(d)
+                OPTIONAL MATCH (e)-[:USES_MATERIAL]->(m:Material)
+                OPTIONAL MATCH (e)-[:MEASURED]->(p:Property)
+                OPTIONAL MATCH (e)-[:HAS_REGIME_PARAM]->(rp:RegimeParameter)
+                OPTIONAL MATCH (e)-[:USES_PROCESS]->(pr:Process)
+
+                WITH [x IN collect(DISTINCT d) + collect(DISTINCT n1)
+                     + collect(DISTINCT e) + collect(DISTINCT m) + collect(DISTINCT p)
+                     + collect(DISTINCT rp) + collect(DISTINCT pr) WHERE x IS NOT NULL] AS raw_nodes
+                UNWIND raw_nodes AS node
+                WITH DISTINCT node
+                WHERE node IS NOT NULL
+                RETURN node, labels(node)[0] AS label
+                LIMIT $node_limit
+                """,
+                {"doc_id": document_id, "skip": skip, "node_limit": node_limit},
+            )
+            return self._build_visual_graph(session, nodes_result, edge_labels)
+
+    def _collect_document_entity_nodes_subquery(self) -> str:
+        """Cypher fragment: bind `d` to a Document, produce `raw_nodes` list."""
+        return """
+                MATCH (d:Document {id: $doc_id})
+                OPTIONAL MATCH (d)-[r1]-(n1)
+                WHERE NOT type(r1) IN $skip
+                OPTIONAL MATCH (e:Experiment)-[:DESCRIBED_IN]->(d)
+                OPTIONAL MATCH (e)-[:USES_MATERIAL]->(m:Material)
+                OPTIONAL MATCH (e)-[:MEASURED]->(p:Property)
+                OPTIONAL MATCH (e)-[:HAS_REGIME_PARAM]->(rp:RegimeParameter)
+                OPTIONAL MATCH (e)-[:USES_PROCESS]->(pr:Process)
+                WITH [x IN collect(DISTINCT n1) + collect(DISTINCT e) + collect(DISTINCT m)
+                     + collect(DISTINCT p) + collect(DISTINCT rp) + collect(DISTINCT pr)
+                     WHERE x IS NOT NULL] AS raw_nodes
+        """
+
+    def get_document_entity_summary(self, document_id: str) -> dict:
+        """Fast per-type entity counts for hierarchical graph drill-down."""
+        skip = list(SKIP_VISUAL_REL_TYPES)
+        visual = list(VISUAL_NODE_LABELS) + ["Property", "RegimeParameter"]
+        subquery = self._collect_document_entity_nodes_subquery()
+        with self.driver.session() as session:
+            rows = session.run(
+                subquery
+                + """
+                UNWIND raw_nodes AS node
+                WITH labels(node)[0] AS label, node
+                WHERE label IN $visual
+                RETURN label, count(DISTINCT node) AS count
+                ORDER BY count DESC
+                """,
+                {"doc_id": document_id, "skip": skip, "visual": visual},
+            )
+            types = [{"label": r["label"], "count": int(r["count"])} for r in rows]
+            total = sum(t["count"] for t in types)
+            return {
+                "document_id": document_id,
+                "total_entities": total,
+                "types": types,
+            }
+
+    def get_document_entities_by_type(
+        self,
+        document_id: str,
+        entity_label: str,
+        *,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> dict:
+        """Paginated entities of one Neo4j label for a document."""
+        allowed = set(VISUAL_NODE_LABELS) | {"Property", "RegimeParameter"}
+        if entity_label not in allowed:
+            return {
+                "document_id": document_id,
+                "entity_label": entity_label,
+                "offset": offset,
+                "limit": limit,
+                "total": 0,
+                "has_more": False,
+                "nodes": [],
+                "edges": [],
+            }
+        skip = list(SKIP_VISUAL_REL_TYPES)
+        edge_labels = list(VISUAL_NODE_LABELS) + ["Property", "RegimeParameter"]
+        subquery = self._collect_document_entity_nodes_subquery()
+        with self.driver.session() as session:
+            total_record = session.run(
+                subquery
+                + """
+                UNWIND raw_nodes AS node
+                WITH node WHERE labels(node)[0] = $entity_label
+                RETURN count(DISTINCT node) AS total
+                """,
+                {
+                    "doc_id": document_id,
+                    "skip": skip,
+                    "entity_label": entity_label,
+                },
+            ).single()
+            total = int(total_record["total"]) if total_record else 0
+
+            nodes_result = session.run(
+                subquery
+                + """
+                UNWIND raw_nodes AS node
+                WITH node WHERE labels(node)[0] = $entity_label
+                WITH DISTINCT node
+                ORDER BY toLower(
+                    coalesce(node.name, node.title, node.regime_name, node.canonical_name, node.id)
                 )
-                seen_edges: set[tuple[str, str, str]] = set()
-                for record in edges_result:
-                    source = self._visual_node_id(record["a"])
-                    target = self._visual_node_id(record["b"])
-                    rel_type = record["type"]
-                    if not source or not target:
-                        continue
-                    if source not in node_ids or target not in node_ids:
-                        continue
-                    key = (source, target, rel_type)
-                    if key in seen_edges:
-                        continue
-                    seen_edges.add(key)
-                    edges.append({
-                        "source": source,
-                        "target": target,
-                        "type": rel_type,
-                    })
+                SKIP $offset LIMIT $limit
+                RETURN node, labels(node)[0] AS label
+                """,
+                {
+                    "doc_id": document_id,
+                    "skip": skip,
+                    "entity_label": entity_label,
+                    "offset": offset,
+                    "limit": limit,
+                },
+            )
+            graph = self._build_visual_graph(session, nodes_result, edge_labels)
+            return {
+                "document_id": document_id,
+                "entity_label": entity_label,
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "has_more": offset + limit < total,
+                **graph,
+            }
 
-            return {"nodes": nodes, "edges": edges}
-    
+    def _build_visual_graph(self, session, nodes_result, edge_labels: list[str]) -> dict:
+        """Turn a Neo4j node result set into React Flow / D3 payload."""
+        rows = list(nodes_result)
+        node_element_ids: list[str] = []
+        experiment_element_ids: list[str] = []
+        property_names: set[str] = set()
+
+        for record in rows:
+            node = record["node"]
+            node_element_ids.append(node.element_id)
+            node_labels = list(node.labels)
+            if "Experiment" in node_labels:
+                experiment_element_ids.append(node.element_id)
+            canonical = dict(node).get("canonical_name")
+            if "Property" in node_labels and canonical:
+                property_names.add(str(canonical))
+
+        property_values: dict[str, tuple[str, str]] = {}
+        if experiment_element_ids:
+            values_result = session.run(
+                """
+                MATCH (e:Experiment)-[r:MEASURED]->(p:Property)
+                WHERE elementId(e) IN $eids
+                  AND r.value IS NOT NULL AND r.value <> ''
+                RETURN p.canonical_name AS name, r.value AS value, r.unit AS unit
+                ORDER BY e.created_at DESC
+                """,
+                {"eids": experiment_element_ids},
+            )
+            for row in values_result:
+                pname = row.get("name")
+                if pname and pname not in property_values:
+                    property_values[pname] = (str(row["value"]), str(row.get("unit") or ""))
+
+        property_langs = self._load_property_languages(
+            session,
+            property_names=property_names or None,
+        )
+
+        nodes = []
+        node_ids: set[str] = set()
+        for record in rows:
+            node = record["node"]
+            node_id = self._visual_node_id(node)
+            if not node_id or node_id in node_ids:
+                continue
+            node_labels = list(node.labels)
+            canonical = dict(node).get("canonical_name")
+            sample_value: str | None = None
+            sample_unit: str | None = None
+            if "Property" in node_labels and canonical and canonical in property_values:
+                sample_value, sample_unit = property_values[canonical]
+            nodes.append({
+                "id": node_id,
+                "label": self._visual_node_label(
+                    node,
+                    display_value=sample_value,
+                    display_unit=sample_unit,
+                    property_langs=property_langs,
+                ),
+                "type": record["label"],
+                "properties": {
+                    k: v for k, v in dict(node).items()
+                    if k not in ("id", "title", "name", "canonical_name")
+                },
+            })
+            if sample_value:
+                nodes[-1]["properties"]["sample_value"] = sample_value
+                if sample_unit:
+                    nodes[-1]["properties"]["sample_unit"] = sample_unit
+            node_ids.add(node_id)
+
+        edges = []
+        if node_element_ids:
+            edges_result = session.run(
+                """
+                MATCH (a)-[r]->(b)
+                WHERE elementId(a) IN $eids
+                  AND elementId(b) IN $eids
+                  AND NOT type(r) IN $skip
+                RETURN a, b, type(r) AS type
+                """,
+                {
+                    "eids": node_element_ids,
+                    "skip": list(SKIP_VISUAL_REL_TYPES),
+                },
+            )
+            seen_edges: set[tuple[str, str, str]] = set()
+            for record in edges_result:
+                source = self._visual_node_id(record["a"])
+                target = self._visual_node_id(record["b"])
+                rel_type = record["type"]
+                if not source or not target:
+                    continue
+                if source not in node_ids or target not in node_ids:
+                    continue
+                key = (source, target, rel_type)
+                if key in seen_edges:
+                    continue
+                seen_edges.add(key)
+                edges.append({
+                    "source": source,
+                    "target": target,
+                    "type": rel_type,
+                })
+
+        return {"nodes": nodes, "edges": edges}
+
+    def _build_visual_graph_for_entity_page(
+        self,
+        session,
+        nodes_result,
+        edge_labels: list[str],
+        *,
+        document_id: str,
+        max_neighbors: int = 300,
+    ) -> dict:
+        """Entity page subgraph: typed nodes plus 1-hop document neighbors and edges."""
+        rows = list(nodes_result)
+        if not rows:
+            return {"nodes": [], "edges": []}
+
+        seed_eids: list[str] = []
+        for record in rows:
+            seed_eids.append(record["node"].element_id)
+
+        skip = list(SKIP_VISUAL_REL_TYPES)
+        neighbor_rows: list = []
+        seen_eids = set(seed_eids)
+
+        edge_records = list(
+            session.run(
+                """
+                MATCH (a)-[r]-(b)
+                WHERE elementId(a) IN $eids
+                  AND NOT type(r) IN $skip
+                  AND (
+                    elementId(b) IN $eids
+                    OR EXISTS { MATCH (d:Document {id: $doc_id})-[]-(b) }
+                  )
+                RETURN a, b, type(r) AS type
+                LIMIT 8000
+                """,
+                {"eids": seed_eids, "skip": skip, "doc_id": document_id},
+            )
+        )
+
+        neighbor_eids: list[str] = []
+        for record in edge_records:
+            for key in ("a", "b"):
+                node = record[key]
+                eid = node.element_id
+                if eid in seen_eids:
+                    continue
+                seen_eids.add(eid)
+                neighbor_eids.append(eid)
+                if len(neighbor_eids) >= max_neighbors:
+                    break
+            if len(neighbor_eids) >= max_neighbors:
+                break
+
+        if neighbor_eids:
+            neighbor_rows = list(
+                session.run(
+                    """
+                    UNWIND $eids AS eid
+                    MATCH (n)
+                    WHERE elementId(n) = eid
+                    RETURN n AS node, labels(n)[0] AS label
+                    """,
+                    {"eids": neighbor_eids},
+                )
+            )
+
+        combined_rows = rows + neighbor_rows
+        graph = self._build_visual_graph(session, combined_rows, edge_labels)
+
+        if not edge_records:
+            return graph
+
+        node_ids = {n["id"] for n in graph["nodes"]}
+        seen_edges: set[tuple[str, str, str]] = {
+            (e["source"], e["target"], e["type"]) for e in graph["edges"]
+        }
+        for record in edge_records:
+            source = self._visual_node_id(record["a"])
+            target = self._visual_node_id(record["b"])
+            rel_type = record["type"]
+            if not source or not target:
+                continue
+            if source not in node_ids or target not in node_ids:
+                continue
+            key = (source, target, rel_type)
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            graph["edges"].append(
+                {"source": source, "target": target, "type": rel_type}
+            )
+
+        return graph
+
+    def find_material_id_by_canonical_key(self, canonical_key: str) -> str | None:
+        if not canonical_key:
+            return None
+        with self.driver.session() as session:
+            record = session.run(
+                """
+                MATCH (m:Material)
+                WHERE m.canonical_key = $key
+                   OR coalesce(m.canonical_key, '') = ''
+                      AND toLower(trim(m.name)) = toLower(trim($name))
+                RETURN m.id AS id
+                LIMIT 1
+                """,
+                {"key": canonical_key, "name": canonical_key.replace("_", " ")},
+            ).single()
+            return str(record["id"]) if record else None
+
     def find_similar_materials(self, name: str, limit: int = 20) -> list[dict]:
         """Ищет похожие материалы (для Entity Resolution)."""
         with self.driver.session() as session:
@@ -1305,20 +2294,22 @@ class GraphDB:
     def search_text_chunks(
         self,
         query: str,
-        limit: int = 10,
+        limit: int = 20,
         *,
         document_id: str | None = None,
         document_ids: list[str] | None = None,
     ) -> list[dict]:
         """Full-text search over stored document chunks in Neo4j."""
-        terms = extract_search_terms(query, limit=12)
-        params: dict = {"terms": terms or [query.lower()], "limit": limit}
+        terms = extract_search_terms(query, limit=16)
+        params: dict = {"terms": terms or [query.lower()], "limit": limit * 3}
         with self.driver.session() as session:
             if document_id:
                 result = session.run("""
                     MATCH (d:Document {id: $document_id})-[:HAS_CHUNK]->(c:DocumentChunk)
                     WHERE any(t IN $terms WHERE toLower(c.text) CONTAINS t)
-                    RETURN c.id as id, c.text as text, d.id as document_id, d.title as title
+                    WITH c, d, size([t IN $terms WHERE toLower(c.text) CONTAINS t]) AS hits
+                    RETURN c.id as id, c.text as text, d.id as document_id, d.title as title, hits
+                    ORDER BY hits DESC, c.chunk_index ASC
                     LIMIT $limit
                 """, {**params, "document_id": document_id})
             elif document_ids:
@@ -1326,17 +2317,79 @@ class GraphDB:
                     MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)
                     WHERE d.id IN $document_ids
                       AND any(t IN $terms WHERE toLower(c.text) CONTAINS t)
-                    RETURN c.id as id, c.text as text, d.id as document_id, d.title as title
+                    WITH c, d, size([t IN $terms WHERE toLower(c.text) CONTAINS t]) AS hits
+                    RETURN c.id as id, c.text as text, d.id as document_id, d.title as title, hits
+                    ORDER BY hits DESC, c.chunk_index ASC
                     LIMIT $limit
                 """, {**params, "document_ids": list(document_ids)})
             else:
                 result = session.run("""
                     MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)
                     WHERE any(t IN $terms WHERE toLower(c.text) CONTAINS t)
-                    RETURN c.id as id, c.text as text, d.id as document_id, d.title as title
+                    WITH c, d, size([t IN $terms WHERE toLower(c.text) CONTAINS t]) AS hits
+                    RETURN c.id as id, c.text as text, d.id as document_id, d.title as title, hits
+                    ORDER BY hits DESC, c.chunk_index ASC
                     LIMIT $limit
                 """, params)
 
+            rows = [dict(record) for record in result]
+            return rows[:limit]
+
+    def get_chunks_by_pages(
+        self,
+        page_numbers: list[int],
+        *,
+        document_id: str | None = None,
+        document_ids: list[str] | None = None,
+        neighbor_pages: int = 1,
+    ) -> list[dict]:
+        """Fetch page-level chunks when the user cites specific pages."""
+        if not page_numbers:
+            return []
+
+        expanded: set[int] = set()
+        for page in page_numbers:
+            for offset in range(-neighbor_pages, neighbor_pages + 1):
+                candidate = page + offset
+                if candidate > 0:
+                    expanded.add(candidate)
+        pages = sorted(expanded)
+
+        params: dict = {"pages": pages}
+        with self.driver.session() as session:
+            if document_id:
+                result = session.run(
+                    """
+                    MATCH (d:Document {id: $document_id})-[:HAS_CHUNK]->(c:DocumentChunk)
+                    WHERE c.page_number IN $pages
+                    RETURN c.id AS id, c.text AS text, c.page_number AS page_number,
+                           d.id AS document_id, d.title AS title
+                    ORDER BY c.page_number ASC, c.chunk_index ASC
+                    """,
+                    {**params, "document_id": document_id},
+                )
+            elif document_ids:
+                result = session.run(
+                    """
+                    MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)
+                    WHERE d.id IN $document_ids AND c.page_number IN $pages
+                    RETURN c.id AS id, c.text AS text, c.page_number AS page_number,
+                           d.id AS document_id, d.title AS title
+                    ORDER BY c.page_number ASC, c.chunk_index ASC
+                    """,
+                    {**params, "document_ids": list(document_ids)},
+                )
+            else:
+                result = session.run(
+                    """
+                    MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)
+                    WHERE c.page_number IN $pages
+                    RETURN c.id AS id, c.text AS text, c.page_number AS page_number,
+                           d.id AS document_id, d.title AS title
+                    ORDER BY c.page_number ASC, c.chunk_index ASC
+                    """,
+                    params,
+                )
             return [dict(record) for record in result]
 
     def structured_search(
@@ -1540,6 +2593,13 @@ class GraphDB:
                     ),
                 })
         return contradictions
+
+    def reconcile_duplicate_entities(self) -> dict:
+        """Merge duplicate entity nodes (materials, teams, experts, etc.)."""
+        from ingestion.entity_dedupe import reconcile_duplicate_entities as run_dedupe
+
+        with self.driver.session() as session:
+            return run_dedupe(session)
 
     def export_json_ld(self, limit: int = 500) -> dict:
         """Export knowledge graph as JSON-LD for interoperability."""

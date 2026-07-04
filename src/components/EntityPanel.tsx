@@ -1,18 +1,29 @@
 "use client";
 
-import type { Entity, Experiment, Article, Material, Team, Facility } from "@/lib/types";
+import type { Entity, Experiment, Article, Material, Team, Facility, Figures, Property } from "@/lib/types";
 import { getEntityLabel, getEntityColor } from "@/lib/graph";
 import { relationLabel } from "@/lib/adapters/backend";
+import { figureImageUrl } from "@/lib/api/backend";
 import type { NodeConnection } from "@/lib/graphConnections";
+import type { GraphNode } from "@/lib/types";
+import { PropertyMeasurementsList } from "@/components/PropertyMeasurementsList";
 import { useI18n } from "@/lib/i18n/I18nProvider";
-import { X, FileText, ExternalLink } from "lucide-react";
+import { X, FileText, ExternalLink, Minimize2, ArrowLeft } from "lucide-react";
 
 interface EntityPanelProps {
   entity: Entity | null;
   loading?: boolean;
   connections?: NodeConnection[];
+  groupMembers?: GraphNode[];
+  groupMembersTotal?: number;
+  groupMembersLoading?: boolean;
   onConnectionClick?: (nodeId: string) => void;
+  onGroupMemberClick?: (nodeId: string) => void;
+  onBack?: () => void;
+  backLabel?: string;
   onClose: () => void;
+  documentGraphExpanded?: boolean;
+  onCollapseDocumentGraph?: () => void;
 }
 
 function asMaterial(entity: Entity): Material | null {
@@ -24,8 +35,16 @@ export function EntityPanel({
   entity,
   loading,
   connections,
+  groupMembers,
+  groupMembersTotal,
+  groupMembersLoading,
   onConnectionClick,
+  onGroupMemberClick,
+  onBack,
+  backLabel,
   onClose,
+  documentGraphExpanded,
+  onCollapseDocumentGraph,
 }: EntityPanelProps) {
   const { t, locale } = useI18n();
   if (!entity) return null;
@@ -35,16 +54,35 @@ export function EntityPanel({
   const isMaterial = entity.type === "material";
   const isTeam = entity.type === "team";
   const isFacility = entity.type === "facility";
+  const isFigures = entity.type === "figures";
+  const isProperty = entity.type === "property";
   const article = entity.type === "article" ? (entity as Partial<Article>) : null;
   const material = asMaterial(entity);
   const team = isTeam ? (entity as Team) : null;
   const facility = isFacility ? (entity as Facility) : null;
+  const figures = isFigures ? (entity as Figures) : null;
+  const property = isProperty ? (entity as Property) : null;
   const exp = isExperiment ? (entity as Experiment) : null;
+  const showGroupMembers = groupMembers !== undefined;
+  const memberCount = groupMembersTotal ?? groupMembers?.length ?? 0;
 
   return (
     <div className="flex h-full flex-col rounded-xl border border-slate-700/60 bg-slate-900/90 backdrop-blur">
-      <div className="flex items-center justify-between border-b border-slate-700/60 p-4">
-        <div className="flex items-center gap-2">
+      <div className="flex items-center justify-between gap-2 border-b border-slate-700/60 p-4">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              className="flex shrink-0 items-center gap-1 rounded-lg border border-slate-600/70 bg-slate-800/60 px-2 py-1 text-xs text-slate-300 transition hover:border-slate-500 hover:bg-slate-800 hover:text-slate-100"
+              title={backLabel}
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              <span className="max-w-[8rem] truncate">
+                {backLabel ?? t("entityPanel.backToGroup", { name: "…" })}
+              </span>
+            </button>
+          )}
           <span
             className="rounded px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-white"
             style={{ backgroundColor: getEntityColor(entity.type) }}
@@ -70,10 +108,54 @@ export function EntityPanel({
           <p className="mt-2 break-all text-sm text-slate-400">{entity.description}</p>
         )}
 
-        {connections !== undefined && (
+        {showGroupMembers && (
           <div className="mt-4">
             <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
-              {t("entityPanel.connections", { count: connections.length })}
+              {t("entityPanel.groupMembers", { count: memberCount })}
+            </div>
+            {groupMembersLoading && (
+              <p className="mt-2 text-xs text-slate-500">{t("entityPanel.loadingMembers")}</p>
+            )}
+            {!groupMembersLoading && (groupMembers?.length ?? 0) === 0 ? (
+              <p className="mt-2 text-xs text-slate-500">{t("entityPanel.noGroupMembers")}</p>
+            ) : (
+              <ul className="mt-2 max-h-[360px] space-y-1.5 overflow-y-auto pr-1">
+                {(groupMembers ?? []).map((member) => (
+                  <li key={member.id}>
+                    <button
+                      type="button"
+                      onClick={() => onGroupMemberClick?.(member.id)}
+                      className="w-full rounded-lg border border-slate-700/60 bg-slate-800/40 px-3 py-2 text-left transition hover:border-slate-600 hover:bg-slate-800/70"
+                    >
+                      <span className="block truncate text-sm text-slate-200">{member.name}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {connections !== undefined && !isProperty && !showGroupMembers && (
+          <div className="mt-4">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                {t("entityPanel.connections", { count: connections.length })}
+              </div>
+              {isArticle &&
+                documentGraphExpanded &&
+                onCollapseDocumentGraph &&
+                connections.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={onCollapseDocumentGraph}
+                    className="flex shrink-0 items-center gap-1 rounded-md border border-cyan-500/40 bg-cyan-500/10 px-2 py-1 text-[10px] font-medium text-cyan-300 transition hover:border-cyan-400/60 hover:bg-cyan-500/20"
+                    title={t("entityPanel.collapseGraphHint")}
+                  >
+                    <Minimize2 className="h-3 w-3" />
+                    {t("entityPanel.collapseGraph")}
+                  </button>
+                )}
             </div>
             {connections.length === 0 ? (
               <p className="mt-2 text-xs text-slate-500">{t("entityPanel.noConnections")}</p>
@@ -105,6 +187,53 @@ export function EntityPanel({
                 ))}
               </ul>
             )}
+          </div>
+        )}
+
+        {isFigures && figures && (
+          <div className="mt-4">
+            {figures.typeSummary && (
+              <p className="text-xs text-slate-500">{figures.typeSummary}</p>
+            )}
+            <div className="mt-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              {t("entityPanel.figuresList", {
+                count: figures.items.length,
+              })}
+            </div>
+            <ul className="mt-2 max-h-[360px] space-y-2 overflow-y-auto pr-1">
+              {figures.items.map((fig) => (
+                <li
+                  key={fig.id}
+                  className="overflow-hidden rounded-lg border border-violet-500/25 bg-violet-950/20"
+                >
+                  {figures.documentId && fig.id && (
+                    <img
+                      src={figureImageUrl(figures.documentId, fig.id)}
+                      alt={fig.caption || fig.image_type || "figure"}
+                      className="max-h-36 w-full object-contain bg-slate-950/60"
+                      loading="lazy"
+                    />
+                  )}
+                  <div className="space-y-1 px-3 py-2 text-xs">
+                    <div className="flex flex-wrap items-center gap-2">
+                      {fig.image_type && (
+                        <span className="rounded bg-violet-500/20 px-1.5 py-0.5 uppercase tracking-wide text-violet-200">
+                          {t(`entityPanel.imageType.${fig.image_type}`) || fig.image_type}
+                        </span>
+                      )}
+                      {fig.page_number != null && (
+                        <span className="text-slate-500">
+                          {t("entityPanel.figurePage", { page: fig.page_number })}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-slate-300">
+                      {fig.caption?.trim() || t("entityPanel.figureNoCaption")}
+                    </p>
+                  </div>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 
@@ -168,22 +297,31 @@ export function EntityPanel({
 
         {exp && (
           <div className="mt-4 space-y-3">
-            <div className="font-mono text-xs text-slate-500">{exp.code}</div>
+            {exp.code && (
+              <div className="font-mono text-xs text-slate-500">{exp.code}</div>
+            )}
+            {exp.description && (
+              <p className="rounded-lg bg-slate-800/50 p-3 text-sm leading-relaxed text-slate-300">
+                {exp.description}
+              </p>
+            )}
             <div className="grid grid-cols-2 gap-2 text-xs">
               <div className="rounded-lg bg-slate-800/50 p-2">
                 <div className="text-slate-500">{t("entityPanel.status")}</div>
-                <div className="mt-0.5 capitalize text-slate-200">{exp.status}</div>
+                <div className="mt-0.5 capitalize text-slate-200">
+                  {exp.status ?? "—"}
+                </div>
               </div>
               <div className="rounded-lg bg-slate-800/50 p-2">
                 <div className="text-slate-500">{t("entityPanel.started")}</div>
-                <div className="mt-0.5 text-slate-200">{exp.startedAt}</div>
+                <div className="mt-0.5 text-slate-200">{exp.startedAt ?? "—"}</div>
               </div>
             </div>
-            {exp.measurements.length > 0 && (
+            {(exp.measurements?.length ?? 0) > 0 && (
               <div>
                 <div className="mb-2 text-xs font-medium text-slate-500">{t("entityPanel.measurements")}</div>
                 <div className="space-y-2">
-                  {exp.measurements.map((m, i) => (
+                  {exp.measurements!.map((m, i) => (
                     <div key={i} className="rounded-lg bg-slate-800/50 p-2 text-xs">
                       <div className="text-slate-300">
                         {m.before !== undefined && m.after !== undefined
@@ -204,6 +342,29 @@ export function EntityPanel({
                   ))}
                 </div>
               </div>
+            )}
+          </div>
+        )}
+
+        {isProperty && property && (
+          <div className="mt-4">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                {t("entityPanel.measurements")}
+              </div>
+              {property.unit && (
+                <span className="rounded bg-amber-500/15 px-2 py-0.5 text-[10px] text-amber-200/90">
+                  {property.unit}
+                </span>
+              )}
+            </div>
+            {property.measurements && property.measurements.length > 0 ? (
+              <PropertyMeasurementsList
+                measurements={property.measurements}
+                emptyLabel={t("entityPanel.noMeasurements")}
+              />
+            ) : (
+              <p className="mt-2 text-xs text-slate-500">{t("entityPanel.noMeasurements")}</p>
             )}
           </div>
         )}
@@ -274,9 +435,13 @@ export function EntityPanel({
           </div>
         )}
 
-        {!isArticle && !isExperiment && !isMaterial && !isTeam && !isFacility && (
-          null
-        )}
+        {!isArticle &&
+          !isExperiment &&
+          !isMaterial &&
+          !isTeam &&
+          !isFacility &&
+          !isFigures &&
+          !isProperty && null}
 
         {"tags" in entity && entity.tags && entity.tags.length > 0 && (
           <div className="mt-4 flex flex-wrap gap-1">

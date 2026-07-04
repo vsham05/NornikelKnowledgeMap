@@ -52,7 +52,10 @@ async def backfill_material_process_links(
 
 @router.get("/explore")
 async def explore_graph(
-    limit: int = Query(200, ge=1, le=1000, description="Max nodes to return"),
+    limit: int = Query(3_000, ge=1, le=100_000, description="Max nodes returned"),
+    document_id: str | None = Query(None, description="Return the subgraph for one document"),
+    doc_limit: int = Query(25, ge=1, le=200, description="Recent documents scanned in overview mode"),
+    hub_only: bool = Query(False, description="Return only document hub nodes (fast preview)"),
     graph_db: GraphDB = Depends(get_graph_db)
 ):
     """
@@ -64,7 +67,54 @@ async def explore_graph(
         "edges": [{"source": "...", "target": "...", "type": "..."}]
     }
     """
-    return graph_db.get_full_graph(limit=limit)
+    return graph_db.get_full_graph(
+        limit=limit,
+        document_id=document_id,
+        doc_limit=doc_limit,
+        hub_only=hub_only,
+    )
+
+
+@router.get("/documents/{document_id}/summary")
+async def document_entity_summary(
+    document_id: str,
+    graph_db: GraphDB = Depends(get_graph_db),
+):
+    """
+    Per-type entity counts for one document — used for hierarchical map drill-down
+    (Bloom-style capsules) without loading thousands of nodes.
+    """
+    return graph_db.get_document_entity_summary(document_id)
+
+
+@router.get("/documents/{document_id}/entities")
+async def document_entities_by_type(
+    document_id: str,
+    entity_type: str = Query(
+        ...,
+        description="Neo4j node label: Material, Experiment, Team, Process, …",
+    ),
+    limit: int = Query(500, ge=1, le=2_000),
+    offset: int = Query(0, ge=0),
+    graph_db: GraphDB = Depends(get_graph_db),
+):
+    """Paginated entities of one type linked to a document."""
+    return graph_db.get_document_entities_by_type(
+        document_id,
+        entity_type,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/nodes/{node_id}/neighbors")
+async def node_neighbors(
+    node_id: str,
+    limit: int = Query(40, ge=1, le=100),
+    graph_db: GraphDB = Depends(get_graph_db),
+):
+    """1-hop graph neighbors for the entity side panel."""
+    return graph_db.get_node_neighbors(node_id, limit=limit)
 
 
 @router.get("/material-classes")
@@ -135,6 +185,12 @@ async def export_json_ld(
 ):
     """Export knowledge graph as JSON-LD (FAIR / interoperability)."""
     return graph_db.export_json_ld(limit=limit)
+
+
+@router.post("/dedupe/entities")
+async def dedupe_entities(graph_db: GraphDB = Depends(get_graph_db)):
+    """Merge duplicate graph entities (materials, equipment, processes, facilities)."""
+    return graph_db.reconcile_duplicate_entities()
 
 
 @router.get("/analytics/contradictions")
@@ -231,6 +287,18 @@ async def get_experiment(
     if not experiment:
         raise HTTPException(status_code=404, detail="Experiment not found")
     return experiment
+
+
+@router.get("/properties/{property_id:path}")
+async def get_property(
+    property_id: str,
+    graph_db: GraphDB = Depends(get_graph_db),
+):
+    """Measured values for a property node (canonical name or prop:… id)."""
+    details = graph_db.get_property_details(property_id)
+    if not details:
+        raise HTTPException(status_code=404, detail="Property not found")
+    return details
 
 
 @router.get("/experiments/{experiment_id}/subgraph")

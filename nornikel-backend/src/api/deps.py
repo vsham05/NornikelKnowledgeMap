@@ -38,3 +38,12 @@ def get_ingestion_pipeline() -> IngestionPipeline:
 def get_rag_service() -> RAGService:
     """Singleton RAGService."""
     return RAGService(get_settings())
+
+
+def clear_service_caches() -> None:
+    """Drop cached services after runtime config changes (e.g. LLM provider)."""
+    get_graph_db.cache_clear()
+    get_vector_db.cache_clear()
+    get_document_db.cache_clear()
+    get_ingestion_pipeline.cache_clear()
+    get_rag_service.cache_clear()

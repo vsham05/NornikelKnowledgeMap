@@ -1,6 +1,10 @@
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
 
+export function figureImageUrl(documentId: string, imageId: string): string {
+  return `${BACKEND_URL}/api/v1/ingest/documents/${encodeURIComponent(documentId)}/images/${encodeURIComponent(imageId)}`;
+}
+
 export class BackendError extends Error {
   constructor(
     message: string,
@@ -48,13 +52,19 @@ async function backendFetch<T>(
 }
 
 export async function checkBackendHealth(): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  const init: RequestInit = { signal: controller.signal, cache: "no-store" };
+
   try {
-    const res = await fetch(`${BACKEND_URL}/health`, {
-      signal: AbortSignal.timeout(3000),
-    });
-    return res.ok;
+    const health = await fetch(`${BACKEND_URL}/health`, init);
+    if (health.ok) return true;
+    const stats = await fetch(`${BACKEND_URL}/api/v1/graph/stats`, init);
+    return stats.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -70,6 +80,12 @@ export interface BackendGraphEdge {
   target: string;
   type: string;
 }
+
+export const GRAPH_OVERVIEW_LIMIT = 3_000;
+/** Max entities fetched per type when drilling into a large document. */
+export const GRAPH_TYPE_PAGE_LIMIT = 500;
+/** Legacy full-document fetch — avoid for large PDFs; prefer type drill-down. */
+export const GRAPH_DOCUMENT_LIMIT = 10_000;
 
 export interface BackendGraph {
   nodes: BackendGraphNode[];
@@ -154,6 +170,43 @@ export interface BackendGap {
   property?: string;
 }
 
+export interface BackendExperimentDetails {
+  id?: string;
+  regime_name?: string;
+  regime_description?: string;
+  regime_type?: string;
+  conclusions?: string | string[];
+  status?: string;
+  material_name?: string;
+  document_title?: string;
+  created_at?: string;
+  regime_parameters?: Array<{ name?: string; value?: string; unit?: string }>;
+  measured_properties?: Array<{
+    name?: string;
+    value?: string | number;
+    unit?: string;
+    category?: string;
+  }>;
+}
+
+export interface BackendPropertyDetails {
+  canonical_name?: string;
+  display_label?: string;
+  category?: string;
+  unit?: string;
+  measurements?: Array<{
+    source?: string;
+    experiment_id?: string;
+    experiment_name?: string;
+    material_id?: string;
+    material_name?: string;
+    document_title?: string;
+    value?: string | number;
+    unit?: string;
+    source_text?: string;
+  }>;
+}
+
 export interface BackendExperiment {
   id: string;
   regime?: string;
@@ -204,12 +257,55 @@ export interface IngestTaskStatus {
   status: "pending" | "processing" | "completed" | "failed";
   progress: number;
   message: string;
+  ingest_llm_provider?: "local" | "yandex" | null;
+  ingest_llm_model?: string | null;
   result?: Record<string, unknown>;
   error?: string | null;
 }
 
+export type LlmProvider = "local" | "yandex";
+
+export interface YandexModelOption {
+  id: string;
+  label: string;
+  context_tokens: number;
+  extraction_chars: number;
+  tags: string[];
+  moderation_risk: boolean;
+  notes: string;
+  recommended: boolean;
+}
+
+export interface LlmConfig {
+  provider: LlmProvider;
+  local_model: string;
+  yandex_model: string;
+  yandex_models: YandexModelOption[];
+  yandex_recommended: string;
+  yandex_ready: boolean;
+  yandex_moderation_risk?: boolean;
+  extraction_max_chars?: number;
+  effective_model: string;
+}
+
 export const backendApi = {
   health: () => backendFetch<{ status: string }>("/health"),
+
+  getLlmConfig: () => backendFetch<LlmConfig>("/api/v1/config/llm"),
+
+  setLlmProvider: (provider: LlmProvider) =>
+    backendFetch<LlmConfig>("/api/v1/config/llm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider }),
+    }),
+
+  setYandexModel: (model: string) =>
+    backendFetch<LlmConfig>("/api/v1/config/llm/yandex-model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    }),
 
   graphStats: () => backendFetch<BackendStats>("/api/v1/graph/stats"),
 
@@ -218,8 +314,53 @@ export const backendApi = {
       method: "POST",
     }),
 
-  exploreGraph: (limit = 200) =>
-    backendFetch<BackendGraph>(`/api/v1/graph/explore?limit=${limit}`),
+  exploreGraph: (limit = GRAPH_OVERVIEW_LIMIT, documentId?: string, hubOnly = false) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (documentId) params.set("document_id", documentId);
+    if (hubOnly) params.set("hub_only", "true");
+    return backendFetch<BackendGraph>(`/api/v1/graph/explore?${params.toString()}`);
+  },
+
+  documentEntitySummary: (documentId: string) =>
+    backendFetch<{
+      document_id: string;
+      total_entities: number;
+      types: Array<{ label: string; count: number }>;
+    }>(`/api/v1/graph/documents/${encodeURIComponent(documentId)}/summary`),
+
+  documentEntitiesByType: (
+    documentId: string,
+    entityType: string,
+    limit = GRAPH_TYPE_PAGE_LIMIT,
+    offset = 0
+  ) =>
+    backendFetch<{
+      document_id: string;
+      entity_label: string;
+      offset: number;
+      limit: number;
+      total: number;
+      has_more: boolean;
+      nodes: BackendGraphNode[];
+      edges: Array<{ source: string; target: string; type: string }>;
+    }>(
+      `/api/v1/graph/documents/${encodeURIComponent(documentId)}/entities?${new URLSearchParams({
+        entity_type: entityType,
+        limit: String(limit),
+        offset: String(offset),
+      }).toString()}`
+    ),
+
+  getNodeNeighbors: (nodeId: string, limit = 40) =>
+    backendFetch<BackendGraph>(
+      `/api/v1/graph/nodes/${encodeURIComponent(nodeId)}/neighbors?limit=${limit}`
+    ),
+
+  reconcileDuplicateEntities: () =>
+    backendFetch<{ merged_group_count: number; groups: unknown[] }>(
+      "/api/v1/graph/dedupe/entities",
+      { method: "POST" }
+    ),
 
   graphSearch: (q: string, limit = 20) =>
     backendFetch<{ query: string; results: BackendGraphNode[]; count: number }>(
@@ -233,6 +374,14 @@ export const backendApi = {
       `/api/v1/graph/experiments/by-material?${params}`
     );
   },
+
+  getExperiment: (experimentId: string) =>
+    backendFetch<BackendExperimentDetails>(`/api/v1/graph/experiments/${experimentId}`),
+
+  getProperty: (propertyId: string) =>
+    backendFetch<BackendPropertyDetails>(
+      `/api/v1/graph/properties/${encodeURIComponent(propertyId)}`
+    ),
 
   dataGaps: () =>
     backendFetch<{ gaps: BackendGap[]; count: number }>(
@@ -295,6 +444,12 @@ export const backendApi = {
 
   getDocument: (documentId: string) =>
     backendFetch<BackendDocument>(`/api/v1/ingest/documents/${documentId}`),
+
+  deleteDocument: (documentId: string) =>
+    backendFetch<{ status: string; document_id: string }>(
+      `/api/v1/ingest/documents/${encodeURIComponent(documentId)}`,
+      { method: "DELETE" }
+    ),
 };
 
 export { BACKEND_URL };

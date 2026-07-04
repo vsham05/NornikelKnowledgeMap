@@ -15,7 +15,7 @@ from search.reranker import rerank_chunks
 logger = logging.getLogger(__name__)
 
 RRF_K = 60
-RETRIEVAL_POOL = 50
+RETRIEVAL_POOL = 80
 PROPER_NOUN_RE = re.compile(
     r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+|[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)+)\b"
 )
@@ -43,6 +43,7 @@ class RetrievedChunk:
             "score": self.final_score,
             "vector_score": self.vector_score,
             "rrf_score": self.rrf_score,
+            "retrieval_sources": list(self.retrieval_sources),
         }
 
 
@@ -51,6 +52,23 @@ def _chunk_key(chunk_id: str | None, text: str) -> str:
         return str(chunk_id)
     digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
     return digest[:32]
+
+
+_UNIT_RE = re.compile(
+    r"(?:мг/л|mg/l|мг/дм|mg/dm|ppm|%|°c|℃|м/ч|м³/ч|m3/h|мм/с|"
+    r"т/год|t/y|t/a|usd|\$|руб|млн|million|billion|tonnes?|tonne|mt\b)",
+    re.IGNORECASE,
+)
+
+
+def _numeric_density_score(text: str) -> float:
+    """Boost passages with measurable technical values."""
+    if not text.strip():
+        return 0.0
+    numbers = len(re.findall(r"\d+(?:[.,]\d+)?", text))
+    units = len(_UNIT_RE.findall(text))
+    score = min(1.0, numbers / 6) * 0.55 + min(1.0, units / 3) * 0.45
+    return score
 
 
 def _year_density_score(text: str) -> float:
@@ -83,6 +101,24 @@ def _bibliography_penalty(text: str) -> float:
     if len(YEAR_RE.findall(text)) > 8:
         penalty += 0.2
     return min(0.5, penalty)
+
+
+def _toc_penalty(text: str) -> float:
+    """Down-rank table-of-contents / heading-list chunks."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 4:
+        return 0.0
+    short_title_lines = sum(
+        1
+        for line in lines
+        if len(line) < 55
+        and 1 <= len(line.split()) <= 6
+        and line[0].isupper()
+        and not line.endswith(".")
+    )
+    if short_title_lines >= 3 and short_title_lines / len(lines) >= 0.45:
+        return 0.35
+    return 0.0
 
 
 def _title_relevance_boost(intent: QueryIntent, chunk: RetrievedChunk) -> float:
@@ -185,6 +221,32 @@ class HybridRetriever:
         pool: dict[str, RetrievedChunk] = {}
         all_rankings: list[list[str]] = []
 
+        if intent.page_refs:
+            page_hits = self.graph_db.get_chunks_by_pages(
+                list(intent.page_refs),
+                document_id=document_id,
+                document_ids=document_ids,
+            )
+            page_ranking: list[str] = []
+            for hit in page_hits:
+                text = (hit.get("text") or "").strip()
+                if not text:
+                    continue
+                key = _chunk_key(hit.get("id"), text)
+                page_ranking.append(key)
+                if key not in pool:
+                    pool[key] = RetrievedChunk(
+                        chunk_id=key,
+                        text=text,
+                        document_id=str(hit.get("document_id") or ""),
+                        title=hit.get("title"),
+                        retrieval_sources=["page"],
+                    )
+                elif "page" not in pool[key].retrieval_sources:
+                    pool[key].retrieval_sources.append("page")
+            if page_ranking:
+                all_rankings.insert(0, page_ranking)
+
         for q in queries:
             vector_hits = await self._vector_hits(
                 q, pool_size=RETRIEVAL_POOL, document_id=document_id, document_ids=document_ids
@@ -249,10 +311,17 @@ class HybridRetriever:
             chunk.lexical_score = _lexical_score(terms, chunk.text, idf)
             harm_score = _harm_damage_score(intent, chunk.text)
             year_score = _year_density_score(chunk.text) if intent.is_temporal else 0.0
+            numeric_score = (
+                _numeric_density_score(chunk.text)
+                if intent.is_technical or intent.is_quantitative
+                else 0.0
+            )
             dual_source = 0.05 if len(chunk.retrieval_sources) > 1 else 0.0
 
             bib_penalty = _bibliography_penalty(chunk.text)
+            toc_penalty = _toc_penalty(chunk.text)
             title_boost = _title_relevance_boost(intent, chunk)
+            page_boost = 0.45 if "page" in chunk.retrieval_sources else 0.0
 
             if intent.is_name:
                 chunk.name_score = _name_density_score(chunk.text)
@@ -262,9 +331,12 @@ class HybridRetriever:
                     + 0.3 * chunk.name_score
                     + 0.15 * harm_score
                     + 0.15 * year_score
+                    + 0.2 * numeric_score
                     + title_boost
+                    + page_boost
                     + dual_source
                     - bib_penalty
+                    - toc_penalty
                 )
             else:
                 chunk.name_score = 0.0
@@ -273,10 +345,13 @@ class HybridRetriever:
                     + 0.3 * chunk.lexical_score
                     + 0.2 * harm_score
                     + 0.2 * year_score
+                    + 0.25 * numeric_score
                     + title_boost
+                    + page_boost
                     + (0.1 if intent.is_quantitative and "%" in chunk.text else 0.0)
                     + dual_source
                     - bib_penalty
+                    - toc_penalty
                 )
 
         ranked = sorted(pool.values(), key=lambda c: c.final_score, reverse=True)
@@ -287,12 +362,13 @@ class HybridRetriever:
         selected = _select_diverse(ranked, limit, max_per_document=per_doc_cap)
 
         logger.info(
-            "Hybrid retrieval: queries=%s pool=%s -> top %s (intent temporal=%s harm=%s)",
+            "Hybrid retrieval: queries=%s pool=%s -> top %s (intent temporal=%s harm=%s pages=%s)",
             len(queries),
             len(pool),
             len(selected),
             intent.is_temporal,
             intent.harm_related,
+            list(intent.page_refs),
         )
         return selected
 

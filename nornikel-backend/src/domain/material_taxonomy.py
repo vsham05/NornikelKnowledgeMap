@@ -239,6 +239,34 @@ class MaterialTaxonomy:
         )
         return "\n".join(lines)
 
+    def find_materials_in_text(
+        self,
+        text: str,
+        *,
+        limit: int = 32,
+    ) -> list[tuple[str, MaterialClass]]:
+        """Word-boundary scan for taxonomy aliases/patterns (local LLM backfill)."""
+        if not (text or "").strip():
+            return []
+        lower = text.lower()
+        hits: dict[str, tuple[str, MaterialClass]] = {}
+        for class_id, schema in self._ontology.material_classes.items():
+            try:
+                cls = MaterialClass(class_id)
+            except ValueError:
+                continue
+            for term in list(schema.name_patterns or []) + list(schema.aliases or []):
+                token = (term or "").strip()
+                key = token.lower()
+                if len(key) < 4 or is_generic_class_label(key):
+                    continue
+                if not re.search(rf"\b{re.escape(key)}\b", lower):
+                    continue
+                hits.setdefault(key, (token, cls))
+                if len(hits) >= limit:
+                    return list(hits.values())
+        return list(hits.values())
+
 
 def is_generic_class_label(name: str) -> bool:
     """

@@ -11,7 +11,8 @@ set PYTHONPATH=src
 set API_RELOAD=false
 echo.
 echo Ensure Ollama is running with models:
-echo   ollama pull qwen2.5:7b-instruct
+echo   scripts\pull-ollama-models.ps1 -Tier premium   REM ~90%% Yandex parity
+echo   scripts\pull-ollama-models.ps1 -Tier standard  REM default balance
 echo   ollama pull mxbai-embed-large
 echo.
 echo Starting backend at http://localhost:8000

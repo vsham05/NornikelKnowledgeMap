@@ -4,6 +4,7 @@ import {
   mergedMaterialLabel,
   parseMaterialComponents,
 } from "@/lib/materialComponents";
+import { deduplicateGraphEntities } from "@/lib/graphDedup";
 import { parseQuery, parsedToStructured, structuredToBackend } from "@/lib/query";
 import type { StructuredFilters } from "@/lib/types";
 import type {
@@ -22,7 +23,7 @@ import type {
   ParsedQuery,
   SearchResult,
 } from "@/lib/types";
-import { backendApi } from "@/lib/api/backend";
+import { backendApi, GRAPH_DOCUMENT_LIMIT, GRAPH_OVERVIEW_LIMIT } from "@/lib/api/backend";
 
 const TYPE_MAP: Record<string, EntityType> = {
   Material: "material",
@@ -36,6 +37,7 @@ const TYPE_MAP: Record<string, EntityType> = {
   Equipment: "equipment",
   Facility: "facility",
   Expert: "expert",
+  FigureGallery: "figures",
 };
 
 const NODE_SIZE: Record<string, number> = {
@@ -50,6 +52,7 @@ const NODE_SIZE: Record<string, number> = {
   Equipment: 7,
   Facility: 6,
   Expert: 6,
+  FigureGallery: 8,
 };
 
 export function backendNodeType(label: string): EntityType {
@@ -62,6 +65,27 @@ function backendNodeName(node: BackendGraphNode): string {
   const id = node.id?.trim();
   if (id) return id.length > 12 ? `${id.slice(0, 8)}…` : id;
   return "Unknown";
+}
+
+function parseFigureItems(
+  properties: Record<string, unknown> | undefined
+): Array<Record<string, unknown>> {
+  if (!properties) return [];
+  if (Array.isArray(properties.items)) {
+    return properties.items as Array<Record<string, unknown>>;
+  }
+  const raw = properties.items_json;
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) {
+        return parsed as Array<Record<string, unknown>>;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return [];
 }
 
 function toGraphNode(n: BackendGraphNode): GraphNode {
@@ -81,6 +105,42 @@ function toGraphNode(n: BackendGraphNode): GraphNode {
       : undefined;
   const components =
     type === "material" ? parseMaterialComponents(name, aliases) : undefined;
+  const rawItems = parseFigureItems(n.properties);
+  const figures =
+    type === "figures"
+      ? (rawItems as Array<Record<string, unknown>>).map((item) => ({
+          id: String(item.id ?? ""),
+          caption: item.caption ? String(item.caption) : undefined,
+          page_number:
+            typeof item.page_number === "number" ? item.page_number : undefined,
+          image_type: item.image_type ? String(item.image_type) : undefined,
+          storage_key: item.storage_key ? String(item.storage_key) : undefined,
+        }))
+      : undefined;
+  const documentId =
+    typeof n.properties?.document_id === "string"
+      ? n.properties.document_id
+      : type === "figures" && n.id.includes(":figures")
+        ? n.id.replace(/:figures$/, "")
+        : undefined;
+  const regimeName =
+    typeof n.properties?.regime_name === "string" ? n.properties.regime_name : undefined;
+  const regimeDescription =
+    typeof n.properties?.regime_description === "string"
+      ? n.properties.regime_description
+      : undefined;
+  const rawConclusions = n.properties?.conclusions;
+  const conclusionText = Array.isArray(rawConclusions)
+    ? rawConclusions.map(String).filter(Boolean).join("; ")
+    : typeof rawConclusions === "string"
+      ? rawConclusions
+      : undefined;
+  const statusRaw =
+    typeof n.properties?.status === "string" ? n.properties.status.toLowerCase() : "";
+  const experimentStatus =
+    statusRaw === "completed" || statusRaw === "ongoing" || statusRaw === "planned"
+      ? statusRaw
+      : undefined;
   return {
     id: n.id,
     type,
@@ -94,6 +154,40 @@ function toGraphNode(n: BackendGraphNode): GraphNode {
     ...(type === "team" && members ? { members } : {}),
     ...(type === "facility"
       ? { country, facilityType }
+      : {}),
+    ...(type === "figures"
+      ? {
+          figures,
+          documentId,
+          imageCount:
+            typeof n.properties?.image_count === "number"
+              ? n.properties.image_count
+              : figures?.length,
+          typeSummary:
+            typeof n.properties?.type_summary === "string"
+              ? n.properties.type_summary
+              : undefined,
+        }
+      : {}),
+    ...(type === "experiment"
+      ? {
+          regimeName,
+          regimeDescription,
+          conclusionText,
+          experimentStatus,
+        }
+      : {}),
+    ...(type === "property"
+      ? {
+          sampleValue:
+            typeof n.properties?.sample_value === "string"
+              ? n.properties.sample_value
+              : undefined,
+          sampleUnit:
+            typeof n.properties?.sample_unit === "string"
+              ? n.properties.sample_unit
+              : undefined,
+        }
       : {}),
   };
 }
@@ -113,7 +207,8 @@ export function backendGraphToFrontend(graph: BackendGraph): {
     relation: mapRelation(e.type),
   }));
 
-  return { nodes, links };
+  const deduped = deduplicateGraphEntities(nodes, links);
+  return { nodes: deduped.nodes, links: deduped.links };
 }
 
 function mapRelation(relation: string): GraphEdge["relation"] {
@@ -138,6 +233,7 @@ function mapRelation(relation: string): GraphEdge["relation"] {
     USES_EQUIPMENT: "employs",
     USES_PROCESS: "employs",
     PROCESSED_IN: "processed_in",
+    HAS_FIGURES: "has_figures",
     HAS_VALUE: "measures",
     TAGGED: "tagged",
     REFERENCES: "references",
@@ -158,6 +254,7 @@ const RELATION_LABELS: Record<GraphEdge["relation"], string> = {
   references: "references",
   employs: "employs",
   processed_in: "processed in",
+  has_figures: "has figures",
 };
 
 export function relationLabel(
@@ -259,14 +356,13 @@ export async function backendSearch(
 
   const materialName = structuredFilters?.material ?? parsed.material;
 
-  const [rag, graphSearch, gapsRes, materialExps, explore, structuredHits] = await Promise.all([
+  const [rag, graphSearch, materialExps, explore, structuredHits] = await Promise.all([
     backendApi.ragSearch(query, documentId, cleanStructured).catch(() => null),
-    backendApi.graphSearch(query).catch(() => ({ query, results: [], count: 0 })),
-    backendApi.dataGaps().catch(() => ({ gaps: [], count: 0 })),
+    backendApi.graphSearch(query, 8).catch(() => ({ query, results: [], count: 0 })),
     materialName
       ? backendApi.experimentsByMaterial(materialName).catch(() => ({ experiments: [], count: 0 }))
       : Promise.resolve({ experiments: [], count: 0 }),
-    backendApi.exploreGraph(300).catch(() => null),
+    backendApi.exploreGraph(documentId ? GRAPH_DOCUMENT_LIMIT : GRAPH_OVERVIEW_LIMIT, documentId).catch(() => null),
     Object.keys(cleanStructured).length
       ? backendApi.structuredQuery(cleanStructured).catch(() => null)
       : Promise.resolve(null),
@@ -278,10 +374,19 @@ export async function backendSearch(
 
   const graph = explore ? documentGraphFromExplore(explore) : { nodes: [], links: [] };
 
-  void graphSearch;
-  void structuredHits;
+  const graphMatchIds = (graphSearch.results ?? [])
+    .map((r) => r.id)
+    .filter((id): id is string => Boolean(id));
 
-  const gaps = backendGapsToFrontend(gapsRes.gaps ?? []).slice(0, 12);
+  const structuredExperiments = (structuredHits?.experiments ?? []).map((row) => ({
+    experiment_id: row.experiment_id as string | undefined,
+    material: row.material as string | undefined,
+    process: row.process as string | undefined,
+    regime: row.regime as string | undefined,
+    document_id: row.document_id as string | undefined,
+    document_title: row.document_title as string | undefined,
+    year: typeof row.year === "number" ? row.year : undefined,
+  }));
 
   const sources: import("@/lib/types").SourceExcerpt[] = (rag?.sources ?? []).map((s) => ({
     index: s.index,
@@ -296,8 +401,8 @@ export async function backendSearch(
     experiments,
     relatedEntities: [],
     graph,
-    gaps,
-    narrative: buildNarrative(rag, experiments, gaps, structuredHits),
+    gaps: [],
+    narrative: buildNarrative(rag, experiments, structuredHits),
     sources,
     confidence: rag?.confidence,
     needsDisambiguation: rag?.needs_disambiguation,
@@ -315,13 +420,14 @@ export async function backendSearch(
           graphMatchCount: rag.retrieval_scope.graph_match_count,
         }
       : undefined,
+    graphMatchIds,
+    structuredExperiments,
   };
 }
 
 function buildNarrative(
   rag: BackendRagResult | null,
   experiments: ExperimentResult[],
-  gaps: DataGap[],
   structuredHits: { count?: number } | null
 ): string {
   const parts: string[] = [];

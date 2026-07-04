@@ -13,6 +13,7 @@ from search.query_processing import (
     YEAR_RE,
     answer_language_instruction,
     is_name_question as _is_name_question_qp,
+    is_technical_quantitative_question,
     significant_terms,
 )
 
@@ -74,6 +75,92 @@ def is_name_question(question: str) -> bool:
     return _is_name_question_qp(question)
 
 
+def build_numeric_answer_instruction(question: str, answer_lang: str) -> str:
+    if not is_technical_quantitative_question(question):
+        return ""
+    if answer_lang == "ru":
+        return (
+            "ЧИСЛА: каждый пункт ответа должен содержать конкретные числовые значения с единицами "
+            "(мг/л, %, м/ч, м³/ч, °C, т/год, $/т, руб. и т.д.) из выдержек. "
+            "Если в вопросе заданы пороги или диапазоны — сравните с ними явно. "
+            "Для вопросов «Россия / зарубеж» — разделите факты по географии. "
+            "Для «покажите все эксперименты» — перечислите каждый с годом, объектом и ключевыми цифрами."
+        )
+    return (
+        "NUMBERS: every answer point must include concrete numeric values with units from excerpts. "
+        "Compare explicitly to any thresholds in the question. "
+        "Split Russia vs international facts when asked. "
+        "For list-all-experiments questions, enumerate each with year and key metrics."
+    )
+
+
+def build_fact_extraction_system(answer_lang: str) -> str:
+    lang = answer_language_instruction(answer_lang)
+    return f"""{lang}
+
+You extract facts ONLY from numbered document excerpts to answer a technical R&D question.
+Reply with JSON only: {{"facts": [{{"claim": "...", "sources": [1]}}]}}
+
+Rules:
+- Answer the user's specific question — each sub-part if the question has multiple parts.
+- EVERY claim must include numeric values with units WHEN they appear in the cited excerpt
+  (concentrations мг/л, flow rates м/ч, temperatures °C, recovery %, costs, capacities).
+- Use exact numbers from excerpts — never round, invent, or guess.
+- For methods/processes questions: state method name AND operating parameters (flow, pressure, pH, recovery).
+- For Russia vs abroad questions: prefix claim with geography (Россия:/Russia: or Зарубеж:/International:).
+- For experiment/publication lists: one fact per experiment — material, process, year, key measured values.
+- Compare to thresholds from the question when relevant (e.g. входная вода 200–300 мг/л vs норма ≤1000).
+- One fact per bullet. Complete sentences. Cite excerpt number(s).
+- If excerpts lack numeric data for a sub-question, omit that fact (do not fabricate).
+- If nothing applies, return {{"facts": []}}."""
+
+
+async def extract_technical_facts_with_llm(
+    llm_client,
+    question: str,
+    context: str,
+    *,
+    answer_lang: str = "ru",
+) -> list[dict[str, Any]]:
+    """Structured fact extraction for technical/numeric questions (grounded JSON)."""
+    user_message = f"""QUESTION:
+{question}
+
+NUMBERED EXCERPTS:
+{context}
+
+Extract facts that answer the question. Include all relevant numbers with units."""
+
+    try:
+        result = await llm_client.chat_json(
+            user_message=user_message,
+            system_message=build_fact_extraction_system(answer_lang),
+            temperature=0.0,
+            max_tokens=6144,
+        )
+    except Exception as exc:
+        logger.warning("Technical fact extraction failed: %s", exc)
+        return []
+
+    raw_facts = result.get("facts") if isinstance(result, dict) else []
+    if not isinstance(raw_facts, list):
+        return []
+
+    facts: list[dict[str, Any]] = []
+    for item in raw_facts:
+        if not isinstance(item, dict):
+            continue
+        claim = str(item.get("claim") or "").strip()
+        sources = item.get("sources") or []
+        if not claim:
+            continue
+        src_nums = [int(s) for s in sources if str(s).isdigit()]
+        if not src_nums:
+            continue
+        facts.append({"claim": claim, "sources": src_nums})
+    return facts
+
+
 def _question_terms(question: str) -> list[str]:
     return significant_terms(question, min_length=4)
 
@@ -86,6 +173,11 @@ def facts_address_question(question: str, facts: list[dict[str, Any]]) -> bool:
     claims = " ".join(fact["claim"] for fact in facts)
     claims_lower = claims.lower()
     question_lower = question.lower()
+
+    if is_technical_quantitative_question(question):
+        if re.search(r"\d", question) and not re.search(r"\d", claims):
+            return False
+        return len(facts) >= 1
 
     if TEMPORAL_QUERY_RE.search(question) and not YEAR_RE.search(claims):
         return False
@@ -413,8 +505,84 @@ Rules:
 8. If multiple documents are present, answer per document in separate sentences or bullets and name the document.
 9. If excerpts from one document conflict with another, state what each document says separately — do not synthesize a blended answer.
 10. If excerpts lack the exact answer, give the closest supported facts and cite them. Only say there is not enough information if even partial facts are absent.
-11. Keep answers concise: 1-4 sentences for simple questions; bullet list only when listing multiple items."""
+11. Keep answers concise: 1-4 sentences for simple questions; bullet list only when listing multiple items.
+12. NEVER answer with bare process names, section titles, or table-of-contents entries (e.g. "Acid Leaching", "Feasibility Study") — each point must be a complete factual sentence.
+13. Do not copy labels from any background/graph index; only cite NUMBERED EXCERPTS.
+14. When the question concerns a specific material, every bullet must state a concrete fact about that material (results, conditions, grades, locations) supported by the cited excerpt.
+15. TECHNICAL/METALLURGY: always include numeric values with units (мг/л, %, m/h, °C, $/t) when present in excerpts — never give qualitative-only answers if numbers exist.
+16. Multi-part questions: address each part; use numbered bullets matching sub-questions.
+17. Russia vs international: separate facts by geography when the question asks for both.
+18. If the question lists input conditions or thresholds, explicitly compare excerpt values to those thresholds."""
 
 
 def build_answer_system(answer_lang: str) -> str:
     return f"{answer_language_instruction(answer_lang)}\n\n{ANSWER_SYSTEM}"
+
+
+_BULLET_LINE_RE = re.compile(
+    r"^\s*\d+\.\s+(.+?)(\s+\[(?:\d+(?:\s*,\s*\d+)*)\])+\s*$"
+)
+
+
+def _is_heading_only_claim(claim: str) -> bool:
+    claim = claim.strip().rstrip(".")
+    if len(claim) > 80 or re.search(r"\d", claim):
+        return False
+    words = [w for w in claim.split() if w]
+    if not words or len(words) > 7:
+        return False
+    return all(w[0].isupper() for w in words if w[0].isalpha())
+
+
+def _looks_like_toc(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return False
+    short = sum(1 for line in lines if len(line) < 55 and len(line.split()) <= 6)
+    return short / len(lines) >= 0.55
+
+
+def prune_unsupported_heading_bullets(
+    answer: str,
+    context_chunks: list[dict],
+    *,
+    focus_terms: list[str] | None = None,
+) -> str:
+    """Remove numbered bullets that are bare titles/process names from TOC-like excerpts."""
+    if not answer or not context_chunks:
+        return answer
+
+    focus = [t.lower() for t in (focus_terms or []) if t]
+    kept: list[str] = []
+
+    for line in answer.splitlines():
+        match = _BULLET_LINE_RE.match(line)
+        if not match:
+            kept.append(line)
+            continue
+
+        claim = match.group(1).strip()
+        if not _is_heading_only_claim(claim):
+            kept.append(line)
+            continue
+
+        cite_nums = [int(n) for n in _CITATION_RE.findall(line)]
+        excerpts: list[str] = []
+        for num in cite_nums:
+            if 1 <= num <= len(context_chunks):
+                excerpts.append(context_chunks[num - 1].get("text") or "")
+
+        combined = "\n".join(excerpts)
+        combined_lower = combined.lower()
+        claim_lower = claim.lower()
+
+        if focus and not any(term in combined_lower for term in focus):
+            continue
+        if claim_lower in combined_lower and _looks_like_toc(combined):
+            continue
+        if claim_lower not in combined_lower:
+            continue
+
+        kept.append(line)
+
+    return "\n".join(kept)

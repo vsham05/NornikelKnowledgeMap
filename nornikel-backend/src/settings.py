@@ -1,12 +1,15 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+_ENV_FILE = _BACKEND_ROOT / ".env"
+
 
 class Settings(BaseSettings):
     """Настройки приложения из переменных окружения."""
     
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE) if _ENV_FILE.is_file() else ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore"
@@ -33,11 +36,40 @@ class Settings(BaseSettings):
     llm_api_key: str = "ollama"
     llm_base_url: str = "http://localhost:11434/v1"
     llm_model: str = "qwen2.5-7b-instruct"
+    llm_provider: str = "local"  # local | yandex
+    llm_context_tokens: int = 32_768
+    llm_extraction_max_chars: int = 28_000
+    llm_extraction_max_batches: int = 0  # 0 = process every page batch (no thinning)
+    llm_yandex_fallback_local: bool = True
+    # ru | en | auto — auto matches labels to document language (recommended)
+    extraction_language: str = "auto"
+    # Hybrid ingest: short PDFs → local 7B, longer → Yandex (when API keys configured)
+    ingest_hybrid_routing: bool = True
+    ingest_local_max_pages: int = 28
+    ingest_local_full_coverage: bool = True  # local: every page batch + auto multipass enricher
+    ingest_local_enricher_concurrency: int = 0  # 0 = tier default (2 light / 3 standard / 4 premium)
+    # Long PDFs (≥ threshold pages): parallel enricher + batched extraction
+    ingest_fast_page_threshold: int = 35
+    ingest_embed_max_chunks: int = 0  # 0 = embed all merged chunks (no thinning)
+    ingest_parallel_extraction_batches: int = 16
+    ingest_llm_concurrency: int = 8
+    ingest_target_max_minutes: int = 10
+    # Legacy aliases (ignored when parallel ingest is active)
+    ingest_balanced_extraction_batches: int = 3
+    ingest_enricher_multipass: int = 0  # auto: 2 for 7B tier on long PDFs
+
+    # Yandex Cloud Foundation Models (OpenAI-compatible)
+    yandex_api_key: str = ""
+    yandex_folder_id: str = ""
+    yandex_base_url: str = "https://llm.api.cloud.yandex.net/v1"
+    yandex_model: str = "qwen3-235b-a22b-fp8/latest"
     
-    # VLM
+    # VLM (vision model for image-based tables — separate from text LLM)
     vlm_api_key: str = "ollama"
     vlm_base_url: str = "http://localhost:11434/v1"
-    vlm_model: str = "qwen2.5-7b-instruct"
+    vlm_model: str = "minicpm-v"
+    ingest_table_vlm: bool = True
+    ingest_table_vlm_max: int = 24
     
     # Embedding (Ollama)
     embedding_api_key: str = "ollama"
@@ -84,4 +116,9 @@ def get_settings() -> Settings:
     global _settings
     if _settings is None:
         _settings = Settings()
+        from infra.llm_runtime import init_llm_provider_from_settings, init_local_model_from_settings, init_yandex_model_from_settings
+
+        init_llm_provider_from_settings(_settings.llm_provider)
+        init_yandex_model_from_settings(_settings.yandex_model)
+        init_local_model_from_settings(_settings.llm_model)
     return _settings

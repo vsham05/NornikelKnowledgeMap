@@ -1,11 +1,14 @@
-import type { GraphEdge, GraphNode } from "@/lib/types";
+import type { EntityType, GraphEdge, GraphNode } from "@/lib/types";
+import { isTypeClusterNode } from "@/lib/graphHierarchy";
 import {
   graphCollisionRadius,
   graphNodeRadius,
   minNodeCenterDistance,
   NODE_GAP_PX,
   ringRadiusForCount,
+  LAYOUT_ENTITY_VAL,
 } from "@/lib/graph";
+import { deduplicateGraphEntities } from "@/lib/graphDedup";
 
 type LayoutNode = GraphNode & {
   x?: number;
@@ -13,6 +16,14 @@ type LayoutNode = GraphNode & {
   fx?: number;
   fy?: number;
   clusterId?: string;
+  clusterCx?: number;
+  clusterCy?: number;
+  clusterType?: EntityType;
+  clusterSize?: number;
+  layoutRole?: "ring" | "grid" | "hub";
+  hubId?: string;
+  collapsedChildCount?: number;
+  isCollapsedHub?: boolean;
 };
 
 type ProcessCluster = {
@@ -20,6 +31,445 @@ type ProcessCluster = {
   process: GraphNode | null;
   satellites: GraphNode[];
 };
+
+/** Preferred angular order for type sectors around a document hub (Bloom-style). */
+export const CLUSTER_TYPE_ORDER: EntityType[] = [
+  "process",
+  "material",
+  "experiment",
+  "property",
+  "equipment",
+  "facility",
+  "expert",
+  "team",
+  "figures",
+  "mode",
+  "setup",
+  "conclusion",
+  "topic",
+];
+
+/** Fixed angular slots for inner type grids (reference-map style). */
+const INNER_TYPE_SLOTS: Array<{ type: EntityType; angleDeg: number }> = [
+  { type: "process", angleDeg: -90 },
+  { type: "team", angleDeg: -138 },
+  { type: "experiment", angleDeg: -38 },
+  { type: "property", angleDeg: 32 },
+  { type: "equipment", angleDeg: 78 },
+  { type: "facility", angleDeg: 128 },
+  { type: "expert", angleDeg: 168 },
+  { type: "figures", angleDeg: -68 },
+  { type: "mode", angleDeg: 8 },
+  { type: "setup", angleDeg: 48 },
+  { type: "conclusion", angleDeg: 108 },
+  { type: "topic", angleDeg: -168 },
+  { type: "material", angleDeg: 52 },
+];
+
+/** Distance from document hub to compressed type capsules (shared with expanded layout). */
+const CAPSULE_RING_R = 145;
+/** Clear band between capsule edge and first expanded entity (~1 cm base + 2 cm extra). */
+const CAPSULE_TO_GRID_GAP = 88 + 2 * NODE_GAP_PX;
+/** Typical visual radius of a type summary capsule (val ~10–18 + halo). */
+const TYPE_CAPSULE_VAL = 12;
+
+function typeCapsuleOuterRadius(): number {
+  return graphNodeRadius(TYPE_CAPSULE_VAL) + 8;
+}
+
+/** Inner edge of an expanded grid — must sit outside the capsule on its spoke. */
+function minGridInnerRadius(): number {
+  return CAPSULE_RING_R + typeCapsuleOuterRadius() + CAPSULE_TO_GRID_GAP;
+}
+
+/** Outermost spoke distance for a grid center placed along a capsule spoke. */
+function axisGridCenterRadius(count: number, step: number): number {
+  const fp = gridFootprint(count, step);
+  return minGridInnerRadius() + fp.halfH + NODE_GAP_PX * 0.5;
+}
+
+/** Furthest hub distance for an axis-aligned grid on a spoke. */
+function axisGridHubExtent(count: number, step: number, angleDeg: number): number {
+  const fp = gridFootprint(count, step);
+  const centerR = axisGridCenterRadius(count, step);
+  const { x: cx, y: cy } = spokePoint({ x: 0, y: 0 }, angleDeg, centerR);
+  const corners: Array<[number, number]> = [
+    [cx - fp.halfW, cy - fp.halfH],
+    [cx + fp.halfW, cy - fp.halfH],
+    [cx - fp.halfW, cy + fp.halfH],
+    [cx + fp.halfW, cy + fp.halfH],
+  ];
+  return Math.max(...corners.map(([x, y]) => Math.hypot(x, y)));
+}
+
+type ClusterBox = {
+  clusterId: string;
+  cx: number;
+  cy: number;
+  halfW: number;
+  halfH: number;
+};
+
+function clusterBoxFromNodes(nodes: LayoutNode[]): ClusterBox | null {
+  if (nodes.length === 0) return null;
+  const clusterId = nodes[0].clusterId ?? nodes[0].id;
+  const xs = nodes.map((n) => n.x ?? 0);
+  const ys = nodes.map((n) => n.y ?? 0);
+  const pad = NODE_GAP_PX * 0.65;
+  return {
+    clusterId,
+    cx: (Math.min(...xs) + Math.max(...xs)) / 2,
+    cy: (Math.min(...ys) + Math.max(...ys)) / 2,
+    halfW: (Math.max(...xs) - Math.min(...xs)) / 2 + pad,
+    halfH: (Math.max(...ys) - Math.min(...ys)) / 2 + pad,
+  };
+}
+
+function clusterBoxesOverlap(a: ClusterBox, b: ClusterBox, gap = NODE_GAP_PX): boolean {
+  return (
+    Math.abs(a.cx - b.cx) < a.halfW + b.halfW + gap &&
+    Math.abs(a.cy - b.cy) < a.halfH + b.halfH + gap
+  );
+}
+
+function translateClusterNodes(nodes: LayoutNode[], dx: number, dy: number): void {
+  for (const node of nodes) {
+    node.x = (node.x ?? 0) + dx;
+    node.y = (node.y ?? 0) + dy;
+    node.fx = node.x;
+    node.fy = node.y;
+    if (node.clusterCx != null) node.clusterCx += dx;
+    if (node.clusterCy != null) node.clusterCy += dy;
+  }
+}
+
+function slotAngleDeg(type: EntityType): number {
+  const slot = INNER_TYPE_SLOTS.find((s) => s.type === type);
+  return slot?.angleDeg ?? -90;
+}
+
+function spokePoint(
+  hubPos: { x: number; y: number },
+  angleDeg: number,
+  radius: number
+): { x: number; y: number } {
+  const angle = (angleDeg * Math.PI) / 180;
+  return {
+    x: hubPos.x + Math.cos(angle) * radius,
+    y: hubPos.y + Math.sin(angle) * radius,
+  };
+}
+
+function pinNode(
+  node: GraphNode,
+  x: number,
+  y: number,
+  hubId: string,
+  extra: Partial<LayoutNode> = {}
+): LayoutNode {
+  return { ...node, x, y, fx: x, fy: y, hubId, ...extra };
+}
+
+function layoutCompactGrid(
+  cx: number,
+  cy: number,
+  nodes: GraphNode[],
+  hubId: string,
+  type: EntityType,
+  cellStep?: number
+): LayoutNode[] {
+  if (nodes.length === 0) return [];
+  const step = cellStep ?? minNodeCenterDistance(LAYOUT_ENTITY_VAL);
+  if (nodes.length === 1) {
+    return [
+      pinNode(nodes[0], cx, cy, hubId, {
+        clusterId: `${hubId}:${type}`,
+        clusterType: type,
+        clusterSize: 1,
+        layoutRole: "grid",
+        val: LAYOUT_ENTITY_VAL,
+      }),
+    ];
+  }
+
+  const cols = Math.max(1, Math.ceil(Math.sqrt(nodes.length * 1.35)));
+  const rows = Math.ceil(nodes.length / cols);
+  const clusterId = `${hubId}:${type}`;
+
+  return nodes.map((node, i) => {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const x = cx + (col - (cols - 1) / 2) * step;
+    const y = cy + (row - (rows - 1) / 2) * step;
+    return pinNode(node, x, y, hubId, {
+      clusterId,
+      clusterCx: cx,
+      clusterCy: cy,
+      clusterType: type,
+      clusterSize: nodes.length,
+      layoutRole: "grid",
+      val: LAYOUT_ENTITY_VAL,
+    });
+  });
+}
+
+function gridFootprint(count: number, step: number): { cols: number; rows: number; halfW: number; halfH: number } {
+  const cols = Math.max(1, Math.ceil(Math.sqrt(count * 1.35)));
+  const rows = Math.ceil(count / cols);
+  return {
+    cols,
+    rows,
+    halfW: (Math.max(0, cols - 1) * step) / 2 + step * 0.6,
+    halfH: (Math.max(0, rows - 1) * step) / 2 + step * 0.6,
+  };
+}
+
+/**
+ * Estimate how far a hub's content extends from its center (for multi-document spacing).
+ */
+function estimateHubLayoutRadius(entities: GraphNode[]): number {
+  const step = minNodeCenterDistance(LAYOUT_ENTITY_VAL);
+  const real = entities.filter((n) => !isTypeClusterNode(n));
+  const clusters = entities.filter((n) => isTypeClusterNode(n));
+
+  if (real.length === 0) {
+    return CAPSULE_RING_R + step * 2 + clusters.length * 4;
+  }
+
+  let maxR = minGridInnerRadius() + step * 2;
+  const byType = new Map<EntityType, GraphNode[]>();
+  for (const node of real) {
+    if (node.type === "material") continue;
+    const bucket = byType.get(node.type) ?? [];
+    bucket.push(node);
+    byType.set(node.type, bucket);
+  }
+
+  for (const [type, group] of byType) {
+    maxR = Math.max(maxR, axisGridHubExtent(group.length, step, slotAngleDeg(type)));
+  }
+
+  const materials = real.filter((n) => n.type === "material");
+  if (materials.length > 0) {
+    if (materials.length <= 36) {
+      maxR = Math.max(maxR, minGridInnerRadius() + step * 2.5);
+    } else {
+      maxR = Math.max(
+        maxR,
+        axisGridHubExtent(materials.length, step, slotAngleDeg("material"))
+      );
+    }
+  }
+
+  return maxR;
+}
+
+/** Find a non-overlapping center for an axis-aligned grid near its capsule spoke. */
+function placeAxisGridCenter(
+  hubPos: { x: number; y: number },
+  angleDeg: number,
+  count: number,
+  step: number,
+  placed: ClusterBox[]
+): { cx: number; cy: number } {
+  const fp = gridFootprint(count, step);
+  const pad = NODE_GAP_PX * 0.65;
+  const halfW = fp.halfW + pad;
+  const halfH = fp.halfH + pad;
+  const angle = (angleDeg * Math.PI) / 180;
+  const radialX = Math.cos(angle);
+  const radialY = Math.sin(angle);
+  const tangentX = -Math.sin(angle);
+  const tangentY = Math.cos(angle);
+
+  let centerR = axisGridCenterRadius(count, step);
+  let cx = hubPos.x + radialX * centerR;
+  let cy = hubPos.y + radialY * centerR;
+
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const probe: ClusterBox = {
+      clusterId: "",
+      cx,
+      cy,
+      halfW,
+      halfH,
+    };
+    if (!placed.some((box) => clusterBoxesOverlap(probe, box))) {
+      return { cx, cy };
+    }
+    if (attempt < 40) {
+      centerR += step * 0.7;
+      cx = hubPos.x + radialX * centerR;
+      cy = hubPos.y + radialY * centerR;
+    } else {
+      const tangSign = attempt % 2 === 0 ? 1 : -1;
+      const tOffset = Math.ceil((attempt - 39) / 2) * step * 0.55 * tangSign;
+      cx = hubPos.x + radialX * centerR + tangentX * tOffset;
+      cy = hubPos.y + radialY * centerR + tangentY * tOffset;
+    }
+  }
+
+  return { cx, cy };
+}
+
+/** Move whole grid clusters apart when their axis-aligned boxes overlap. */
+function resolveClusterBoxOverlaps(nodes: LayoutNode[], maxIter = 120): void {
+  const byCluster = new Map<string, LayoutNode[]>();
+  for (const node of nodes) {
+    if (node.layoutRole !== "grid" || !node.clusterId) continue;
+    const bucket = byCluster.get(node.clusterId) ?? [];
+    bucket.push(node);
+    byCluster.set(node.clusterId, bucket);
+  }
+
+  const clusterIds = [...byCluster.keys()];
+  if (clusterIds.length < 2) return;
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    let moved = false;
+    const boxes = clusterIds
+      .map((id) => clusterBoxFromNodes(byCluster.get(id)!))
+      .filter((b): b is ClusterBox => b != null);
+
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i];
+        const b = boxes[j];
+        if (!clusterBoxesOverlap(a, b)) continue;
+
+        const dx = b.cx - a.cx || 0.001;
+        const dy = b.cy - a.cy || 0.001;
+        const dist = Math.hypot(dx, dy) || 0.001;
+        const overlapX = a.halfW + b.halfW + NODE_GAP_PX - Math.abs(b.cx - a.cx);
+        const overlapY = a.halfH + b.halfH + NODE_GAP_PX - Math.abs(b.cy - a.cy);
+        const push = Math.max(overlapX, overlapY, 1) * 0.55;
+        const ux = dx / dist;
+        const uy = dy / dist;
+
+        translateClusterNodes(byCluster.get(a.clusterId)!, -ux * push, -uy * push);
+        translateClusterNodes(byCluster.get(b.clusterId)!, ux * push, uy * push);
+        moved = true;
+      }
+    }
+
+    if (!moved) break;
+  }
+}
+
+/**
+ * Expanded entities sit in axis-aligned square grids near their type capsule spoke.
+ */
+function layoutHubEntitiesRadialMap(
+  hubId: string,
+  hubPos: { x: number; y: number },
+  entities: GraphNode[]
+): LayoutNode[] {
+  if (entities.length === 0) return [];
+
+  const step = minNodeCenterDistance(LAYOUT_ENTITY_VAL);
+  const materials = entities.filter((n) => n.type === "material");
+  const byType = new Map<EntityType, GraphNode[]>();
+  for (const entity of entities) {
+    if (entity.type === "material") continue;
+    const bucket = byType.get(entity.type) ?? [];
+    bucket.push(entity);
+    byType.set(entity.type, bucket);
+  }
+
+  const out: LayoutNode[] = [];
+  const placed: ClusterBox[] = [];
+
+  const layoutGroup = (group: GraphNode[], type: EntityType, angleDeg: number) => {
+    if (group.length === 0) return;
+    const { cx, cy } = placeAxisGridCenter(hubPos, angleDeg, group.length, step, placed);
+    const laid = layoutCompactGrid(cx, cy, group, hubId, type, step);
+    const box = clusterBoxFromNodes(laid);
+    if (box) placed.push(box);
+    out.push(...laid);
+  };
+
+  if (materials.length > 0) {
+    const matAngle = slotAngleDeg("material");
+    if (materials.length <= 36) {
+      const ringR = minGridInnerRadius() + step * 1.2;
+      const arcSpan = Math.min(Math.PI * 1.1, (materials.length * step) / Math.max(ringR, step));
+      const centerAngle = (matAngle * Math.PI) / 180;
+      const startAngle = centerAngle - arcSpan / 2;
+      materials.forEach((node, i) => {
+        const t = materials.length === 1 ? 0.5 : i / (materials.length - 1);
+        const a = startAngle + t * arcSpan;
+        const x = hubPos.x + Math.cos(a) * ringR;
+        const y = hubPos.y + Math.sin(a) * ringR;
+        out.push(
+          pinNode(node, x, y, hubId, {
+            clusterId: `${hubId}:material`,
+            clusterType: "material",
+            clusterSize: materials.length,
+            layoutRole: "ring",
+            val: LAYOUT_ENTITY_VAL,
+          })
+        );
+      });
+    } else {
+      layoutGroup(materials, "material", matAngle);
+    }
+  }
+
+  const typeOrder = [
+    ...CLUSTER_TYPE_ORDER.filter((t) => byType.has(t)),
+    ...[...byType.keys()].filter((t) => !CLUSTER_TYPE_ORDER.includes(t)),
+  ];
+  typeOrder.sort(
+    (a, b) => (byType.get(b)?.length ?? 0) - (byType.get(a)?.length ?? 0)
+  );
+
+  for (const type of typeOrder) {
+    const group = byType.get(type);
+    if (!group) continue;
+    layoutGroup(group, type, slotAngleDeg(type));
+  }
+
+  resolveClusterBoxOverlaps(out);
+  return out;
+}
+
+/** Place type summary capsules on fixed slots around the document hub. */
+function layoutHubTypeClusters(
+  hubId: string,
+  hubPos: { x: number; y: number },
+  clusters: GraphNode[]
+): LayoutNode[] {
+  if (clusters.length === 0) return [];
+
+  return clusters.map((node) => {
+    const angleDeg = slotAngleDeg(node.type);
+    const { x, y } = spokePoint(hubPos, angleDeg, CAPSULE_RING_R);
+    return pinNode(node, x, y, hubId, { layoutRole: "grid" });
+  });
+}
+
+/** Drop hub membership spokes — they create dense beams through the document node. */
+export function filterVisualGraphLinks(
+  links: GraphEdge[],
+  nodeById: Map<string, Pick<GraphNode, "type">>
+): GraphEdge[] {
+  return links.filter((link) => {
+    const [a, b] = linkEndpoints(link);
+    const na = nodeById.get(a);
+    const nb = nodeById.get(b);
+    if (!na || !nb) return false;
+
+    const touchesArticle = na.type === "article" || nb.type === "article";
+    if (touchesArticle) {
+      if (link.relation === "describes" || link.relation === "references") return false;
+      if (isTypeClusterNode({ id: a }) || isTypeClusterNode({ id: b })) return false;
+      return false;
+    }
+
+    // Entity–entity edges render only in search-focus (Q&A) mode — see GraphView graphLinks.
+    return true;
+  });
+}
 
 function linkEndpoints(link: GraphEdge): [string, string] {
   return [String(link.source), String(link.target)];
@@ -43,7 +493,20 @@ function reachableFromDocuments(
   maxDepth = 4
 ): Set<string> {
   const docs = nodes.filter((n) => n.type === "article");
+  const docIds = new Set(docs.map((d) => d.id));
   const keep = new Set<string>();
+
+  for (const node of nodes) {
+    if (node.type === "article") {
+      keep.add(node.id);
+      continue;
+    }
+    const hub = node.hubId ?? node.documentId;
+    if (hub && docIds.has(hub)) {
+      keep.add(node.id);
+    }
+  }
+
   for (const doc of docs) {
     const queue: Array<{ id: string; depth: number }> = [{ id: doc.id, depth: 0 }];
     const seen = new Set<string>();
@@ -108,9 +571,10 @@ function pin(
   node: GraphNode,
   x: number,
   y: number,
+  hubId: string,
   clusterId?: string
 ): LayoutNode {
-  return { ...node, x, y, fx: x, fy: y, clusterId };
+  return { ...node, x, y, fx: x, fy: y, hubId, clusterId: clusterId ?? hubId };
 }
 
 function nodeVal(node: GraphNode, fallback = 5): number {
@@ -167,19 +631,22 @@ function placeOnRing(
   cx: number,
   cy: number,
   nodes: GraphNode[],
+  hubId: string,
   clusterId: string,
   val: number,
   out: LayoutNode[]
 ): void {
   const n = nodes.length;
   if (n === 1) {
-    out.push(pin(nodes[0], cx, cy, clusterId));
+    out.push(pin(nodes[0], cx, cy, hubId, clusterId));
     return;
   }
   const ringR = Math.max(minNodeCenterDistance(val), ringRadiusForCount(n, val));
   nodes.forEach((node, i) => {
     const a = (i / n) * Math.PI * 2 - Math.PI / 2;
-    out.push(pin(node, cx + Math.cos(a) * ringR, cy + Math.sin(a) * ringR, clusterId));
+    out.push(
+      pin(node, cx + Math.cos(a) * ringR, cy + Math.sin(a) * ringR, hubId, clusterId)
+    );
   });
 }
 
@@ -188,17 +655,18 @@ function layoutProcessCluster(
   cy: number,
   cluster: ProcessCluster,
   outwardAngle: number,
+  hubId: string,
   out: LayoutNode[]
 ): void {
   const gap = minNodeCenterDistance(8) * 0.85;
   const satellites = cluster.satellites;
 
   if (!cluster.process) {
-    placeOnRing(cx, cy, satellites, cluster.id, 7, out);
+    placeOnRing(cx, cy, satellites, hubId, cluster.id, 7, out);
     return;
   }
 
-  out.push(pin(cluster.process, cx, cy, cluster.id));
+  out.push(pin(cluster.process, cx, cy, hubId, cluster.id));
 
   if (satellites.length === 0) return;
 
@@ -208,6 +676,7 @@ function layoutProcessCluster(
         satellites[0],
         cx + Math.cos(outwardAngle) * gap,
         cy + Math.sin(outwardAngle) * gap,
+        hubId,
         cluster.id
       )
     );
@@ -222,6 +691,7 @@ function layoutProcessCluster(
         node,
         cx + Math.cos(a) * ringR,
         cy + Math.sin(a) * ringR,
+        hubId,
         cluster.id
       )
     );
@@ -232,13 +702,14 @@ function layoutTightGroup(
   cx: number,
   cy: number,
   nodes: GraphNode[],
+  hubId: string,
   clusterId: string,
   fallbackVal: number,
   out: LayoutNode[]
 ): void {
   if (nodes.length === 0) return;
   if (nodes.length === 1) {
-    out.push(pin(nodes[0], cx, cy, clusterId));
+    out.push(pin(nodes[0], cx, cy, hubId, clusterId));
     return;
   }
 
@@ -253,7 +724,7 @@ function layoutTightGroup(
     const row = Math.floor(i / cols);
     const x = cx + (col - (cols - 1) / 2) * step;
     const y = cy + (row - (rows - 1) / 2) * step;
-    out.push(pin(node, x, y, clusterId));
+    out.push(pin(node, x, y, hubId, clusterId));
   });
 }
 
@@ -298,81 +769,6 @@ function resolveCrossClusterOverlaps(nodes: LayoutNode[], maxIter = 120): void {
 
     if (!moved) break;
   }
-}
-
-function canonicalizeProcesses(
-  nodes: GraphNode[],
-  links: GraphEdge[],
-  materialToProcess: Map<string, string>
-): {
-  nodes: GraphNode[];
-  links: GraphEdge[];
-  materialToProcess: Map<string, string>;
-} {
-  const processes = nodes.filter((n) => n.type === "process");
-  if (processes.length <= 1) {
-    return { nodes, links, materialToProcess };
-  }
-
-  const byName = new Map<string, GraphNode[]>();
-  for (const proc of processes) {
-    const key = (proc.name ?? proc.id).toLowerCase().trim();
-    if (!byName.has(key)) byName.set(key, []);
-    byName.get(key)!.push(proc);
-  }
-
-  const idToCanonical = new Map<string, string>();
-  const canonicalIds = new Set<string>();
-
-  for (const group of byName.values()) {
-    let best = group[0];
-    let bestCount = -1;
-    for (const proc of group) {
-      const count = [...materialToProcess.values()].filter((pid) => pid === proc.id).length;
-      if (count > bestCount) {
-        bestCount = count;
-        best = proc;
-      }
-    }
-    for (const proc of group) {
-      idToCanonical.set(proc.id, best.id);
-      if (proc.id === best.id) canonicalIds.add(proc.id);
-    }
-  }
-
-  if (canonicalIds.size === processes.length) {
-    return { nodes, links, materialToProcess };
-  }
-
-  const filteredNodes = nodes.filter(
-    (n) => n.type !== "process" || canonicalIds.has(n.id)
-  );
-
-  const remappedMat = new Map<string, string>();
-  for (const [matId, procId] of materialToProcess) {
-    remappedMat.set(matId, idToCanonical.get(procId) ?? procId);
-  }
-
-  const remapId = (id: string): string => idToCanonical.get(id) ?? id;
-
-  const seenLinks = new Set<string>();
-  const filteredLinks: GraphEdge[] = [];
-  for (const link of links) {
-    const [a, b] = linkEndpoints(link);
-    const src = remapId(a);
-    const tgt = remapId(b);
-    if (src === tgt) continue;
-    const key = `${src}|${tgt}|${link.relation}`;
-    if (seenLinks.has(key)) continue;
-    seenLinks.add(key);
-    filteredLinks.push({ ...link, source: src, target: tgt });
-  }
-
-  return {
-    nodes: filteredNodes,
-    links: filteredLinks,
-    materialToProcess: remappedMat,
-  };
 }
 
 function layoutHub(
@@ -422,6 +818,7 @@ function layoutHub(
   }
 
   const people = others.filter((n) => n.type === "expert" || n.type === "team");
+  const figureBlobs = others.filter((n) => n.type === "figures");
   const equipment = others.filter(
     (n) =>
       n.type === "equipment" ||
@@ -429,7 +826,10 @@ function layoutHub(
       n.type === "experiment"
   );
   const misc = others.filter(
-    (n) => !people.includes(n) && !equipment.includes(n)
+    (n) =>
+      n.type !== "figures" &&
+      !people.includes(n) &&
+      !equipment.includes(n)
   );
 
   const orbitSlots: Array<{
@@ -443,7 +843,16 @@ function layoutHub(
       kind: "process",
       footprint: processClusterFootprint(cluster),
       place: (cx, cy, angle) =>
-        layoutProcessCluster(cx, cy, cluster, angle, hubNodes),
+        layoutProcessCluster(cx, cy, cluster, angle, hubId, hubNodes),
+    });
+  }
+
+  if (figureBlobs.length > 0) {
+    orbitSlots.push({
+      kind: "process",
+      footprint: gridGroupFootprint(figureBlobs, 8),
+      place: (cx, cy) =>
+        layoutTightGroup(cx, cy, figureBlobs, hubId, `${hubId}:figures`, 8, hubNodes),
     });
   }
 
@@ -452,7 +861,7 @@ function layoutHub(
       kind: "outer",
       footprint: gridGroupFootprint(people, 5),
       place: (cx, cy) =>
-        layoutTightGroup(cx, cy, people, `${hubId}:people`, 5, hubNodes),
+        layoutTightGroup(cx, cy, people, hubId, `${hubId}:people`, 5, hubNodes),
     });
   }
 
@@ -461,7 +870,7 @@ function layoutHub(
       kind: "outer",
       footprint: gridGroupFootprint(equipment, 6),
       place: (cx, cy) =>
-        layoutTightGroup(cx, cy, equipment, `${hubId}:equipment`, 6, hubNodes),
+        layoutTightGroup(cx, cy, equipment, hubId, `${hubId}:equipment`, 6, hubNodes),
     });
   }
 
@@ -470,7 +879,7 @@ function layoutHub(
       kind: "outer",
       footprint: gridGroupFootprint(misc, 5),
       place: (cx, cy) =>
-        layoutTightGroup(cx, cy, misc, `${hubId}:misc`, 5, hubNodes),
+        layoutTightGroup(cx, cy, misc, hubId, `${hubId}:misc`, 5, hubNodes),
     });
   }
 
@@ -527,8 +936,28 @@ export function prepareDocumentHubGraph(
 ): { nodes: LayoutNode[]; links: GraphEdge[]; hiddenOrphans: number } {
   if (nodes.length === 0) return { nodes: [], links: [], hiddenOrphans: 0 };
 
-  const adj = buildAdjacency(links);
   const docs = nodes.filter((n) => n.type === "article");
+  if (docs.length > 0 && docs.length === nodes.length && links.length === 0) {
+    const cols = Math.ceil(Math.sqrt(docs.length));
+    const rows = Math.ceil(docs.length / cols);
+    const positioned: LayoutNode[] = docs.map((doc, i) => {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = (col - (cols - 1) / 2) * 420;
+      const y = (row - (rows - 1) / 2) * 420;
+      return {
+        ...doc,
+        val: doc.val ?? 12,
+        x,
+        y,
+        fx: x,
+        fy: y,
+      };
+    });
+    return { nodes: positioned, links: [], hiddenOrphans: 0 };
+  }
+
+  const adj = buildAdjacency(links);
 
   if (docs.length === 0) {
     return { nodes: [...nodes], links: [...links], hiddenOrphans: 0 };
@@ -541,18 +970,12 @@ export function prepareDocumentHubGraph(
     return keep.has(a) && keep.has(b);
   });
   const materialToProcess = buildMaterialProcessMap(filteredNodes, filteredLinks);
-  const canonical = canonicalizeProcesses(
-    filteredNodes,
-    filteredLinks,
-    materialToProcess
-  );
+  const deduped = deduplicateGraphEntities(filteredNodes, filteredLinks);
   const hiddenOrphans =
-    nodes.length -
-    filteredNodes.length +
-    (filteredNodes.length - canonical.nodes.length);
-  const layoutNodes: GraphNode[] = canonical.nodes;
-  const layoutLinks = canonical.links;
-  const matProcMap = canonical.materialToProcess;
+    nodes.length - filteredNodes.length + deduped.mergedCount;
+  const layoutNodes: GraphNode[] = deduped.nodes;
+  const layoutLinks = deduped.links;
+  const matProcMap = buildMaterialProcessMap(layoutNodes, layoutLinks);
 
   const byHub = new Map<string, GraphNode[]>();
   for (const node of layoutNodes) {
@@ -590,4 +1013,188 @@ export function prepareDocumentHubGraph(
   }
 
   return { nodes: positioned, links: layoutLinks, hiddenOrphans };
+}
+
+/** Stable 0..1 scalar from node id (deterministic scatter). */
+function hashUnit(id: string, salt = 0): number {
+  let h = salt;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return (h % 10000) / 10000;
+}
+
+function placeDocumentsOnCircle(
+  docs: GraphNode[],
+  hubRadii: Map<string, number>
+): Map<string, { x: number; y: number }> {
+  const positions = new Map<string, { x: number; y: number }>();
+  const n = docs.length;
+  if (n === 0) return positions;
+
+  if (n === 1) {
+    positions.set(docs[0].id, { x: 0, y: 0 });
+    return positions;
+  }
+
+  const maxHubR = Math.max(320, ...docs.map((d) => hubRadii.get(d.id) ?? 320));
+  const minCenterDist = maxHubR * 2 + 160;
+  const radius =
+    n === 2
+      ? minCenterDist / 2
+      : minCenterDist / (2 * Math.sin(Math.PI / n));
+
+  docs.forEach((doc, i) => {
+    const angle = (i / n) * Math.PI * 2 - Math.PI / 2;
+    positions.set(doc.id, {
+      x: Math.cos(angle) * radius,
+      y: Math.sin(angle) * radius,
+    });
+  });
+  return positions;
+}
+
+/**
+ * Seed positions for force-directed layout: documents pinned on a circle,
+ * entities scattered near their hub without fixed coordinates (no square grids).
+ */
+export function prepareForceGraphLayout(
+  nodes: GraphNode[],
+  links: GraphEdge[]
+): { nodes: LayoutNode[]; links: GraphEdge[]; hiddenOrphans: number } {
+  if (nodes.length === 0) return { nodes: [], links: [], hiddenOrphans: 0 };
+
+  const docs = nodes.filter((n) => n.type === "article");
+  if (docs.length > 0 && docs.length === nodes.length && links.length === 0) {
+    const hubRadii = new Map(docs.map((d) => [d.id, CAPSULE_RING_R + 80]));
+    const docPositions = placeDocumentsOnCircle(docs, hubRadii);
+    const positioned: LayoutNode[] = docs.map((doc) => {
+      const { x, y } = docPositions.get(doc.id)!;
+      return {
+        ...doc,
+        val: doc.val ?? 12,
+        x,
+        y,
+        fx: x,
+        fy: y,
+        hubId: doc.id,
+      };
+    });
+    return { nodes: positioned, links: [], hiddenOrphans: 0 };
+  }
+
+  const adj = buildAdjacency(links);
+
+  if (docs.length === 0) {
+    return { nodes: [...nodes], links: [...links], hiddenOrphans: 0 };
+  }
+
+  const keep = reachableFromDocuments(nodes, adj);
+  const filteredNodes = nodes.filter((n) => keep.has(n.id));
+  const filteredLinks = links.filter((l) => {
+    const [a, b] = linkEndpoints(l);
+    return keep.has(a) && keep.has(b);
+  });
+  const deduped = deduplicateGraphEntities(filteredNodes, filteredLinks);
+  const hiddenOrphans =
+    nodes.length - filteredNodes.length + deduped.mergedCount;
+  const layoutNodes: GraphNode[] = deduped.nodes;
+  const layoutLinks = deduped.links;
+
+  const entitiesByHub = new Map<string, GraphNode[]>();
+  for (const node of layoutNodes) {
+    if (node.type === "article") continue;
+    const hub =
+      node.hubId ??
+      nearestDocument(node.id, docs, adj) ??
+      docs[0]?.id;
+    if (!hub) continue;
+    if (!entitiesByHub.has(hub)) entitiesByHub.set(hub, []);
+    entitiesByHub.get(hub)!.push(node);
+  }
+
+  const hubRadii = new Map<string, number>();
+  for (const [hubId, entities] of entitiesByHub) {
+    hubRadii.set(hubId, estimateHubLayoutRadius(entities));
+  }
+  for (const doc of docs) {
+    if (!hubRadii.has(doc.id)) {
+      hubRadii.set(doc.id, CAPSULE_RING_R + 80);
+    }
+  }
+
+  const docPositions = placeDocumentsOnCircle(docs, hubRadii);
+  const positioned: LayoutNode[] = [];
+
+  for (const doc of docs) {
+    const { x, y } = docPositions.get(doc.id)!;
+    positioned.push({
+      ...doc,
+      val: doc.val ?? 12,
+      x,
+      y,
+      fx: x,
+      fy: y,
+      hubId: doc.id,
+    });
+  }
+
+  for (const [hubId, entities] of entitiesByHub) {
+    const hubPos = docPositions.get(hubId) ?? { x: 0, y: 0 };
+    const typeClusters = entities.filter((n) => isTypeClusterNode(n));
+    const realEntities = entities.filter((n) => !isTypeClusterNode(n));
+    positioned.push(...layoutHubTypeClusters(hubId, hubPos, typeClusters));
+    positioned.push(...layoutHubEntitiesRadialMap(hubId, hubPos, realEntities));
+  }
+
+  return { nodes: positioned, links: layoutLinks, hiddenOrphans };
+}
+
+export type HubLayout = {
+  nodes: LayoutNode[];
+  links: GraphEdge[];
+  hiddenOrphans: number;
+};
+
+/** Hide entity nodes inside collapsed document hubs until the user expands them. */
+export function filterGraphByDocumentExpansion(
+  layout: HubLayout,
+  expandedDocIds: Set<string>
+): { nodes: LayoutNode[]; links: GraphEdge[] } {
+  const childCounts = new Map<string, number>();
+  for (const node of layout.nodes) {
+    if (node.type === "article") continue;
+    const hub = node.hubId;
+    if (!hub) continue;
+    if (node.isTypeCluster && (node.typeClusterCount ?? 0) > 0) {
+      childCounts.set(hub, (childCounts.get(hub) ?? 0) + (node.typeClusterCount ?? 0));
+    } else if (!isTypeClusterNode(node)) {
+      childCounts.set(hub, (childCounts.get(hub) ?? 0) + 1);
+    }
+  }
+
+  const visibleNodes = layout.nodes.filter((node) => {
+    if (node.type === "article") return true;
+    const hub = node.hubId;
+    return hub ? expandedDocIds.has(hub) : true;
+  });
+
+  const visibleIds = new Set(visibleNodes.map((n) => n.id));
+  const visibleLinks = layout.links.filter((link) => {
+    const [a, b] = linkEndpoints(link);
+    return visibleIds.has(a) && visibleIds.has(b);
+  });
+
+  const nodes = visibleNodes.map((node) => {
+    if (node.type !== "article") return node;
+    const count = childCounts.get(node.id) ?? 0;
+    const collapsed = count > 0 && !expandedDocIds.has(node.id);
+    if (!collapsed) return node;
+    return {
+      ...node,
+      val: Math.max(node.val ?? 12, 16),
+      collapsedChildCount: count,
+      isCollapsedHub: true,
+    };
+  });
+
+  return { nodes, links: visibleLinks };
 }

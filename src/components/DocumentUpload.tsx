@@ -1,8 +1,9 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { Upload, Link2, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
-import { backendApi } from "@/lib/api/backend";
+import { backendApi, type LlmProvider } from "@/lib/api/backend";
+import { dispatchIngestComplete, dispatchIngestRoute, dispatchIngestStart } from "@/lib/ingestRouteEvents";
 import { useI18n } from "@/lib/i18n/I18nProvider";
 
 interface DocumentUploadProps {
@@ -10,22 +11,53 @@ interface DocumentUploadProps {
   disabled?: boolean;
 }
 
+/** Poll until backend reports completed or failed — no client-side timeout. */
+const POLL_INTERVAL_MS = 2000;
+
 export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadProps) {
   const { t } = useI18n();
   const [url, setUrl] = useState("");
   const [uploading, setUploading] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [llmProvider, setLlmProvider] = useState<LlmProvider>("local");
   const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    backendApi
+      .getLlmConfig()
+      .then((cfg) => setLlmProvider(cfg.provider))
+      .catch(() => {});
+  }, []);
 
   const pollTask = useCallback(
     async (taskId: string) => {
-      for (let i = 0; i < 120; i++) {
-        await new Promise((r) => setTimeout(r, 2000));
+      const started = Date.now();
+
+      for (;;) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
         const task = await backendApi.ingestStatus(taskId);
-        setStatus(task.message || task.status);
+        const elapsedMin = Math.floor((Date.now() - started) / 60_000);
+        if (task.ingest_llm_provider) {
+          dispatchIngestRoute({
+            provider: task.ingest_llm_provider,
+            model: task.ingest_llm_model ?? undefined,
+          });
+          setLlmProvider(task.ingest_llm_provider);
+        }
+        const pct =
+          typeof task.progress === "number" && task.progress > 0
+            ? ` (${Math.round(task.progress * 100)}%)`
+            : "";
+        const base = task.message || task.status;
+        setStatus(
+          elapsedMin > 0
+            ? `${base}${pct} — ${t("upload.stillProcessing", { min: String(elapsedMin) })}`
+            : `${base}${pct}`
+        );
         if (task.status === "completed") {
           setUploading(false);
+          dispatchIngestComplete();
           const action = task.result?.action as string | undefined;
           const deduped = task.result?.deduplicated === true;
           if (deduped || action === "skip") {
@@ -39,16 +71,17 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
           return;
         }
         if (task.status === "failed") {
+          dispatchIngestComplete();
           throw new Error(task.error ?? t("upload.ingestFailed"));
         }
       }
-      throw new Error(t("upload.timedOut"));
     },
     [onIngestComplete, t]
   );
 
   const handleFile = async (file: File) => {
     setUploading(true);
+    dispatchIngestStart();
     setError(null);
     setStatus(t("upload.uploading"));
     try {
@@ -56,6 +89,7 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
       setStatus(task.message);
       await pollTask(task.task_id);
     } catch (e) {
+      dispatchIngestComplete();
       setError(e instanceof Error ? e.message : t("upload.uploadFailed"));
       setUploading(false);
     }
@@ -64,6 +98,7 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
   const handleUrl = async () => {
     if (!url.trim()) return;
     setUploading(true);
+    dispatchIngestStart();
     setError(null);
     setStatus(t("upload.fetchingUrl"));
     try {
@@ -71,6 +106,7 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
       await pollTask(task.task_id);
       setUrl("");
     } catch (e) {
+      dispatchIngestComplete();
       setError(e instanceof Error ? e.message : t("upload.urlFailed"));
       setUploading(false);
     }
@@ -81,6 +117,10 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
       <p className="text-sm font-medium text-slate-300">{t("upload.title")}</p>
       <p className="mt-1 text-xs text-slate-500">{t("upload.subtitle")}</p>
       <p className="mt-1 text-xs text-slate-600">{t("upload.paywallHint")}</p>
+      <p className="mt-1 text-xs text-slate-600">{t("upload.hybridRoutingHint")}</p>
+      <p className="mt-1 text-xs text-slate-600">
+        {llmProvider === "yandex" ? t("upload.longPdfHintYandex") : t("upload.longPdfHintLocal")}
+      </p>
 
       <div className="mt-3 flex flex-wrap gap-2">
         <input
@@ -126,7 +166,11 @@ export function DocumentUpload({ onIngestComplete, disabled }: DocumentUploadPro
 
       {status && !error && (
         <p className="mt-2 flex items-center gap-1 text-xs text-emerald-400">
-          <CheckCircle2 className="h-3 w-3" />
+          {uploading ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <CheckCircle2 className="h-3 w-3" />
+          )}
           {status}
         </p>
       )}

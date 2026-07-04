@@ -3,6 +3,7 @@ from difflib import SequenceMatcher
 from uuid import UUID
 
 from domain.dto.material import MaterialDTO
+from domain.entity_glossary import canonical_entity_key
 from storage.graph_db import GraphDB
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,19 @@ class EntityResolver:
         Returns:
             UUID существующего или нового материала
         """
-        # Ищем похожие материалы в графе
+        key = canonical_entity_key(new_material.name)
+        if key:
+            existing_id = self.graph_db.find_material_id_by_canonical_key(key)
+            if existing_id:
+                existing = self.graph_db.get_material_by_id(UUID(existing_id))
+                if existing:
+                    merged = existing.merge_with(new_material).model_copy(
+                        update={"id": UUID(existing_id)}
+                    )
+                    self.graph_db.save_material(merged)
+                    logger.info("Canonical match: %s -> %s", new_material.name, existing_id)
+                    return UUID(existing_id)
+
         existing_materials = self.graph_db.find_similar_materials(new_material.name)
         
         # Проверяем точное совпадение
@@ -45,8 +58,8 @@ class EntityResolver:
         
         # Не нашли — создаем новый
         logger.info(f"Creating new material: {new_material.name}")
-        self.graph_db.save_material(new_material)
-        return new_material.id
+        resolved_id = self.graph_db.save_material(new_material)
+        return UUID(resolved_id)
     
     def _is_exact_match(self, name1: str, name2: str) -> bool:
         """Проверяет точное совпадение (с нормализацией)."""
@@ -81,5 +94,7 @@ class EntityResolver:
     
     def _normalize_name(self, name: str) -> str:
         """Нормализует название материала."""
-        # Убираем пробелы, приводим к нижнему регистру
+        key = canonical_entity_key(name)
+        if key:
+            return key
         return name.lower().replace(" ", "").replace("-", "")

@@ -181,7 +181,34 @@ regime_parameters:
     
   pressure:
     label: "Давление"
-    expected_units: ["MPa", "Pa", "atm"]
+    expected_units: ["MPa", "Pa", "atm", "kPa"]
+    value_type: scalar
+
+  ph:
+    label: "pH"
+    expected_units: []
+    value_type: scalar
+
+  concentration:
+    label: "Концентрация"
+    expected_units: ["mg/L", "g/L", "ppm", "мг/л", "г/л"]
+    value_type: scalar
+
+  flow_rate:
+    label: "Расход"
+    expected_units: ["m3/h", "L/min", "m/h", "м³/ч", "м/ч"]
+    value_type: scalar
+
+  global_production:
+    label: "Global/world production"
+    category: technological
+    expected_units: ["million tonnes", "Mt", "t/y", "tonnes/year", "t/a", "tonnes"]
+    value_type: scalar
+
+  annual_production:
+    label: "Annual production"
+    category: technological
+    expected_units: ["million tonnes", "Mt", "t/y", "tonnes/year", "t/a", "tonnes"]
     value_type: scalar
 
 
