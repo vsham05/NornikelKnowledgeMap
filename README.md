@@ -1,67 +1,71 @@
-# R&D Knowledge Map — Nornickel Hackathon
+# R&D Knowledge Map — Научный Клубок
 
-Mining & metallurgy research knowledge map: ingest PDFs/DOCX, build a Neo4j graph, and run semantic RAG (RU/EN) with citations.
+Mining & metallurgy R&D knowledge map: ingest PDF/DOCX, build a Neo4j graph, explore entities interactively, and run semantic RAG in **Russian and English** with citations.
 
-**Repo:** [NornikelHack](https://github.com/vsham05/NornikelHack) · branch `scientific-tangle`
+**Repository:** [NornikelKnowledgeMap](https://github.com/vsham05/NornikelKnowledgeMap)
+
+---
+
+## What it does
+
+| Capability | Description |
+|------------|-------------|
+| **Ingest** | PDF/DOCX → MinIO · text chunks → Qdrant · entities → Neo4j |
+| **Graph UI** | Materials, processes, experiments, teams, facilities — clustered layout |
+| **RAG Q&A** | Hybrid retrieval (embeddings + keywords) with cited answers |
+| **RU / EN** | Questions and documents in either language; Russian queries use a translate→search→answer→translate pipeline |
+| **Hybrid LLM** | Local Ollama (GPU) for short docs; optional Yandex API for long PDFs |
 
 ---
 
 ## Quick start
 
-**Docker only** — Neo4j, Qdrant, MinIO, Ollama, backend, and frontend all run in containers.
+**Docker only** — Neo4j, Qdrant, MinIO, Ollama, backend, and frontend run in containers. **NVIDIA GPU required** for Ollama (CPU inference is blocked).
 
 ### Linux / macOS
 
 ```bash
-git clone https://github.com/vsham05/NornikelHack.git
-cd NornikelHack
-git checkout scientific-tangle
-cd scientific-tangle
+git clone https://github.com/vsham05/NornikelKnowledgeMap.git
+cd NornikelKnowledgeMap
 
 cp .env.example .env.docker
 chmod +x start-docker.sh scripts/*.sh
 ./start-docker.sh
 ```
 
-Or with Make:
-
-```bash
-make up
-```
+Or: `make up`
 
 ### Windows
 
 ```powershell
-git clone https://github.com/vsham05/NornikelHack.git
-cd NornikelHack
-git checkout scientific-tangle
-cd scientific-tangle
+git clone https://github.com/vsham05/NornikelKnowledgeMap.git
+cd NornikelKnowledgeMap
 
 copy .env.example .env.docker
 .\start-docker.bat
 ```
 
-Open http://localhost:3000 when startup finishes.
+Open **http://localhost:3000** when startup finishes.
 
-| What | URL |
-|------|-----|
-| **App (UI)** | http://localhost:3000 |
-| **API docs** | http://localhost:8000/docs |
-| Neo4j Browser | http://localhost:7474 (`neo4j` / `password123`) |
-| MinIO console | http://localhost:9001 (`minioadmin` / `minioadmin`) |
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| **App** | http://localhost:3000 | — |
+| **API docs** | http://localhost:8000/docs | — |
+| **Neo4j** | http://localhost:7474 | `neo4j` / `password123` |
+| **MinIO** | http://localhost:9001 | `minioadmin` / `minioadmin` |
 
 ### Daily use
 
 | OS | Start | Stop |
 |----|-------|------|
-| Linux / macOS | `./start-docker.sh` or `make up` | `docker compose down` or `make down` |
+| Linux / macOS | `./start-docker.sh` or `make up` | `make down` or `docker compose down` |
 | Windows | `.\start-docker.bat` | `docker compose down` |
 
-After **code changes** to the backend only (faster than a full restart):
+**Backend-only rebuild** after code changes (faster):
 
 ```bash
-./scripts/restart-backend.sh    # Linux / macOS
-make rebuild-backend            # same via Make
+./scripts/restart-backend.sh   # Linux / macOS
+make rebuild-backend
 ```
 
 ```powershell
@@ -70,173 +74,57 @@ docker compose --env-file .env.docker up -d --no-deps --build backend
 
 ---
 
-## First run (important)
+## First run
 
-The **first** start takes **10–30+ minutes** because Docker will:
+The first start takes **10–30+ minutes** (images, builds, ~10 GB Ollama models):
 
-1. Pull container images
-2. Build backend + frontend
-3. Download Ollama models (~10 GB):
-   - `qwen3:8b` (default) — text LLM
-   - `mxbai-embed-large` — embeddings
-   - `minicpm-v` — image tables (VLM)
-
-Watch model download progress:
+| Model | Role |
+|-------|------|
+| `qwen3:8b` | Text LLM (default) |
+| `mxbai-embed-large` | Embeddings |
+| `minicpm-v` | Table/image VLM |
 
 ```bash
 docker compose logs -f ollama-pull
 ```
-
-The backend waits until models are ready. Later starts are much faster.
 
 ### Prerequisites
 
-| Requirement | Notes |
-|-------------|--------|
-| **Docker** | [Docker Engine](https://docs.docker.com/engine/install/) (Linux) or [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows / macOS) |
-| **NVIDIA GPU** | Required for Ollama inference (CPU-only mode is blocked) |
-| **Disk** | ~25 GB free (images + models) |
-| **Ports** | `3000`, `8000`, `11434`, `7474`, `6333`, `9000` available |
+- [Docker Engine](https://docs.docker.com/engine/install/) (Linux) or [Docker Desktop](https://www.docker.com/products/docker-desktop/) (Windows)
+- **NVIDIA GPU** + drivers; [Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) on Linux
+- ~25 GB disk · ports `3000`, `8000`, `11434`, `7474`, `6333`, `9000` free
 
-**No separate Ollama install** — models run inside Docker.
-
----
-
-## GPU setup
-
-### Linux (NVIDIA)
-
-1. Install [NVIDIA drivers](https://www.nvidia.com/Download/index.aspx) and verify: `nvidia-smi`
-2. Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html):
-
-```bash
-# Ubuntu / Debian
-sudo apt-get update
-sudo apt-get install -y nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
-
-3. Test GPU inside Docker:
-
-```bash
-docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
-```
-
-4. Run `./start-docker.sh` — it verifies GPU-only Ollama before finishing.
-
-### Windows
-
-- Install NVIDIA drivers
-- Docker Desktop → **Settings → Resources → GPU** → enable
-- Run `.\start-docker.bat`
-
-### Verify Ollama uses GPU
-
-```bash
-docker exec skg-ollama ollama ps    # must show GPU, not CPU
-make verify-gpu                      # full probe
-```
-
----
-
-## What's in Docker
-
-| Service | Role |
-|---------|------|
-| **frontend** | Next.js UI |
-| **backend** | FastAPI — ingest, RAG, graph |
-| **neo4j** | Knowledge graph |
-| **qdrant** | Vector search |
-| **minio** | Document storage |
-| **ollama** | LLM + embeddings + vision |
-| **ollama-pull** | One-shot model download on first start |
-
----
-
-## Useful commands
-
-```bash
-# Start everything (Linux / macOS)
-./start-docker.sh
-# or
-docker compose --env-file .env.docker up -d --build
-
-# Stop (keeps data)
-docker compose down
-
-# Rebuild after code changes
-docker compose --env-file .env.docker up -d --build
-
-# Backend only (fast)
-./scripts/restart-backend.sh
-
-# Logs
-docker compose logs -f backend
-docker compose logs -f ollama-pull
-
-# Re-pull models after changing tier in .env.docker
-docker compose --env-file .env.docker run --rm ollama-pull
-docker compose --env-file .env.docker up -d backend
-
-# Full reset (graph, vectors, uploads, models)
-docker compose down -v
-```
+Verify GPU: `docker exec skg-ollama ollama ps` (must show **GPU**, not CPU)
 
 ---
 
 ## Configuration (`.env.docker`)
 
+Copy from `.env.example`:
+
 ```env
 LLM_MODEL=qwen3:8b
 OLLAMA_PULL_MODELS=qwen3:8b,mxbai-embed-large,minicpm-v
+RAG_RU_TRANSLATE_PIPELINE=true
 ```
 
-### Model tiers
+| Tier | `LLM_MODEL` | VRAM |
+|------|-------------|------|
+| **default** | `qwen3:8b` | ~6 GB |
+| light | `qwen2.5:7b-instruct` | ~8 GB |
+| standard | `qwen2.5:14b-instruct` | ~16 GB |
+| premium | `qwen2.5:32b-instruct` | ~24 GB |
 
-| Tier | `LLM_MODEL` | `OLLAMA_PULL_MODELS` (LLM part) | VRAM |
-|------|-------------|----------------------------------|------|
-| **default** | `qwen3:8b` | `qwen3:8b,...` | ~6 GB |
-| **light** | `qwen2.5:7b-instruct` | `qwen2.5:7b-instruct,...` | ~8 GB |
-| **standard** | `qwen2.5:14b-instruct` | `qwen2.5:14b-instruct,...` | ~16 GB |
-| **premium** | `qwen2.5:32b-instruct` | `qwen2.5:32b-instruct,...` | ~24 GB |
-
-After changing tier: `docker compose --env-file .env.docker run --rm ollama-pull`
-
-### Yandex Cloud (optional)
-
-Long PDFs and DOCX files (>28 estimated pages) use Yandex when keys are set **and** the API is reachable. Shorter files always use local Ollama. If Yandex is down, misconfigured, or rate-limited, the backend **automatically falls back to local Ollama** (`LLM_YANDEX_FALLBACK_LOCAL=true` by default). Check status via `GET /api/config/llm` (`yandex_usable`, `effective_provider`).
+**Yandex Cloud (optional)** — long PDFs (>28 pages) can route to Yandex when keys are set; falls back to local Ollama automatically:
 
 ```env
 YANDEX_API_KEY=your-key
 YANDEX_FOLDER_ID=your-folder-id
 ```
 
----
+Check runtime provider: `GET /api/config/llm`
 
-## Troubleshooting
-
-| Problem | Fix |
-|---------|-----|
-| `docker: command not found` | Install Docker Engine (Linux) or Docker Desktop |
-| `Docker daemon is not running` | `sudo systemctl start docker` (Linux) or start Docker Desktop |
-| `Docker cannot access the NVIDIA GPU` | Install `nvidia-container-toolkit`, restart Docker (see GPU setup) |
-| `permission denied` on `./start-docker.sh` | `chmod +x start-docker.sh scripts/*.sh` |
-| `qdrant unhealthy` | `docker compose up -d qdrant` |
-| Backend not starting | Wait for `ollama-pull`: `docker compose logs ollama-pull` |
-| Port in use | Free 3000/8000 or edit `docker-compose.yaml` |
-| Slow ingest | Use GPU or Yandex keys for large PDFs |
-| Yandex errors / fallback | Local Ollama used automatically; see `GET /api/config/llm` |
-| Out of disk | `docker system prune` or use light model tier |
-| Script `^M` / bad interpreter (Linux) | Files use LF via `.gitattributes`; `git checkout -- scripts/` |
-
----
-
-## Load demo data
-
-1. Download corpus from [Yandex Disk](https://disk.yandex.ru/d/npigiuw4Rbe9Pg)
-2. Upload PDFs via http://localhost:3000
-3. Wait for ingest
+**Russian RAG** — when `RAG_RU_TRANSLATE_PIPELINE=true`, Russian questions are translated to English for retrieval, answered in English from excerpts, then translated back to Russian.
 
 ---
 
@@ -244,22 +132,47 @@ YANDEX_FOLDER_ID=your-folder-id
 
 ```
 Browser (:3000)
-    → Next.js + FastAPI (Docker)
-    → Neo4j · Qdrant · MinIO · Ollama (all Docker)
+  → Next.js frontend
+  → FastAPI backend
+  → Neo4j (graph) · Qdrant (vectors) · MinIO (files) · Ollama (LLM/embeddings/VLM)
 ```
 
 ---
 
-## API quick reference
+## API
 
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /api/v1/ingest/file` | Upload document |
-| `POST /api/v1/search/json` | RAG + filters |
-| `GET /api/v1/graph/explore` | Full graph |
-| `GET /api/v1/graph/export/json-ld` | JSON-LD export |
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/api/v1/ingest/file` | Upload PDF/DOCX |
+| GET | `/api/v1/ingest/active` | Ingest in progress (Q&A blocked while true) |
+| POST | `/api/v1/search/json` | RAG search with filters |
+| GET | `/api/v1/graph/explore` | Full knowledge graph |
+| GET | `/api/v1/graph/export/json-ld` | JSON-LD export |
 
-Docs: http://localhost:8000/docs
+Interactive docs: http://localhost:8000/docs
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| Docker not running | Start Docker Desktop or `sudo systemctl start docker` |
+| GPU not available in Docker | Install `nvidia-container-toolkit`, restart Docker |
+| `permission denied` on scripts | `chmod +x start-docker.sh scripts/*.sh` |
+| Backend waits forever | `docker compose logs -f ollama-pull` |
+| Port in use | Free 3000/8000 or edit `docker-compose.yaml` |
+| Russian Q&A misses context | Ensure `RAG_RU_TRANSLATE_PIPELINE=true`, rebuild backend |
+| Out of disk | `docker system prune` or use a lighter model tier |
+| Full reset | `docker compose down -v` |
+
+---
+
+## Demo data
+
+1. [Corpus on Yandex Disk](https://disk.yandex.ru/d/npigiuw4Rbe9Pg)
+2. Upload via http://localhost:3000
+3. Wait for ingest to complete before searching
 
 ---
 
