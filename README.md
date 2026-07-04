@@ -6,30 +6,36 @@ Mining & metallurgy research knowledge map: ingest PDFs/DOCX, build a Neo4j grap
 
 ---
 
-## Quick start (daily use)
+## Quick start
 
-Every time you work on the project:
-
-1. **Start Ollama** — open the Ollama app (system tray icon must be running).
-2. **Start Docker Desktop** — wait until it says “Running”.
-3. **Run one command** from the project folder:
+**Only Docker Desktop required** — everything else runs in containers (including Ollama + models).
 
 ```powershell
+git clone https://github.com/vsham05/NornikelHack.git
+cd NornikelHack
+git checkout scientific-tangle
 cd scientific-tangle
+
+copy .env.example .env.docker
 .\start-docker.bat
 ```
 
-4. Open the app:
+Open http://localhost:3000 when startup finishes.
 
 | What | URL |
 |------|-----|
-| **Frontend (UI)** | http://localhost:3000 |
-| **Backend (API docs)** | http://localhost:8000/docs |
-| **Health check** | http://localhost:8000/health |
+| **App (UI)** | http://localhost:3000 |
+| **API docs** | http://localhost:8000/docs |
+| Neo4j Browser | http://localhost:7474 (`neo4j` / `password123`) |
+| MinIO console | http://localhost:9001 (`minioadmin` / `minioadmin`) |
 
-That’s it — `start-docker.bat` starts **everything**: Neo4j, Qdrant, MinIO, **backend**, and **frontend**. There is no separate backend or `npm run dev` step.
+### Daily use
 
-To stop:
+1. Start **Docker Desktop**
+2. Run `.\start-docker.bat`
+3. Open http://localhost:3000
+
+Stop:
 
 ```powershell
 docker compose down
@@ -37,69 +43,36 @@ docker compose down
 
 ---
 
-## First-time setup (new PC)
+## First run (important)
 
-Do this once on a new machine.
+The **first** `start-docker.bat` takes **10–30+ minutes** because Docker will:
 
-### Step 1 — Install software
+1. Pull container images
+2. Build backend + frontend
+3. Download Ollama models (~10 GB):
+   - `qwen2.5:7b-instruct` — text LLM
+   - `mxbai-embed-large` — embeddings
+   - `minicpm-v` — image tables (VLM)
 
-| Software | Download | Purpose |
-|----------|----------|---------|
-| **Docker Desktop** | https://www.docker.com/products/docker-desktop/ | Databases + backend + frontend |
-| **Ollama** | https://ollama.com/download | LLM, embeddings, vision (runs on your PC) |
-
-You need **~15 GB** free disk. Ports `3000`, `8000`, and `11434` must be free.
-
-### Step 2 — Clone the repo
+Watch model download progress:
 
 ```powershell
-git clone https://github.com/vsham05/NornikelHack.git
-cd NornikelHack
-git checkout scientific-tangle
-cd scientific-tangle
+docker compose logs -f ollama-pull
 ```
 
-### Step 3 — Pull AI models (one-time)
+The backend waits until models are ready. Later starts are much faster.
 
-Open Ollama, then in PowerShell or CMD:
+### Prerequisites
 
-```powershell
-ollama pull qwen2.5:7b-instruct
-ollama pull mxbai-embed-large
-ollama pull minicpm-v
-```
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) — **only requirement**
+- **~25 GB** free disk (images + models)
+- Ports free: `3000`, `8000`, `11434`, `7474`, `6333`, `9000`
 
-~10 GB download. Models stay on your PC — Docker does **not** download them again.
-
-**Optional — better quality (more VRAM):**
-
-```powershell
-ollama pull qwen2.5:14b-instruct
-```
-
-Then set `LLM_MODEL=qwen2.5:14b-instruct` in `.env.docker`.
-
-### Step 4 — Config file
-
-```powershell
-copy .env.example .env.docker
-```
-
-Edit `.env.docker` only if you need Yandex API keys or a different LLM model.
-
-### Step 5 — Start
-
-```powershell
-.\start-docker.bat
-```
-
-Open http://localhost:3000 when it finishes.
+**No separate Ollama install needed.**
 
 ---
 
 ## Linux / macOS
-
-Same idea — install [Docker](https://docs.docker.com/get-docker/) and [Ollama](https://ollama.com/download), pull the three models, then:
 
 ```bash
 cp .env.example .env.docker
@@ -108,63 +81,75 @@ docker compose --env-file .env.docker up -d --build
 
 ---
 
+## What's in Docker
+
+| Service | Role |
+|---------|------|
+| **frontend** | Next.js UI |
+| **backend** | FastAPI — ingest, RAG, graph |
+| **neo4j** | Knowledge graph |
+| **qdrant** | Vector search |
+| **minio** | Document storage |
+| **ollama** | LLM + embeddings + vision |
+| **ollama-pull** | One-shot model download on first start |
+
+---
+
 ## Useful commands
 
 ```powershell
-# Start (same as start-docker.bat, after Ollama is running)
+# Start everything
 docker compose --env-file .env.docker up -d --build
 
-# Stop all containers (keeps your data)
+# Stop (keeps data)
 docker compose down
 
-# Rebuild after you changed code
+# Rebuild after code changes
 docker compose --env-file .env.docker up -d --build
 
-# Watch backend logs
+# Logs
 docker compose logs -f backend
+docker compose logs -f ollama-pull
 
-# Watch all services
-docker compose logs -f
+# Re-pull models after changing tier in .env.docker
+docker compose --env-file .env.docker run --rm ollama-pull
+docker compose --env-file .env.docker up -d backend
 
-# Full reset — deletes graph, vectors, uploads (NOT Ollama models)
+# Full reset (graph, vectors, uploads, models)
 docker compose down -v
 ```
 
 ---
 
-## Admin URLs
-
-| Service | URL | Login |
-|---------|-----|-------|
-| App UI | http://localhost:3000 | — |
-| API docs | http://localhost:8000/docs | — |
-| Neo4j Browser | http://localhost:7474 | `neo4j` / `password123` |
-| MinIO console | http://localhost:9001 | `minioadmin` / `minioadmin` |
-
----
-
 ## Configuration (`.env.docker`)
 
-Copy from `.env.example`. Most users can leave defaults.
-
 ```env
-# Local LLM (must match a model you pulled in Ollama)
 LLM_MODEL=qwen2.5:7b-instruct
-
-# Optional — better ingest on large PDFs (needs Yandex Cloud account)
-YANDEX_API_KEY=
-YANDEX_FOLDER_ID=
+OLLAMA_PULL_MODELS=qwen2.5:7b-instruct,mxbai-embed-large,minicpm-v
 ```
 
 ### Model tiers
 
-| Tier | Ollama model | VRAM |
-|------|--------------|------|
-| light (default) | `qwen2.5:7b-instruct` | ~8 GB |
-| standard | `qwen2.5:14b-instruct` | ~16 GB |
-| premium | `qwen2.5:32b-instruct` | ~24 GB |
+| Tier | `LLM_MODEL` | `OLLAMA_PULL_MODELS` (LLM part) | VRAM |
+|------|-------------|----------------------------------|------|
+| **light** (default) | `qwen2.5:7b-instruct` | `qwen2.5:7b-instruct,...` | ~8 GB |
+| **standard** | `qwen2.5:14b-instruct` | `qwen2.5:14b-instruct,...` | ~16 GB |
+| **premium** | `qwen2.5:32b-instruct` | `qwen2.5:32b-instruct,...` | ~24 GB |
 
-Embeddings and image-table vision always use `mxbai-embed-large` and `minicpm-v`.
+After changing tier: `docker compose --env-file .env.docker run --rm ollama-pull`
+
+### Yandex Cloud (optional)
+
+```env
+YANDEX_API_KEY=your-key
+YANDEX_FOLDER_ID=your-folder-id
+```
+
+### GPU (optional, NVIDIA)
+
+```powershell
+docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml --env-file .env.docker up -d --build
+```
 
 ---
 
@@ -172,45 +157,30 @@ Embeddings and image-table vision always use `mxbai-embed-large` and `minicpm-v`
 
 | Problem | Fix |
 |---------|-----|
-| `Ollama is not running` | Open Ollama from the Start menu / Applications |
-| `Missing models` | Run the three `ollama pull` commands in first-time setup |
-| `Docker compose failed` | Start Docker Desktop and wait until it’s ready |
-| UI loads but search/ingest fails | Check http://localhost:8000/health — backend must be up |
-| Backend errors in logs | Keep Ollama running while using the app |
-| Port already in use | Stop other apps on 3000/8000 or change ports in `docker-compose.yaml` |
-| Slow ingest on big PDFs | Use 14B/32B model or add Yandex API keys |
+| `Docker compose failed` | Start Docker Desktop |
+| `qdrant unhealthy` | `docker compose up -d qdrant` (fixed healthcheck in latest compose) |
+| Backend not starting | Wait for `ollama-pull`: `docker compose logs ollama-pull` |
+| Port in use | Free 3000/8000 or edit `docker-compose.yaml` |
+| Slow ingest | Use GPU overlay or Yandex keys for large PDFs |
+| Out of disk | `docker system prune` or use light model tier |
 
 ---
 
 ## Load demo data
 
-1. Download the case corpus from [Yandex Disk](https://disk.yandex.ru/d/npigiuw4Rbe9Pg)
-2. Open http://localhost:3000
-3. Upload PDFs/DOCX via the UI
-4. Wait for ingest to finish (large PDFs can take a while on 7B)
-
-### Sample questions
-
-- *What water desalination methods work when feed water has sulfates/chlorides at 200–300 mg/L?*
-- *Catholyte circulation during nickel electrowinning — global practice and optimal flow rate?*
-- *Distribution of Au, Ag, PGMs between matte and slag (last 5 years)?*
+1. Download corpus from [Yandex Disk](https://disk.yandex.ru/d/npigiuw4Rbe9Pg)
+2. Upload PDFs via http://localhost:3000
+3. Wait for ingest
 
 ---
 
-## How it fits together
+## Architecture
 
 ```
 Browser (:3000)
-    → Next.js frontend (Docker)
-    → FastAPI backend (Docker)
-    → Neo4j · Qdrant · MinIO (Docker)
-    → Ollama on your PC (:11434)
-        qwen2.5:7b-instruct  — text LLM
-        mxbai-embed-large    — embeddings
-        minicpm-v            — image tables (VLM)
+    → Next.js + FastAPI (Docker)
+    → Neo4j · Qdrant · MinIO · Ollama (all Docker)
 ```
-
-**Hybrid ingest:** PDFs ≤28 pages use local Ollama; longer PDFs use Yandex API if keys are set in `.env.docker`.
 
 ---
 
@@ -220,12 +190,10 @@ Browser (:3000)
 |----------|---------|
 | `POST /api/v1/ingest/file` | Upload document |
 | `POST /api/v1/search/json` | RAG + filters |
-| `GET /api/v1/graph/explore` | Full knowledge graph |
-| `GET /api/v1/graph/analytics/gaps` | Knowledge gaps |
-| `GET /api/v1/graph/analytics/contradictions` | Conflicting values |
+| `GET /api/v1/graph/explore` | Full graph |
 | `GET /api/v1/graph/export/json-ld` | JSON-LD export |
 
-Interactive docs: http://localhost:8000/docs
+Docs: http://localhost:8000/docs
 
 ---
 

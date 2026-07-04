@@ -37,7 +37,7 @@ const enTree: MessageTree = {
     hybridYandex: "Yandex API (auto — large PDF)",
     hybridLocal: "Local Qwen (auto — small PDF)",
     unavailable: "Could not load model settings",
-    backendOffline: "Run start-docker.bat (Ollama + Docker) to load models",
+    backendOffline: "Run start-docker.bat to start the full Docker stack",
     yandexNotConfigured: "Set YANDEX_API_KEY and YANDEX_FOLDER_ID in backend .env",
     switchFailed: "Failed to switch model",
     yandexModel: "Yandex model",
@@ -50,7 +50,7 @@ const enTree: MessageTree = {
     backendProcessing: "Processing document…",
     backendOffline: "Backend offline",
     backendHint:
-      "Install Ollama (ollama.com), run start-docker.bat, then search and ingest documents.",
+      "Run start-docker.bat (Docker Desktop) to search and ingest documents.",
   },
   search: {
     placeholder: "Search your knowledge base…",
@@ -340,7 +340,7 @@ const ruTree: MessageTree = {
     hybridYandex: "Yandex API (авто — большой PDF)",
     hybridLocal: "Локальный Qwen (авто — малый PDF)",
     unavailable: "Не удалось загрузить настройки модели",
-    backendOffline: "Запустите start-docker.bat (Ollama + Docker) для выбора модели",
+    backendOffline: "Запустите start-docker.bat для полного Docker-стека",
     yandexNotConfigured: "Укажите YANDEX_API_KEY и YANDEX_FOLDER_ID в .env бэкенда",
     switchFailed: "Не удалось переключить модель",
     yandexModel: "Модель Yandex",
@@ -353,7 +353,7 @@ const ruTree: MessageTree = {
     backendProcessing: "Обработка документа…",
     backendOffline: "Бэкенд недоступен",
     backendHint:
-      "Установите Ollama (ollama.com), запустите start-docker.bat, затем ищите и загружайте документы.",
+      "Запустите start-docker.bat (Docker Desktop) для поиска и загрузки документов.",
   },
   search: {
     placeholder: "Поиск по базе знаний…",
