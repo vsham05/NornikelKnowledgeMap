@@ -1,93 +1,234 @@
 # R&D Knowledge Map — Nornickel Hackathon
 
-Unified **mining & metallurgy** research knowledge map: links publications, experiments, materials, processes, equipment, facilities, experts, and verified conclusions in a Neo4j graph with semantic RAG (RU/EN).
+Mining & metallurgy research knowledge map: ingest PDFs/DOCX, build a Neo4j graph, and run semantic RAG (RU/EN) with citations.
 
-## Problem we solve
+**Repo:** [NornikelHack](https://github.com/vsham05/NornikelHack) · branch `scientific-tangle`
 
-| Pain | Solution |
-|------|----------|
-| Scattered institutional memory | Ingest PDF/DOCX/URLs → normalized graph + vector index |
-| Duplicate literature reviews | Structured search + graph traversal shows what was already studied |
-| Disparate interdisciplinary data | Entity links: material → process → experiment → publication |
-| Slow manual synthesis | RAG answers with numbered citations + confidence |
-| Contradictory conclusions | Contradiction panel + source reliability on documents |
+---
 
-## Architecture
+## Quick start (daily use)
 
-```
-Next.js UI (:3000)
-    ↓ REST
-FastAPI (:8000) — ingest · NLP · RAG · graph analytics
-    ↓
-Neo4j (graph) · Qdrant (vectors) · MinIO (files) · Ollama (LLM + embeddings)
-```
+Every time you work on the project:
 
-**Models (local, no API keys):**
-- LLM: `qwen2.5:7b-instruct`
-- Embeddings: `mxbai-embed-large` (1024-dim)
-
-## Entity ontology
-
-| Type | Neo4j label | Example |
-|------|-------------|---------|
-| Publication | `Document` | Article, report, patent |
-| Material | `Material` | Nickel cathode, copper matte |
-| Process | `Process` | Electrowinning, heap leaching |
-| Experiment | `Experiment` | Protocol + parameters + status |
-| Property | `Property` | Concentration, flow rate |
-| Equipment | `Equipment` | Diaphragm cell, PVD furnace |
-| Facility | `Facility` | Plant, laboratory + country |
-| Expert / Team | `Expert`, `Team` | Authors, competence holders |
-
-**Key relationships:** `MENTIONS_MATERIAL`, `USES_MATERIAL`, `USES_PROCESS`, `DESCRIBED_IN`, `MEASURED`, `AUTHORED`, `HAS_TOPIC`, `WORKS_AT`, `MENTIONS_EQUIPMENT`
-
-## Hackathon features
-
-- **Multi-parameter queries:** material + process + geography + year + numeric limits
-- **Geography:** domestic (Russia/CIS) vs international/global on documents
-- **Provenance:** source excerpts [1][2], document type reliability, update metadata
-- **Gap analysis:** materials without experiments, missing properties
-- **Contradictions:** conflicting measurements for same material + property
-- **Graph visualization:** full knowledge map with filters
-- **Export:** Markdown report, JSON, JSON-LD (`/api/v1/graph/export/json-ld`)
-- **Multilingual:** Russian & English queries and documents
-
-## Quick start
+1. **Start Ollama** — open the Ollama app (system tray icon must be running).
+2. **Start Docker Desktop** — wait until it says “Running”.
+3. **Run one command** from the project folder:
 
 ```powershell
-docker compose up -d
-.\scripts\pull-ollama-models.ps1
-.\start-backend.bat
-npm run dev
+cd scientific-tangle
+.\start-docker.bat
 ```
 
-Open http://localhost:3000
+4. Open the app:
 
-### Demo queries (from case)
+| What | URL |
+|------|-----|
+| **Frontend (UI)** | http://localhost:3000 |
+| **Backend (API docs)** | http://localhost:8000/docs |
+| **Health check** | http://localhost:8000/health |
 
-1. *What water desalination methods are suitable if feed water has sulfates/chlorides at 200–300 mg/L?*
-2. *Catholyte circulation during nickel electrowinning — global practice and optimal flow rate?*
-3. *Distribution of Au, Ag, PGMs between matte and slag (last 5 years)?* — use year filter `2021–2026`
-4. *Mine water pumping to deep horizons — Russia vs abroad?* — geography: **domestic** / **international**
+That’s it — `start-docker.bat` starts **everything**: Neo4j, Qdrant, MinIO, **backend**, and **frontend**. There is no separate backend or `npm run dev` step.
 
-### Ingest case data
+To stop:
 
-Download corpus from [Yandex Disk](https://disk.yandex.ru/d/npigiuw4Rbe9Pg), then upload PDFs/DOCX via the UI. Run **enrich-all** (auto on first load) to populate graph entities.
+```powershell
+docker compose down
+```
 
-## API highlights
+---
+
+## First-time setup (new PC)
+
+Do this once on a new machine.
+
+### Step 1 — Install software
+
+| Software | Download | Purpose |
+|----------|----------|---------|
+| **Docker Desktop** | https://www.docker.com/products/docker-desktop/ | Databases + backend + frontend |
+| **Ollama** | https://ollama.com/download | LLM, embeddings, vision (runs on your PC) |
+
+You need **~15 GB** free disk. Ports `3000`, `8000`, and `11434` must be free.
+
+### Step 2 — Clone the repo
+
+```powershell
+git clone https://github.com/vsham05/NornikelHack.git
+cd NornikelHack
+git checkout scientific-tangle
+cd scientific-tangle
+```
+
+### Step 3 — Pull AI models (one-time)
+
+Open Ollama, then in PowerShell or CMD:
+
+```powershell
+ollama pull qwen2.5:7b-instruct
+ollama pull mxbai-embed-large
+ollama pull minicpm-v
+```
+
+~10 GB download. Models stay on your PC — Docker does **not** download them again.
+
+**Optional — better quality (more VRAM):**
+
+```powershell
+ollama pull qwen2.5:14b-instruct
+```
+
+Then set `LLM_MODEL=qwen2.5:14b-instruct` in `.env.docker`.
+
+### Step 4 — Config file
+
+```powershell
+copy .env.example .env.docker
+```
+
+Edit `.env.docker` only if you need Yandex API keys or a different LLM model.
+
+### Step 5 — Start
+
+```powershell
+.\start-docker.bat
+```
+
+Open http://localhost:3000 when it finishes.
+
+---
+
+## Linux / macOS
+
+Same idea — install [Docker](https://docs.docker.com/get-docker/) and [Ollama](https://ollama.com/download), pull the three models, then:
+
+```bash
+cp .env.example .env.docker
+docker compose --env-file .env.docker up -d --build
+```
+
+---
+
+## Useful commands
+
+```powershell
+# Start (same as start-docker.bat, after Ollama is running)
+docker compose --env-file .env.docker up -d --build
+
+# Stop all containers (keeps your data)
+docker compose down
+
+# Rebuild after you changed code
+docker compose --env-file .env.docker up -d --build
+
+# Watch backend logs
+docker compose logs -f backend
+
+# Watch all services
+docker compose logs -f
+
+# Full reset — deletes graph, vectors, uploads (NOT Ollama models)
+docker compose down -v
+```
+
+---
+
+## Admin URLs
+
+| Service | URL | Login |
+|---------|-----|-------|
+| App UI | http://localhost:3000 | — |
+| API docs | http://localhost:8000/docs | — |
+| Neo4j Browser | http://localhost:7474 | `neo4j` / `password123` |
+| MinIO console | http://localhost:9001 | `minioadmin` / `minioadmin` |
+
+---
+
+## Configuration (`.env.docker`)
+
+Copy from `.env.example`. Most users can leave defaults.
+
+```env
+# Local LLM (must match a model you pulled in Ollama)
+LLM_MODEL=qwen2.5:7b-instruct
+
+# Optional — better ingest on large PDFs (needs Yandex Cloud account)
+YANDEX_API_KEY=
+YANDEX_FOLDER_ID=
+```
+
+### Model tiers
+
+| Tier | Ollama model | VRAM |
+|------|--------------|------|
+| light (default) | `qwen2.5:7b-instruct` | ~8 GB |
+| standard | `qwen2.5:14b-instruct` | ~16 GB |
+| premium | `qwen2.5:32b-instruct` | ~24 GB |
+
+Embeddings and image-table vision always use `mxbai-embed-large` and `minicpm-v`.
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| `Ollama is not running` | Open Ollama from the Start menu / Applications |
+| `Missing models` | Run the three `ollama pull` commands in first-time setup |
+| `Docker compose failed` | Start Docker Desktop and wait until it’s ready |
+| UI loads but search/ingest fails | Check http://localhost:8000/health — backend must be up |
+| Backend errors in logs | Keep Ollama running while using the app |
+| Port already in use | Stop other apps on 3000/8000 or change ports in `docker-compose.yaml` |
+| Slow ingest on big PDFs | Use 14B/32B model or add Yandex API keys |
+
+---
+
+## Load demo data
+
+1. Download the case corpus from [Yandex Disk](https://disk.yandex.ru/d/npigiuw4Rbe9Pg)
+2. Open http://localhost:3000
+3. Upload PDFs/DOCX via the UI
+4. Wait for ingest to finish (large PDFs can take a while on 7B)
+
+### Sample questions
+
+- *What water desalination methods work when feed water has sulfates/chlorides at 200–300 mg/L?*
+- *Catholyte circulation during nickel electrowinning — global practice and optimal flow rate?*
+- *Distribution of Au, Ag, PGMs between matte and slag (last 5 years)?*
+
+---
+
+## How it fits together
+
+```
+Browser (:3000)
+    → Next.js frontend (Docker)
+    → FastAPI backend (Docker)
+    → Neo4j · Qdrant · MinIO (Docker)
+    → Ollama on your PC (:11434)
+        qwen2.5:7b-instruct  — text LLM
+        mxbai-embed-large    — embeddings
+        minicpm-v            — image tables (VLM)
+```
+
+**Hybrid ingest:** PDFs ≤28 pages use local Ollama; longer PDFs use Yandex API if keys are set in `.env.docker`.
+
+---
+
+## API quick reference
 
 | Endpoint | Purpose |
 |----------|---------|
 | `POST /api/v1/ingest/file` | Upload document |
-| `POST /api/v1/search/json` | RAG + structured filters |
-| `GET /api/v1/graph/explore` | Full graph for visualization |
-| `GET /api/v1/graph/query` | Structured multi-param search |
+| `POST /api/v1/search/json` | RAG + filters |
+| `GET /api/v1/graph/explore` | Full knowledge graph |
 | `GET /api/v1/graph/analytics/gaps` | Knowledge gaps |
 | `GET /api/v1/graph/analytics/contradictions` | Conflicting values |
-| `GET /api/v1/graph/export/json-ld` | FAIR JSON-LD export |
+| `GET /api/v1/graph/export/json-ld` | JSON-LD export |
+
+Interactive docs: http://localhost:8000/docs
+
+---
 
 ## Tech stack
 
 Next.js 16 · FastAPI · Neo4j · Qdrant · MinIO · Ollama · LangChain
-
-Branch: `scientific-tangle` on [NornikelHack](https://github.com/vsham05/NornikelHack)

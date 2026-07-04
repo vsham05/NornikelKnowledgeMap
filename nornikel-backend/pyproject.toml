@@ -1,8 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [project]
 name = "nornikelhack"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+description = "R&D Knowledge Map API — ingest, graph, RAG"
 requires-python = ">=3.11"
 dependencies = [
     "docx>=0.2.4",

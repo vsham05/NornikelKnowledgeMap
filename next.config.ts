@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 const projectRoot = path.dirname(fileURLToPath(import.meta.url));
 
 const nextConfig: NextConfig = {
+  output: "standalone",
   // Pin workspace root — avoids wrong lockfile parent (C:\Users\dienh\)
   outputFileTracingRoot: projectRoot,
   turbopack: {

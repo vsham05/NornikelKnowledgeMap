@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+.env
+.env.*
+!.env.example
+nornikel-backend/.venv
+nornikel-backend/.pytest_cache
+nornikel-backend/.env
+**/__pycache__
+*.pyc

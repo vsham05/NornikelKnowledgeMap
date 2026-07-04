@@ -84,17 +84,6 @@ LOCAL_MODELS: tuple[LocalModelInfo, ...] = (
         notes="Good mid-tier extraction model.",
     ),
     LocalModelInfo(
-        id="qwen2.5-7b-instruct",
-        label="Qwen2.5 7B (custom GGUF import)",
-        tier="light",
-        context_tokens=8_192,
-        extraction_chars=12_000,
-        max_output_tokens=8_192,
-        enricher_multipass=0,
-        extraction_batches=0,
-        notes="Full-coverage multipass + taxonomy backfill; upgrade to 14B/32B for best recall.",
-    ),
-    LocalModelInfo(
         id="qwen2.5:7b-instruct",
         label="Qwen2.5 7B (fast, lower recall)",
         tier="light",

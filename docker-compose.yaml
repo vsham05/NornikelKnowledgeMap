@@ -1,3 +1,12 @@
+# Full stack — Docker runs app + databases; Ollama runs on your PC (Windows/Mac/Linux app).
+#
+#   copy .env.example .env.docker
+#   .\start-docker.bat
+#
+# Prerequisites:
+#   1. Docker Desktop — https://www.docker.com/products/docker-desktop/
+#   2. Ollama — https://ollama.com/download (Windows: install + keep app running)
+
 services:
   neo4j:
     image: neo4j:5.25-community
@@ -11,6 +20,12 @@ services:
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   qdrant:
     image: qdrant/qdrant:v1.13.4
@@ -20,6 +35,11 @@ services:
       - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:6333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   minio:
     image: minio/minio:latest
@@ -33,6 +53,50 @@ services:
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./nornikel-backend
+    container_name: skg-backend
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - path: .env.docker
+        required: false
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      QDRANT_URL: http://qdrant:6333
+      MINIO_ENDPOINT: minio:9000
+      LLM_BASE_URL: http://host.docker.internal:11434/v1
+      EMBEDDING_BASE_URL: http://host.docker.internal:11434/v1
+      VLM_BASE_URL: http://host.docker.internal:11434/v1
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://localhost:8000}
+    container_name: skg-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
 
 volumes:
   neo4j_data:

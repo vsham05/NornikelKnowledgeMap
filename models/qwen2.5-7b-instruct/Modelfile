@@ -1,4 +1,0 @@
-FROM C:/Users/dienh/Downloads/qwen2.5-7b-instruct-q4_k_m.gguf
-
-PARAMETER temperature 0.7
-PARAMETER num_ctx 8192

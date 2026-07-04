@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     # LLM (Ollama OpenAI-compatible API)
     llm_api_key: str = "ollama"
     llm_base_url: str = "http://localhost:11434/v1"
-    llm_model: str = "qwen2.5-7b-instruct"
+    llm_model: str = "qwen2.5:7b-instruct"
     llm_provider: str = "local"  # local | yandex
     llm_context_tokens: int = 32_768
     llm_extraction_max_chars: int = 28_000

@@ -37,9 +37,6 @@ yarn-error.log*
 nornikel-backend/.env
 nornikel-backend/.venv
 
-# local llama binaries (download via scripts)
-/tools/
-
 # vercel
 .vercel
 
