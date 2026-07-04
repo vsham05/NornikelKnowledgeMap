@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 
 from search.query_processing import (
+    detect_language,
     extract_numeric_anchors,
     extract_search_terms,
     keyword_search_string,
@@ -19,12 +20,13 @@ REWRITE_SYSTEM = """You help search a scientific and engineering R&D document kn
 Given a user question, produce search terms that will retrieve passages with NUMERIC data.
 
 Reply with JSON only:
-{"search_query": "one concise sentence for semantic search", "keywords": ["term1", "term2"]}
+{"search_query": "one concise sentence for semantic search", "keywords": ["term1", "term2"], "search_query_en": "optional English paraphrase when question is Russian"}
 
 Rules:
 - search_query: rephrase the information need clearly (processes, materials, geography, years).
 - keywords: 6-12 important words/phrases — include ALL numbers, units (мг/л, %, м/ч), chemical symbols (Ca, Mg, Ni, Au), and technical terms from the question.
 - Keep Russian keywords in Cyrillic; English in Latin script.
+- When the user question is in Russian, set search_query_en to an English paraphrase of the same information need (helps cross-lingual embedding search). Omit search_query_en for English-only questions.
 - Do not answer the question — only optimize retrieval.
 - Preserve numeric thresholds and ranges exactly (e.g. 200–300 мг/л, ≤1000 мг/дм³)."""
 
@@ -36,14 +38,18 @@ class RewrittenQuery:
     original: str
     search_query: str
     keywords: tuple[str, ...]
+    search_query_en: str = ""
 
 
 def should_skip_llm_rewrite(question: str) -> bool:
     """
-    Skip the rewrite LLM call — hybrid embedding+keyword retrieval handles long queries.
-    Only very short/vague questions get an LLM rewrite.
+    Skip the rewrite LLM call for long English questions only.
+    Russian/mixed queries always get LLM rewrite + bilingual expansion.
     """
     q = question.strip()
+    lang = detect_language(q)
+    if lang in ("ru", "mixed"):
+        return False
     if len(q) < 28:
         return False
     return True
@@ -56,11 +62,14 @@ def _heuristic_rewrite(question: str) -> RewrittenQuery:
     keywords = tuple((terms + extra)[:12])
     search = question.strip()
     if keywords:
-        search = f"{question.strip()} — ключевые термины: {', '.join(keywords[:10])}"
+        lang = detect_language(question)
+        label = "ключевые термины" if lang == "ru" else "keywords"
+        search = f"{question.strip()} — {label}: {', '.join(keywords[:10])}"
     return RewrittenQuery(
         original=question.strip(),
         search_query=search,
         keywords=keywords or tuple(terms[:10]),
+        search_query_en="",
     )
 
 
@@ -75,6 +84,7 @@ def _parse_rewrite_json(text: str, fallback: str) -> RewrittenQuery | None:
         if not isinstance(data, dict):
             continue
         search_query = str(data.get("search_query") or "").strip()
+        search_query_en = str(data.get("search_query_en") or "").strip()
         raw_kw = data.get("keywords") or []
         keywords = tuple(
             str(k).strip()
@@ -86,6 +96,7 @@ def _parse_rewrite_json(text: str, fallback: str) -> RewrittenQuery | None:
                 original=fallback.strip(),
                 search_query=search_query,
                 keywords=keywords or tuple(significant_terms(fallback)),
+                search_query_en=search_query_en,
             )
     return None
 
@@ -125,6 +136,8 @@ def auxiliary_retrieval_queries(rewritten: RewrittenQuery) -> list[str]:
     queries: list[str] = []
     if rewritten.search_query and rewritten.search_query != rewritten.original:
         queries.append(rewritten.search_query)
+    if rewritten.search_query_en and rewritten.search_query_en not in queries:
+        queries.append(rewritten.search_query_en)
     kw_string = keyword_search_string(rewritten.original, list(rewritten.keywords))
     if kw_string and kw_string not in queries and kw_string != rewritten.original:
         queries.append(kw_string)

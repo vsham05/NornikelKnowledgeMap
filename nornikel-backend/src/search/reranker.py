@@ -7,7 +7,7 @@ import math
 import re
 from typing import TYPE_CHECKING
 
-from search.query_processing import significant_terms
+from search.query_processing import detect_language, significant_terms, term_matches_text
 
 if TYPE_CHECKING:
     from search.retrieval import RetrievedChunk
@@ -35,7 +35,7 @@ def _lexical_rerank_score(query: str, text: str, idf: dict[str, float]) -> float
         return 0.0
     lower = text.lower()
     total_idf = sum(idf.get(t, 1.0) for t in terms) or 1.0
-    hit_idf = sum(idf.get(t, 1.0) for t in terms if t in lower)
+    hit_idf = sum(idf.get(t, 1.0) for t in terms if term_matches_text(t, lower))
     coverage = hit_idf / total_idf
 
     # Phrase / bigram overlap from query
@@ -83,7 +83,10 @@ def rerank_chunks(
     terms = significant_terms(query)
     idf = _idf_weights(terms, corpus)
 
-    if model is not None:
+    # ms-marco cross-encoder is English-only — it demotes relevant Russian passages.
+    use_cross_encoder = model is not None and detect_language(query) not in ("ru", "mixed")
+
+    if use_cross_encoder:
         pairs = [(query, chunk.text[:1024]) for chunk in chunks]
         try:
             ce_scores = model.predict(pairs)

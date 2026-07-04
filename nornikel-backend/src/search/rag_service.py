@@ -40,12 +40,18 @@ from search.document_scope import (
 from search.extractive_answer import extractive_answer_from_chunks
 from search.query_processing import (
     answer_language_instruction,
+    detect_language,
     is_technical_quantitative_question,
     requests_experiment_list,
     resolve_answer_language,
     significant_terms,
 )
-from search.query_rewrite import auxiliary_retrieval_queries, rewrite_query_for_retrieval
+from search.query_rewrite import RewrittenQuery, auxiliary_retrieval_queries, rewrite_query_for_retrieval
+from search.query_translate import (
+    should_use_translate_pipeline,
+    translate_answer_to_russian,
+    translate_question_to_english,
+)
 from search.relevance import compute_confidence
 from search.retrieval import HybridRetriever, RetrievedChunk
 from settings import Settings
@@ -87,15 +93,25 @@ class RAGService:
         retrieval_limit = self._retrieval_limit(question)
 
         rewritten = await rewrite_query_for_retrieval(self.llm_client, retrieval_question)
-        aux = [] if is_name_question(question) else auxiliary_retrieval_queries(rewritten)
-        if len(aux) > 1:
-            aux = aux[:1]
+        primary_retrieval, aux, english_question, use_translate = (
+            await self._prepare_retrieval_queries(
+                question, retrieval_question, rewritten
+            )
+        )
 
         all_documents = self.graph_db.list_documents()
         answer_lang = resolve_answer_language(question)
 
         if query_requests_aggregate(question) and not forced_doc_id:
-            return await self._answer_aggregate(question, aux, answer_lang, all_documents)
+            return await self._answer_aggregate(
+                primary_retrieval,
+                aux,
+                answer_lang,
+                all_documents,
+                question=question,
+                english_question=english_question,
+                use_translate=use_translate,
+            )
 
         disambiguation = await self._check_disambiguation(
             question,
@@ -104,12 +120,13 @@ class RAGService:
             forced_doc_id,
             answer_lang,
             structured_document_ids=filter_doc_ids if has_structured_filters else None,
+            retrieval_query=primary_retrieval,
         )
         if disambiguation is not None:
             return disambiguation
 
         retrieved, scope, retrieval_scope = await self._retrieve_scoped(
-            retrieval_question,
+            primary_retrieval,
             aux,
             forced_document_id=forced_doc_id,
             all_documents=all_documents,
@@ -153,15 +170,21 @@ class RAGService:
 
         full_context = self._assemble_context(context_chunks, scope)
         used_extractive = False
+        gen_lang = "en" if use_translate and not is_name_question(question) else answer_lang
+        gen_question = english_question or question
         try:
             answer, used_grounded = await self._generate_answer(
-                question,
+                gen_question,
                 full_context,
                 context_chunks,
-                answer_lang,
+                gen_lang,
                 scope,
                 filter_payload=filter_payload,
             )
+            if use_translate and not is_name_question(question) and answer_lang == "ru":
+                answer = await translate_answer_to_russian(
+                    self.llm_client, answer, question
+                )
         except Exception as exc:
             logger.warning("LLM synthesis failed (%s); using embedding retrieval excerpts", exc)
             answer = extractive_answer_from_chunks(
@@ -217,6 +240,47 @@ class RAGService:
             retrieval_scope=retrieval_scope,
         )
 
+    async def _prepare_retrieval_queries(
+        self,
+        question: str,
+        retrieval_question: str,
+        rewritten: RewrittenQuery,
+    ) -> tuple[str, list[str], str | None, bool]:
+        """Return (primary_query, auxiliary_queries, english_question, use_translate_pipeline)."""
+        use_translate = should_use_translate_pipeline(
+            question, enabled=self.settings.rag_ru_translate_pipeline
+        )
+        english_question: str | None = None
+        if use_translate and not is_name_question(question):
+            english_question = (rewritten.search_query_en or "").strip() or None
+            if not english_question:
+                english_question = await translate_question_to_english(
+                    self.llm_client, retrieval_question
+                )
+
+        aux = [] if is_name_question(question) else auxiliary_retrieval_queries(rewritten)
+        if english_question:
+            if english_question not in aux:
+                aux.insert(0, english_question)
+            if (
+                retrieval_question
+                and retrieval_question not in aux
+                and retrieval_question != english_question
+            ):
+                aux.append(retrieval_question)
+
+        primary = english_question or retrieval_question
+        max_aux = 4 if detect_language(question) in ("ru", "mixed") else 1
+        if len(aux) > max_aux:
+            aux = aux[:max_aux]
+
+        if english_question:
+            logger.info(
+                "Cross-lingual RAG: retrieval in EN, answer EN→RU (%r)",
+                english_question[:80],
+            )
+        return primary, aux, english_question, use_translate and bool(english_question)
+
     async def _check_disambiguation(
         self,
         question: str,
@@ -226,6 +290,7 @@ class RAGService:
         answer_lang: str,
         *,
         structured_document_ids: list[str] | None = None,
+        retrieval_query: str | None = None,
     ) -> SearchResultDTO | None:
         if forced_doc_id:
             return None
@@ -239,7 +304,7 @@ class RAGService:
             return None
 
         probe = await self.retriever.retrieve(
-            question,
+            retrieval_query or question,
             limit=self._retrieval_limit(question),
             auxiliary_queries=auxiliary_queries,
         )
@@ -291,10 +356,14 @@ class RAGService:
 
     async def _answer_aggregate(
         self,
-        question: str,
+        retrieval_query: str,
         auxiliary_queries: list[str],
         answer_lang: str,
         all_documents: list[dict],
+        *,
+        question: str = "",
+        english_question: str | None = None,
+        use_translate: bool = False,
     ) -> SearchResultDTO:
         scope = DocumentScope(
             "aggregate",
@@ -312,7 +381,7 @@ class RAGService:
             if not doc_id:
                 continue
             retrieved = await self.retriever.retrieve(
-                question,
+                retrieval_query,
                 limit=AGGREGATE_CHUNKS_PER_DOC,
                 auxiliary_queries=auxiliary_queries,
                 document_id=doc_id,
@@ -321,16 +390,17 @@ class RAGService:
             if not retrieved:
                 continue
 
+            compress_q = question or retrieval_query
             chunks = compress_chunks(
                 [c.as_context_dict() for c in retrieved],
-                question,
+                compress_q,
                 max_chunk_chars=resolve_rag_chunk_max_chars(
                     self.settings, AGGREGATE_CHUNKS_PER_DOC
                 ),
             )
             chunks = fit_chunks_to_context_budget(
                 chunks,
-                question,
+                compress_q,
                 max_total_chars=resolve_rag_max_chars(self.settings) // MAX_AGGREGATE_DOCS,
                 settings=self.settings,
             )
@@ -342,9 +412,15 @@ class RAGService:
             context = self._assemble_context(
                 chunks, scope, start_index=start_index
             )
+            gen_q = english_question or question or retrieval_query
+            gen_lang = "en" if use_translate else answer_lang
             section = await self._generate_direct_answer(
-                question, context, answer_lang, scope, context_chunks=chunks
+                gen_q, context, gen_lang, scope, context_chunks=chunks
             )
+            if use_translate and answer_lang == "ru":
+                section = await translate_answer_to_russian(
+                    self.llm_client, section, question or retrieval_query
+                )
             index_to_doc = {
                 start_index + i: doc_id
                 for i in range(len(chunks))

@@ -92,6 +92,9 @@ CHEM_SYMBOL_RE = re.compile(
 PROPER_NOUN_PHRASE_RE = re.compile(
     r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b"
 )
+CYRILLIC_PROPER_NOUN_RE = re.compile(
+    r"(?<![а-яёА-ЯЁ])([А-ЯЁ][а-яё]{2,}(?:\s+[А-ЯЁ][а-яё]{2,}){0,3})(?![а-яёА-ЯЁ])"
+)
 HYPHEN_TERM_RE = re.compile(r"\b[A-Za-z]+(?:-[A-Za-z0-9]+)+\b")
 TECH_SHORT_TERMS = frozenset({
     "ph", "zn", "ni", "cu", "au", "ag", "fe", "al", "co", "mg", "na", "ca",
@@ -222,6 +225,12 @@ def extract_search_terms(query: str, *, limit: int = 16) -> list[str]:
             if len(part) >= 3:
                 push(part)
 
+    for match in CYRILLIC_PROPER_NOUN_RE.finditer(query):
+        push(match.group(1))
+        for part in match.group(1).split():
+            if len(part) >= 3:
+                push(part)
+
     for match in HYPHEN_TERM_RE.finditer(query):
         push(match.group(0))
         for part in re.split(r"[-/]", match.group(0)):
@@ -238,8 +247,21 @@ def extract_search_terms(query: str, *, limit: int = 16) -> list[str]:
         if token in TECH_SHORT_TERMS:
             push(token)
 
+    def finalize(raw_terms: list[str]) -> list[str]:
+        expanded = expand_spelling_variants(raw_terms)
+        expanded = expand_russian_morphology(expanded)
+        expanded = expand_glossary_bilingual(query, expanded)
+        deduped: list[str] = []
+        seen3: set[str] = set()
+        for t in expanded:
+            key = t.lower()
+            if key not in seen3:
+                seen3.add(key)
+                deduped.append(t)
+        return deduped[:limit]
+
     if len(terms) >= 2:
-        return expand_spelling_variants(terms[:limit])
+        return finalize(terms)
 
     extra = [t for t in tokenize(query, min_length=2) if not is_stopword(t)]
     merged: list[str] = []
@@ -250,10 +272,10 @@ def extract_search_terms(query: str, *, limit: int = 16) -> list[str]:
             seen2.add(key)
             merged.append(t)
     if merged:
-        return expand_spelling_variants(merged[:limit])
+        return finalize(merged)
 
     q = query.lower().strip()
-    return expand_spelling_variants([q[:60]]) if q else []
+    return finalize([q[:60]]) if q else []
 
 
 def is_name_question(query: str) -> bool:
@@ -291,6 +313,66 @@ def expand_spelling_variants(terms: list[str]) -> list[str]:
             seen.add(alt)
             out.append(alt)
     return out
+
+
+def _russian_prefix_stems(token: str) -> list[str]:
+    """Prefix stems catch inflected forms (обогащение/обогащения/обогащению)."""
+    if not CYRILLIC_RE.search(token):
+        return []
+    t = token.lower().replace("ё", "е")
+    if len(t) < 5:
+        return []
+    stems: list[str] = []
+    for n in (4, 5, 6):
+        if len(t) >= n + 2:
+            stem = t[:n]
+            if stem not in stems:
+                stems.append(stem)
+    return stems
+
+
+def expand_russian_morphology(terms: list[str]) -> list[str]:
+    """Add Cyrillic prefix stems for Neo4j CONTAINS keyword recall."""
+    out = list(terms)
+    seen = {t.lower() for t in terms}
+    for term in terms:
+        for stem in _russian_prefix_stems(term):
+            if stem not in seen:
+                seen.add(stem)
+                out.append(stem)
+    return out
+
+
+def expand_glossary_bilingual(query: str, terms: list[str]) -> list[str]:
+    """Add RU+EN glossary aliases when the query mentions a known domain term."""
+    from domain.entity_glossary import _ENTRIES, find_glossary_terms_in_text
+
+    out = list(terms)
+    seen = {t.lower() for t in terms}
+    for _key, ru, en in find_glossary_terms_in_text(query, frozenset(_ENTRIES.keys())):
+        for variant in (ru, en):
+            for piece in re.split(r"[\s/\-]+", variant):
+                v = piece.strip().lower()
+                if len(v) >= 2 and v not in seen:
+                    seen.add(v)
+                    out.append(v)
+            phrase = variant.strip().lower()
+            if len(phrase) >= 4 and phrase not in seen:
+                seen.add(phrase)
+                out.append(phrase)
+    return out
+
+
+def term_matches_text(term: str, text_lower: str) -> bool:
+    """Lexical hit: exact token or Russian prefix stem."""
+    if not term or not text_lower:
+        return False
+    if term in text_lower:
+        return True
+    for stem in _russian_prefix_stems(term):
+        if stem in text_lower:
+            return True
+    return False
 
 
 def extract_numeric_anchors(query: str) -> list[str]:

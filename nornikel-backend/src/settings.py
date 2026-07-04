@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     embedding_base_url: str = "http://localhost:11434/v1"
     embedding_model: str = "mxbai-embed-large"
     embedding_dimensions: int = 1024
+
+    # Russian RAG: translate question→EN for search, answer in EN, translate answer→RU
+    rag_ru_translate_pipeline: bool = True
     
     # Application
     log_level: str = "INFO"

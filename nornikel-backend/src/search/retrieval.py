@@ -8,7 +8,7 @@ import math
 import re
 from dataclasses import dataclass, field
 
-from search.query_processing import HARM_TERMS, YEAR_RE, QueryIntent, analyze_intent, significant_terms
+from search.query_processing import HARM_TERMS, YEAR_RE, QueryIntent, analyze_intent, significant_terms, term_matches_text
 
 from search.reranker import rerank_chunks
 
@@ -125,7 +125,7 @@ def _title_relevance_boost(intent: QueryIntent, chunk: RetrievedChunk) -> float:
     if not chunk.title:
         return 0.0
     title_lower = chunk.title.lower()
-    hits = sum(1 for term in intent.content_terms if term in title_lower)
+    hits = sum(1 for term in intent.content_terms if term_matches_text(term, title_lower))
     return min(0.25, 0.08 * hits)
 
 
@@ -150,7 +150,7 @@ def _lexical_score(terms: list[str], text: str, idf: dict[str, float]) -> float:
         return 0.0
     lower = text.lower()
     total_idf = sum(idf.get(t, 1.0) for t in terms) or 1.0
-    hit_idf = sum(idf.get(t, 1.0) for t in terms if t in lower)
+    hit_idf = sum(idf.get(t, 1.0) for t in terms if term_matches_text(t, lower))
     return hit_idf / total_idf
 
 

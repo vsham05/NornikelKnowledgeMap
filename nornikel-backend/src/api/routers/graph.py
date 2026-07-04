@@ -482,7 +482,7 @@ async def health_check(graph_db: GraphDB = Depends(get_graph_db)):
             return {
                 "status": "healthy",
                 "neo4j": "connected",
-                "test_query": result["n"]
+                "ping": result["n"],
             }
     except Exception as e:
         logger.error(f"Neo4j health check failed: {e}")
