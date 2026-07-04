@@ -15,7 +15,7 @@ from search.query_processing import (
 
 logger = logging.getLogger(__name__)
 
-REWRITE_SYSTEM = """You help search a scientific/mining/metallurgy document knowledge base (Russian and English).
+REWRITE_SYSTEM = """You help search a scientific and engineering R&D document knowledge base (Russian and English).
 Given a user question, produce search terms that will retrieve passages with NUMERIC data.
 
 Reply with JSON only:
@@ -39,14 +39,14 @@ class RewrittenQuery:
 
 
 def should_skip_llm_rewrite(question: str) -> bool:
-    """Long technical questions already carry enough terms — skip rewrite for speed."""
+    """
+    Skip the rewrite LLM call — hybrid embedding+keyword retrieval handles long queries.
+    Only very short/vague questions get an LLM rewrite.
+    """
     q = question.strip()
-    if len(q) < 70:
+    if len(q) < 28:
         return False
-    terms = significant_terms(q)
-    if re.search(r"\d", q) and len(terms) >= 6:
-        return True
-    return len(terms) >= 10
+    return True
 
 
 def _heuristic_rewrite(question: str) -> RewrittenQuery:
@@ -97,7 +97,7 @@ async def rewrite_query_for_retrieval(llm_client, question: str) -> RewrittenQue
         return _heuristic_rewrite("")
 
     if should_skip_llm_rewrite(question):
-        logger.info("Query rewrite: heuristic (long technical question)")
+        logger.info("Query rewrite: heuristic (embedding retrieval handles this query)")
         return _heuristic_rewrite(question)
 
     try:

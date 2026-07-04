@@ -11,6 +11,7 @@ from infra.llm_refusal import is_llm_refusal, wrap_yandex_extraction_user
 from infra.local_models import local_ingest_profile, resolve_local_model_tier
 from infra.llm_runtime import get_effective_llm_provider, get_llm_provider, get_local_model
 from infra.llm_runtime import get_yandex_model as runtime_yandex_model
+from infra.yandex_health import is_yandex_failure, mark_yandex_unusable
 from ingestion.nlp.extraction_language import extraction_language_instruction
 from settings import Settings
 
@@ -36,7 +37,8 @@ JSON_SYSTEM_PROMPT = (
 )
 
 YANDEX_JSON_SYSTEM_PROMPT = (
-    "Ты — компонент извлечения структурированных данных из научных PDF (R&D, металлургия). "
+    "Ты — компонент извлечения структурированных данных из научно-технических PDF "
+    "(любая область R&D: геология, геотехника, материаловедение, металлургия, моделирование и т.д.). "
     "Ответь ТОЛЬКО валидным JSON без markdown. "
     "Все строковые поля пиши на языке исходного текста (русский или английский). "
     'Если данных нет: {"materials":[],"experiments":[]}.'
@@ -62,14 +64,15 @@ def extraction_json_system_prompt(target_lang: str = "auto", *, provider: str | 
     empty_json = '{"materials":[],"experiments":[]}'
     if use_yandex:
         return (
-            "Ты — компонент извлечения структурированных данных из научных PDF (R&D, металлургия). "
+            "Ты — компонент извлечения структурированных данных из научно-технических PDF "
+            "(любая область R&D). "
             "Ответь ТОЛЬКО валидным JSON без markdown. "
             f"{lang_rule} "
             f"{keys_rule} "
             f"Если данных нет: {empty_json}."
         )
     return (
-        "You extract structured scientific data for a mining/metallurgy knowledge graph. "
+        "You extract structured scientific and engineering data from R&D documents (any domain). "
         "Reply with ONLY valid JSON. No markdown. "
         f"{lang_rule} "
         f"{keys_rule} "
@@ -137,29 +140,58 @@ class LLMClient:
         provider: str | None = None,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        _allow_yandex_fallback: bool = True,
     ) -> str:
+        provider = provider or get_effective_llm_provider()
         client = self._get_client(provider)
         bind_kwargs: dict = {"temperature": temperature}
         if max_tokens is not None:
             bind_kwargs["max_tokens"] = max_tokens
         if json_mode:
             bind_kwargs["response_format"] = {"type": "json_object"}
+        if provider == "local" and "qwen3" in get_local_model().lower():
+            # Qwen3 thinking tokens waste output budget and hurt JSON extraction.
+            bind_kwargs["extra_body"] = {"think": False}
         llm = client.bind(**bind_kwargs)
-        response = await llm.ainvoke(messages)
-        return normalize_llm_content(response.content)
+        try:
+            response = await llm.ainvoke(messages)
+            return normalize_llm_content(response.content)
+        except Exception as exc:
+            if (
+                provider == "yandex"
+                and _allow_yandex_fallback
+                and self.settings.llm_yandex_fallback_local
+                and is_yandex_failure(exc)
+            ):
+                mark_yandex_unusable(str(exc))
+                logger.warning(
+                    "Yandex invoke failed (%s); falling back to local LLM (%s)",
+                    exc,
+                    get_local_model(),
+                )
+                return await self._invoke(
+                    messages,
+                    temperature=temperature,
+                    provider="local",
+                    max_tokens=max_tokens,
+                    json_mode=json_mode,
+                    _allow_yandex_fallback=False,
+                )
+            raise
 
     async def chat(
         self,
         user_message: str,
         system_message: str | None = None,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         messages: list = []
         if system_message:
             messages.append(SystemMessage(content=system_message))
         messages.append(HumanMessage(content=user_message))
         temp = 0.1 if temperature is None else temperature
-        return await self._invoke(messages, temperature=temp)
+        return await self._invoke(messages, temperature=temp, max_tokens=max_tokens)
 
     @staticmethod
     def is_context_overflow(exc: BaseException) -> bool:

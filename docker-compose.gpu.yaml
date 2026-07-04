@@ -1,12 +1,3 @@
-# Optional NVIDIA GPU for Ollama
-# docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml --env-file .env.docker up -d --build
-
-services:
-  ollama:
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+# Legacy overlay — GPU settings are now in docker-compose.yaml (required).
+# Kept so old scripts passing -f docker-compose.gpu.yaml still work.
+services: {}

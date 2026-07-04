@@ -7,6 +7,10 @@ from functools import lru_cache
 
 from domain.enums import MaterialClass, MaterialProcessStage, MaterialState
 from domain.ontology import MaterialClassSchema, get_ontology
+from ingestion.nlp.extraction_validate import (
+    classify_non_material_entity,
+    looks_like_concept_not_material,
+)
 
 _CLASS_PRIORITY: dict[MaterialClass, int] = {
     MaterialClass.OTHER: 0,
@@ -208,8 +212,8 @@ class MaterialTaxonomy:
 
     def prompt_block(self) -> str:
         lines = [
-            "MATERIAL CLASSES (process-stream taxonomy — use exactly one per material):",
-            "  Stage: Feedstock → Beneficiation → Processing → Product / Engineering",
+            "MATERIAL CLASSES (optional taxonomy — pick the best fit per substance; use other if none apply):",
+            "  Stages cover process streams and engineered materials: Feedstock → Beneficiation → Processing → Product / Engineering",
         ]
         stage_order = [
             MaterialProcessStage.FEEDSTOCK,
@@ -234,8 +238,8 @@ class MaterialTaxonomy:
         lines.append(f"  Allowed material_class values (pick exactly ONE per material): {allowed}")
         lines.append("  Return each material as a separate JSON object — never combine names with | or /.")
         lines.append(
-            "  name = specific substance (nickel, copper matte, gypsum, catholyte) — "
-            "NEVER put class labels (ore, concentrate, intermediate, metal, alloy) in name."
+            "  name = specific substance (granite, clay, steel, nickel, gypsum, sulfuric acid) — "
+            "NEVER put class labels (ore, concentrate, rock, soil, metal, alloy) in name."
         )
         return "\n".join(lines)
 
@@ -300,7 +304,13 @@ def is_generic_class_label(name: str) -> bool:
 
 
 def is_valid_material_name(name: str) -> bool:
-    return not is_generic_class_label(name)
+    if is_generic_class_label(name):
+        return False
+    if classify_non_material_entity(name):
+        return False
+    if looks_like_concept_not_material(name):
+        return False
+    return True
 
 
 @lru_cache(maxsize=1)

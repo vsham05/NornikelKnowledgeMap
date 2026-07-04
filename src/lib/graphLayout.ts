@@ -10,7 +10,7 @@ import {
 } from "@/lib/graph";
 import { deduplicateGraphEntities } from "@/lib/graphDedup";
 
-type LayoutNode = GraphNode & {
+export type LayoutNode = GraphNode & {
   x?: number;
   y?: number;
   fx?: number;
@@ -192,7 +192,7 @@ function layoutCompactGrid(
     ];
   }
 
-  const cols = Math.max(1, Math.ceil(Math.sqrt(nodes.length * 1.35)));
+  const cols = Math.max(1, Math.ceil(Math.sqrt(nodes.length * 0.82)));
   const rows = Math.ceil(nodes.length / cols);
   const clusterId = `${hubId}:${type}`;
 
@@ -214,7 +214,7 @@ function layoutCompactGrid(
 }
 
 function gridFootprint(count: number, step: number): { cols: number; rows: number; halfW: number; halfH: number } {
-  const cols = Math.max(1, Math.ceil(Math.sqrt(count * 1.35)));
+  const cols = Math.max(1, Math.ceil(Math.sqrt(count * 0.82)));
   const rows = Math.ceil(count / cols);
   return {
     cols,
@@ -390,7 +390,7 @@ function layoutHubEntitiesRadialMap(
 
   if (materials.length > 0) {
     const matAngle = slotAngleDeg("material");
-    if (materials.length <= 36) {
+    if (materials.length <= 6) {
       const ringR = minGridInnerRadius() + step * 1.2;
       const arcSpan = Math.min(Math.PI * 1.1, (materials.length * step) / Math.max(ringR, step));
       const centerAngle = (matAngle * Math.PI) / 180;
@@ -1064,13 +1064,16 @@ export function prepareForceGraphLayout(
 
   const docs = nodes.filter((n) => n.type === "article");
   if (docs.length > 0 && docs.length === nodes.length && links.length === 0) {
-    const hubRadii = new Map(docs.map((d) => [d.id, CAPSULE_RING_R + 80]));
-    const docPositions = placeDocumentsOnCircle(docs, hubRadii);
-    const positioned: LayoutNode[] = docs.map((doc) => {
-      const { x, y } = docPositions.get(doc.id)!;
+    const cols = Math.ceil(Math.sqrt(docs.length));
+    const rows = Math.ceil(docs.length / cols);
+    const positioned: LayoutNode[] = docs.map((doc, i) => {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = (col - (cols - 1) / 2) * 280;
+      const y = (row - (rows - 1) / 2) * 280;
       return {
         ...doc,
-        val: doc.val ?? 12,
+        val: doc.val ?? 14,
         x,
         y,
         fx: x,
@@ -1197,4 +1200,149 @@ export function filterGraphByDocumentExpansion(
   });
 
   return { nodes, links: visibleLinks };
+}
+
+/** Shift layout so a specific node sits at the origin (screen center after centerAt). */
+export function centerLayoutOnNode<
+  T extends { id: string; x?: number; y?: number; fx?: number; fy?: number },
+>(nodes: T[], nodeId: string): T[] {
+  const anchor = nodes.find((n) => n.id === nodeId);
+  if (!anchor || anchor.x == null || anchor.y == null) return nodes;
+  const ox = anchor.x;
+  const oy = anchor.y;
+  return nodes.map((n) => {
+    if (n.x == null || n.y == null) return n;
+    const out: T = { ...n, x: n.x - ox, y: n.y - oy };
+    if (n.fx != null) out.fx = n.fx - ox;
+    if (n.fy != null) out.fy = n.fy - oy;
+    return out;
+  });
+}
+
+/** Shift layout so the visible subgraph is centered at the origin (better zoom-to-fit). */
+export function recenterLayoutNodes<T extends { x?: number; y?: number; fx?: number; fy?: number }>(
+  nodes: T[]
+): T[] {
+  const positioned = nodes.filter((n) => n.x != null && n.y != null);
+  if (positioned.length === 0) return nodes;
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const n of positioned) {
+    minX = Math.min(minX, n.x!);
+    maxX = Math.max(maxX, n.x!);
+    minY = Math.min(minY, n.y!);
+    maxY = Math.max(maxY, n.y!);
+  }
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  if (Math.abs(cx) < 1 && Math.abs(cy) < 1) return nodes;
+
+  return nodes.map((n) => {
+    if (n.x == null || n.y == null) return n;
+    const x = n.x - cx;
+    const y = n.y - cy;
+    const out: T = { ...n, x, y };
+    if (n.fx != null) out.fx = n.fx - cx;
+    if (n.fy != null) out.fy = n.fy - cy;
+    return out;
+  });
+}
+
+/** Compact local layout for Q&A query-focus (avoids hub-scale coordinates). */
+export function layoutQueryFocusNodes(
+  nodes: GraphNode[],
+  primaryIds?: Set<string>,
+  chainLinks?: GraphEdge[]
+): LayoutNode[] {
+  if (nodes.length === 0) return [];
+
+  const stripLayout = (node: GraphNode, x: number, y: number): LayoutNode => ({
+    ...node,
+    x,
+    y,
+    fx: x,
+    fy: y,
+    layoutRole: undefined,
+    clusterId: undefined,
+    clusterType: undefined,
+    clusterCx: undefined,
+    clusterCy: undefined,
+    clusterSize: undefined,
+  });
+
+  const ordered = orderNodesAlongChain(nodes, chainLinks);
+  if (ordered.length >= 2) {
+    const count = ordered.length;
+    const radius = Math.max(90, Math.min(220, 40 + count * 14));
+    return ordered.map((node, i) => {
+      const angle = (2 * Math.PI * i) / count - Math.PI / 2;
+      const isPrimary = primaryIds?.has(node.id);
+      const r = isPrimary ? radius * 0.68 : radius;
+      const x = Math.cos(angle) * r;
+      const y = Math.sin(angle) * r;
+      return stripLayout(node, x, y);
+    });
+  }
+
+  const sorted = [...nodes].sort((a, b) => {
+    const ap = primaryIds?.has(a.id) ? 0 : 1;
+    const bp = primaryIds?.has(b.id) ? 0 : 1;
+    if (ap !== bp) return ap - bp;
+    return (a.name ?? a.id).localeCompare(b.name ?? b.id);
+  });
+
+  const count = sorted.length;
+  const radius = Math.max(56, Math.min(140, 32 * Math.sqrt(count)));
+
+  return sorted.map((node, i) => {
+    const angle = (2 * Math.PI * i) / count - Math.PI / 2;
+    const isPrimary = primaryIds?.has(node.id);
+    const r = isPrimary ? radius * 0.55 : radius;
+    const x = Math.cos(angle) * r;
+    const y = Math.sin(angle) * r;
+    return stripLayout(node, x, y);
+  });
+}
+
+function orderNodesAlongChain(
+  nodes: GraphNode[],
+  links: GraphEdge[] | undefined
+): GraphNode[] {
+  if (!links?.length || nodes.length < 2) return [];
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const degree = new Map<string, number>();
+  const adj = new Map<string, string[]>();
+
+  for (const link of links) {
+    const a = String(link.source);
+    const b = String(link.target);
+    if (!byId.has(a) || !byId.has(b)) continue;
+    adj.set(a, [...(adj.get(a) ?? []), b]);
+    adj.set(b, [...(adj.get(b) ?? []), a]);
+    degree.set(a, (degree.get(a) ?? 0) + 1);
+    degree.set(b, (degree.get(b) ?? 0) + 1);
+  }
+  if (adj.size === 0) return [];
+
+  let start = [...degree.entries()].find(([, d]) => d === 1)?.[0];
+  if (!start) start = nodes[0]?.id;
+  if (!start) return [];
+
+  const ordered: GraphNode[] = [];
+  const seen = new Set<string>();
+  let cur: string | undefined = start;
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const node = byId.get(cur);
+    if (node) ordered.push(node);
+    const next: string | undefined = (adj.get(cur) ?? []).find((nb) => !seen.has(nb));
+    cur = next;
+  }
+  for (const node of nodes) {
+    if (!seen.has(node.id)) ordered.push(node);
+  }
+  return ordered;
 }

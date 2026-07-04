@@ -37,7 +37,7 @@ const enTree: MessageTree = {
     hybridYandex: "Yandex API (auto — large PDF)",
     hybridLocal: "Local Qwen (auto — small PDF)",
     unavailable: "Could not load model settings",
-    backendOffline: "Run start-docker.bat to start the full Docker stack",
+    backendOffline: "Run ./start-docker.sh or start-docker.bat to start the Docker stack",
     yandexNotConfigured: "Set YANDEX_API_KEY and YANDEX_FOLDER_ID in backend .env",
     switchFailed: "Failed to switch model",
     yandexModel: "Yandex model",
@@ -45,12 +45,12 @@ const enTree: MessageTree = {
   },
   header: {
     title: "R&D Knowledge Map",
-    subtitle: "Mining & metallurgy · Neo4j graph · Qdrant RAG · provenance & geography",
+    subtitle: "Scientific documents · Neo4j knowledge graph · Qdrant RAG · experiments & provenance",
     backendConnected: "Backend connected",
     backendProcessing: "Processing document…",
     backendOffline: "Backend offline",
     backendHint:
-      "Run start-docker.bat (Docker Desktop) to search and ingest documents.",
+      "Run ./start-docker.sh (Linux/macOS) or start-docker.bat (Windows) to search and ingest.",
   },
   search: {
     placeholder: "Search your knowledge base…",
@@ -60,6 +60,9 @@ const enTree: MessageTree = {
     backendDisconnected:
       "Backend is not connected. Start Docker and the FastAPI server.",
     disambiguation: "Multiple documents match — pick one:",
+    blockedDuringIngest:
+      "Questions are disabled while a document is processing. Wait for ingest to finish, then search.",
+    placeholderIngest: "Wait for document processing to finish…",
   },
   documentFilter: {
     aria: "Filter by document",
@@ -84,10 +87,19 @@ const enTree: MessageTree = {
     teams: "Teams",
     live: "Live · Neo4j",
     backendOffline: "Backend offline",
-    highlight: "Highlight {label} in graph",
+    highlight: "Highlight {label} in graph · open browse list",
     completed: "completed",
     ongoing: "ongoing",
     planned: "planned",
+  },
+  entityBrowse: {
+    title: "All {label}",
+    searchPlaceholder: "Search by name…",
+    noResults: "No matches for this search.",
+    showing: "Showing {shown} of {total}",
+    loadMore: "Load more",
+    loadingMore: "Loading…",
+    close: "Close browse panel",
   },
   upload: {
     title: "Ingest documents",
@@ -340,7 +352,7 @@ const ruTree: MessageTree = {
     hybridYandex: "Yandex API (авто — большой PDF)",
     hybridLocal: "Локальный Qwen (авто — малый PDF)",
     unavailable: "Не удалось загрузить настройки модели",
-    backendOffline: "Запустите start-docker.bat для полного Docker-стека",
+    backendOffline: "Запустите ./start-docker.sh или start-docker.bat для Docker-стека",
     yandexNotConfigured: "Укажите YANDEX_API_KEY и YANDEX_FOLDER_ID в .env бэкенда",
     switchFailed: "Не удалось переключить модель",
     yandexModel: "Модель Yandex",
@@ -348,12 +360,12 @@ const ruTree: MessageTree = {
   },
   header: {
     title: "Карта знаний НИОКР",
-    subtitle: "Горная металлургия · граф Neo4j · Qdrant RAG · происхождение и география",
+    subtitle: "Научные документы · граф знаний Neo4j · Qdrant RAG · эксперименты и источники",
     backendConnected: "Бэкенд подключён",
     backendProcessing: "Обработка документа…",
     backendOffline: "Бэкенд недоступен",
     backendHint:
-      "Запустите start-docker.bat (Docker Desktop) для поиска и загрузки документов.",
+      "Запустите ./start-docker.sh (Linux/macOS) или start-docker.bat (Windows) для поиска и загрузки.",
   },
   search: {
     placeholder: "Поиск по базе знаний…",
@@ -363,6 +375,9 @@ const ruTree: MessageTree = {
     backendDisconnected:
       "Бэкенд не подключён. Запустите Docker и сервер FastAPI.",
     disambiguation: "Найдено несколько документов — выберите один:",
+    blockedDuringIngest:
+      "Вопросы недоступны, пока идёт обработка документа. Дождитесь окончания индексации.",
+    placeholderIngest: "Дождитесь окончания обработки документа…",
   },
   documentFilter: {
     aria: "Фильтр по документу",
@@ -387,10 +402,20 @@ const ruTree: MessageTree = {
     teams: "Команды",
     live: "Онлайн · Neo4j",
     backendOffline: "Бэкенд недоступен",
-    highlight: "Подсветить {label} на графе",
+    highlight: "Подсветить {label} на графе · открыть список",
+    browse: "Просмотр и поиск: все {label}",
     completed: "завершено",
     ongoing: "в работе",
     planned: "запланировано",
+  },
+  entityBrowse: {
+    title: "Все: {label}",
+    searchPlaceholder: "Поиск по названию…",
+    noResults: "Ничего не найдено.",
+    showing: "Показано {shown} из {total}",
+    loadMore: "Загрузить ещё",
+    loadingMore: "Загрузка…",
+    close: "Закрыть список",
   },
   upload: {
     title: "Загрузка документов",

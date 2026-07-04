@@ -129,8 +129,8 @@ async def _translate_strings_batch(
 
     lang_label = "Russian" if target_lang == "ru" else "English"
     payload = {"items": [{"id": i, "text": text} for i, text in enumerate(strings)]}
-    prompt = f"""Translate each "text" field into {lang_label} for a mining/metallurgy R&D knowledge graph.
-Preserve technical meaning, numbers, and units. Use terminology appropriate for hydrometallurgy / pyrometallurgy documents.
+    prompt = f"""Translate each "text" field into {lang_label} for a scientific/engineering R&D knowledge graph.
+Preserve technical meaning, numbers, and units. Use domain-appropriate terminology from the source field.
 Keep chemical formulas (Fe2O3, H2SO4) and element symbols unchanged.
 
 Return ONLY valid JSON in this exact shape:

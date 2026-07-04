@@ -24,7 +24,10 @@ export function filterNodesForLayout(
     return { nodes: articles, links: [] };
   }
 
-  const keep = new Set<string>(articles.map((a) => a.id));
+  const keep = new Set<string>();
+  for (const article of articles) {
+    keep.add(article.id);
+  }
 
   for (const node of nodes) {
     if (node.type === "article") continue;

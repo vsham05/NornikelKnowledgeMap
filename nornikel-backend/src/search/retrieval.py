@@ -389,7 +389,7 @@ class HybridRetriever:
                 document_ids=document_ids,
             )
         except Exception as exc:
-            logger.warning("Vector retrieval failed: %s", exc)
+            logger.warning("Vector retrieval failed for %r: %s", query[:80], exc)
             return []
 
         hits = []

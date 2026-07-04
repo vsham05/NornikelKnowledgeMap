@@ -1,11 +1,11 @@
 "use client";
 
 import { useState, useCallback, useEffect, useRef, useMemo, type Dispatch, type SetStateAction } from "react";
-import dynamic from "next/dynamic";
 import { SearchBar } from "@/components/SearchBar";
 import { ExperimentCard } from "@/components/ExperimentCard";
 import { Timeline } from "@/components/Timeline";
 import { EntityPanel } from "@/components/EntityPanel";
+import { EntityBrowsePanel } from "@/components/EntityBrowsePanel";
 import { StatsBar } from "@/components/StatsBar";
 import { DocumentUpload } from "@/components/DocumentUpload";
 import { DocumentFilter, type DocumentOption } from "@/components/DocumentFilter";
@@ -38,17 +38,7 @@ import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ModelSwitcher } from "@/components/ModelSwitcher";
 import { useI18n } from "@/lib/i18n/I18nProvider";
 
-const GraphView = dynamic(
-  () => import("@/components/GraphView").then((m) => m.GraphView),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="flex min-h-[420px] items-center justify-center rounded-xl border border-slate-700/60 bg-slate-950/40 text-sm text-slate-500">
-        Loading graph…
-      </div>
-    ),
-  }
-);
+import { GraphView } from "@/components/GraphView";
 
 type PanelSnapshot = {
   selectedNodeId: string;
@@ -94,6 +84,7 @@ export function Dashboard() {
   const [expandedTypeKeys, setExpandedTypeKeys] = useState<Set<string>>(() => new Set());
   const [expandingTypeKey, setExpandingTypeKey] = useState<string | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const graphRef = useRef<HTMLDivElement>(null);
   const entityDedupeDoneRef = useRef(false);
   const loadedDocSummariesRef = useRef<Set<string>>(new Set());
   const loadedTypeKeysRef = useRef<Set<string>>(new Set());
@@ -118,7 +109,31 @@ export function Dashboard() {
     };
   }, []);
 
+  useEffect(() => {
+    const syncIngestActive = async () => {
+      try {
+        const status = await backendApi.ingestActive();
+        setIngestActive(status.active);
+      } catch {
+        /* backend offline */
+      }
+    };
+    void syncIngestActive();
+    const interval = window.setInterval(syncIngestActive, 3000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (!graphTypeFilter || panelEntity) return;
+    if (typeof window !== "undefined" && window.innerWidth < 1024) {
+      requestAnimationFrame(() => {
+        panelRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      });
+    }
+  }, [graphTypeFilter, panelEntity]);
+
   const effectiveBackendOnline = backendOnline || ingestActive;
+  const searchBlocked = !backendOnline || ingestActive;
 
   const searchFocus = useMemo(
     () => computeSearchFocus(graphSnapshot.nodes, graphSnapshot.links, result),
@@ -142,6 +157,21 @@ export function Dashboard() {
       }
     },
     [locale]
+  );
+
+  const focusDocumentInGraph = useCallback(
+    (documentId: string) => {
+      setSelectedDocumentId(documentId);
+      setExpandedDocIds(new Set());
+      setExpandedTypeKeys(new Set());
+      setSelectedNodeId(null);
+      setGraphFocusDismissed(true);
+      void loadDocumentSubgraph(documentId);
+      requestAnimationFrame(() => {
+        graphRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+    },
+    [loadDocumentSubgraph]
   );
 
   const loadTypeClusterEntities = useCallback(async (docId: string, entityType: EntityType) => {
@@ -288,6 +318,10 @@ export function Dashboard() {
 
   const handleSearch = useCallback(
     async (query: string, documentId?: string) => {
+      if (ingestActive) {
+        setSearchError(t("search.blockedDuringIngest"));
+        return;
+      }
       setLoading(true);
       setHasSearched(true);
       setSearchError(null);
@@ -303,21 +337,25 @@ export function Dashboard() {
         const res = await backendSearch(
           query,
           docFilter || undefined,
-          { ...parsedToStructured(parseQuery(query)), ...structuredFilters }
+          { ...parsedToStructured(parseQuery(query)), ...structuredFilters },
+          (partial) => {
+            setResult(partial);
+            setExpandedDocIds(new Set());
+            setGraphFocusDismissed(false);
+            setSelectedExpId(null);
+            setPanelEntity(null);
+            setPanelConnections([]);
+            setPanelGroupMembers(undefined);
+            setPanelGroupMembersTotal(0);
+            setPanelBack(null);
+            setSelectedNodeId(null);
+          }
         );
         setResult(res);
         if (res.graph.nodes.length > 0) {
           setGraphSnapshot(res.graph);
         }
-        setExpandedDocIds(new Set());
-        setGraphFocusDismissed(false);
         setSelectedExpId(res.experiments[0]?.experiment.id ?? null);
-        setPanelEntity(null);
-        setPanelConnections([]);
-        setPanelGroupMembers(undefined);
-        setPanelGroupMembersTotal(0);
-        setPanelBack(null);
-        setSelectedNodeId(null);
       } catch (e) {
         setSearchError(e instanceof Error ? e.message : t("search.failed"));
         setResult(null);
@@ -325,7 +363,7 @@ export function Dashboard() {
         setLoading(false);
       }
     },
-    [refreshBackendStatus, selectedDocumentId, structuredFilters, t]
+    [ingestActive, refreshBackendStatus, selectedDocumentId, structuredFilters, t]
   );
 
   const handleDeleteDocument = useCallback(
@@ -354,14 +392,27 @@ export function Dashboard() {
     [selectedDocumentId, refreshAfterIngest, t]
   );
 
+  const handleDocumentFilterChange = useCallback(
+    (documentId: string) => {
+      if (!documentId) {
+        setSelectedDocumentId("");
+        setExpandedDocIds(new Set());
+        setExpandedTypeKeys(new Set());
+        return;
+      }
+      focusDocumentInGraph(documentId);
+    },
+    [focusDocumentInGraph]
+  );
+
   const handlePickDocument = useCallback(
     (documentId: string) => {
-      setSelectedDocumentId(documentId);
+      focusDocumentInGraph(documentId);
       if (lastQuery.trim()) {
         void handleSearch(lastQuery, documentId);
       }
     },
-    [lastQuery, handleSearch]
+    [lastQuery, handleSearch, focusDocumentInGraph]
   );
 
   const handleCollapseDocumentGraph = useCallback((documentId: string) => {
@@ -676,7 +727,14 @@ export function Dashboard() {
             </div>
           </div>
 
-          {!effectiveBackendOnline && (
+          {ingestActive && (
+            <div className="mb-4 flex items-start gap-2 rounded-lg border border-cyan-500/30 bg-cyan-950/20 px-4 py-3 text-sm text-cyan-100">
+              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin" />
+              <p>{t("search.blockedDuringIngest")}</p>
+            </div>
+          )}
+
+          {!effectiveBackendOnline && !ingestActive && (
             <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-950/20 px-4 py-3 text-sm text-amber-200">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
               <p>{t("header.backendHint")}</p>
@@ -687,14 +745,19 @@ export function Dashboard() {
             <DocumentFilter
               documents={documents}
               value={selectedDocumentId}
-              onChange={setSelectedDocumentId}
+              onChange={handleDocumentFilterChange}
               onDelete={effectiveBackendOnline ? handleDeleteDocument : undefined}
               disabled={!effectiveBackendOnline}
               loading={loading}
             />
           </div>
 
-          <SearchBar onSearch={handleSearch} loading={loading} disabled={!effectiveBackendOnline} />
+          <SearchBar
+            onSearch={handleSearch}
+            loading={loading}
+            disabled={searchBlocked}
+            placeholder={ingestActive ? t("search.placeholderIngest") : undefined}
+          />
 
           <div className="mt-3">
             <QueryFilters
@@ -745,7 +808,7 @@ export function Dashboard() {
       </header>
 
       <main className="mx-auto flex w-full max-w-[1600px] flex-1 flex-col gap-4 p-6 lg:flex-row">
-        <section className="flex min-h-[420px] flex-1 flex-col gap-4 lg:min-h-0">
+        <section className="flex min-w-0 flex-1 flex-col gap-4">
           {result?.narrative && (
             <div className="flex items-start gap-3 rounded-xl border border-cyan-500/20 bg-cyan-950/20 p-4">
               <MessageSquareQuote className="mt-0.5 h-5 w-5 shrink-0 text-cyan-400" />
@@ -848,24 +911,18 @@ export function Dashboard() {
             <SourceExcerpts sources={result.sources} />
           )}
 
-          <div className="flex min-h-[min(68vh,720px)] flex-1 flex-col">
-            <div className="mb-2 flex items-center justify-between gap-2">
-              <p className="text-xs text-slate-500">
-                {t("graph.caption")}
-              </p>
-            </div>
-            <div className="min-h-[420px] flex-1 bg-slate-950">
             <GraphView
+              containerRef={graphRef}
               nodes={displayGraph.nodes}
               links={displayGraph.links}
               onNodeClick={handleNodeClick}
               onDocumentExpand={loadDocumentSubgraph}
               onTypeClusterExpand={loadTypeClusterEntities}
               onDocumentCollapse={handleDocumentCollapse}
-              highlightId={selectedNodeId ?? selectedExpId ?? selectedDocumentId ?? undefined}
+              highlightId={selectedDocumentId || selectedNodeId || selectedExpId || undefined}
               emptyMessage={graphEmptyMessage}
               typeFilter={graphTypeFilter}
-              focusNodeId={selectedNodeId ?? selectedDocumentId ?? undefined}
+              selectedDocumentId={selectedDocumentId || undefined}
               expandingDocId={expandingDocId}
               expandingTypeKey={expandingTypeKey}
               expandedDocIds={expandedDocIds}
@@ -875,15 +932,13 @@ export function Dashboard() {
               searchFocus={graphFocusDismissed ? null : searchFocus}
               onDismissSearchFocus={() => setGraphFocusDismissed(true)}
             />
-            </div>
-          </div>
         </section>
 
         <aside className="flex w-full flex-col gap-4 lg:w-[400px] lg:shrink-0">
           <div
             ref={panelRef}
             className={
-              panelEntity
+              panelEntity || graphTypeFilter
                 ? "h-[320px] lg:h-auto lg:min-h-[200px]"
                 : "hidden lg:block lg:min-h-0"
             }
@@ -920,6 +975,14 @@ export function Dashboard() {
                   setPanelGroupMembersLoading(false);
                   setPanelBack(null);
                   setSelectedNodeId(null);
+                }}
+              />
+            ) : graphTypeFilter ? (
+              <EntityBrowsePanel
+                entityType={graphTypeFilter}
+                onClose={() => setGraphTypeFilter(null)}
+                onSelectNode={(node) => {
+                  void handleNodeClick(node);
                 }}
               />
             ) : (

@@ -340,54 +340,13 @@ function documentGraphFromExplore(graph: BackendGraph): {
   return backendGraphToFrontend(graph);
 }
 
-export async function backendSearch(
+function buildSearchResultFromRag(
   query: string,
-  documentId?: string,
-  structuredFilters?: StructuredFilters
-): Promise<SearchResult> {
-  const parsed = parseQuery(query);
-  const structured = {
-    ...structuredToBackend(parsedToStructured(parsed)),
-    ...structuredToBackend(structuredFilters ?? {}),
-  };
-  const cleanStructured = Object.fromEntries(
-    Object.entries(structured).filter(([, v]) => v != null && v !== "")
-  );
-
-  const materialName = structuredFilters?.material ?? parsed.material;
-
-  const [rag, graphSearch, materialExps, explore, structuredHits] = await Promise.all([
-    backendApi.ragSearch(query, documentId, cleanStructured).catch(() => null),
-    backendApi.graphSearch(query, 8).catch(() => ({ query, results: [], count: 0 })),
-    materialName
-      ? backendApi.experimentsByMaterial(materialName).catch(() => ({ experiments: [], count: 0 }))
-      : Promise.resolve({ experiments: [], count: 0 }),
-    backendApi.exploreGraph(documentId ? GRAPH_DOCUMENT_LIMIT : GRAPH_OVERVIEW_LIMIT, documentId).catch(() => null),
-    Object.keys(cleanStructured).length
-      ? backendApi.structuredQuery(cleanStructured).catch(() => null)
-      : Promise.resolve(null),
-  ]);
-
-  const experiments: ExperimentResult[] = (materialExps.experiments ?? []).map(
-    backendExperimentToResult
-  );
-
-  const graph = explore ? documentGraphFromExplore(explore) : { nodes: [], links: [] };
-
-  const graphMatchIds = (graphSearch.results ?? [])
-    .map((r) => r.id)
-    .filter((id): id is string => Boolean(id));
-
-  const structuredExperiments = (structuredHits?.experiments ?? []).map((row) => ({
-    experiment_id: row.experiment_id as string | undefined,
-    material: row.material as string | undefined,
-    process: row.process as string | undefined,
-    regime: row.regime as string | undefined,
-    document_id: row.document_id as string | undefined,
-    document_title: row.document_title as string | undefined,
-    year: typeof row.year === "number" ? row.year : undefined,
-  }));
-
+  parsed: ParsedQuery,
+  rag: BackendRagResult | null,
+  structuredHits: { count?: number } | null = null,
+  experiments: ExperimentResult[] = []
+): SearchResult {
   const sources: import("@/lib/types").SourceExcerpt[] = (rag?.sources ?? []).map((s) => ({
     index: s.index,
     text: s.text,
@@ -400,7 +359,7 @@ export async function backendSearch(
     parsed,
     experiments,
     relatedEntities: [],
-    graph,
+    graph: { nodes: [], links: [] },
     gaps: [],
     narrative: buildNarrative(rag, experiments, structuredHits),
     sources,
@@ -420,9 +379,97 @@ export async function backendSearch(
           graphMatchCount: rag.retrieval_scope.graph_match_count,
         }
       : undefined,
-    graphMatchIds,
-    structuredExperiments,
+    graphMatchIds: [],
+    structuredExperiments: [],
   };
+}
+
+async function loadSearchEnrichment(
+  query: string,
+  documentId: string | undefined,
+  cleanStructured: Record<string, string>,
+  materialName: string | undefined
+) {
+  const [graphSearch, materialExps, explore, structuredHits] = await Promise.all([
+    backendApi.graphSearch(query, 8).catch(() => ({ query, results: [], count: 0 })),
+    materialName
+      ? backendApi.experimentsByMaterial(materialName).catch(() => ({ experiments: [], count: 0 }))
+      : Promise.resolve({ experiments: [], count: 0 }),
+    backendApi.exploreGraph(documentId ? GRAPH_DOCUMENT_LIMIT : GRAPH_OVERVIEW_LIMIT, documentId).catch(() => null),
+    Object.keys(cleanStructured).length
+      ? backendApi.structuredQuery(cleanStructured).catch(() => null)
+      : Promise.resolve(null),
+  ]);
+
+  const experiments: ExperimentResult[] = (materialExps.experiments ?? []).map(
+    backendExperimentToResult
+  );
+  const graph = explore ? documentGraphFromExplore(explore) : { nodes: [], links: [] };
+  const graphMatchIds = (graphSearch.results ?? [])
+    .map((r) => r.id)
+    .filter((id): id is string => Boolean(id));
+  const structuredExperiments = (structuredHits?.experiments ?? []).map((row) => ({
+    experiment_id: row.experiment_id as string | undefined,
+    material: row.material as string | undefined,
+    process: row.process as string | undefined,
+    regime: row.regime as string | undefined,
+    document_id: row.document_id as string | undefined,
+    document_title: row.document_title as string | undefined,
+    year: typeof row.year === "number" ? row.year : undefined,
+  }));
+
+  return { experiments, graph, graphMatchIds, structuredHits, structuredExperiments };
+}
+
+export function mergeSearchEnrichment(
+  base: SearchResult,
+  enrichment: Awaited<ReturnType<typeof loadSearchEnrichment>>
+): SearchResult {
+  const experiments =
+    enrichment.experiments.length > 0 ? enrichment.experiments : base.experiments;
+  return {
+    ...base,
+    experiments,
+    graph: enrichment.graph.nodes.length > 0 ? enrichment.graph : base.graph,
+    graphMatchIds: enrichment.graphMatchIds,
+    structuredExperiments: enrichment.structuredExperiments,
+    narrative:
+      base.narrative ||
+      (experiments.length > 0
+        ? `Found ${experiments.length} related experiment(s) in the knowledge graph.`
+        : base.narrative),
+  };
+}
+
+export async function backendSearch(
+  query: string,
+  documentId?: string,
+  structuredFilters?: StructuredFilters,
+  onRagComplete?: (partial: SearchResult) => void
+): Promise<SearchResult> {
+  const parsed = parseQuery(query);
+  const structured = {
+    ...structuredToBackend(parsedToStructured(parsed)),
+    ...structuredToBackend(structuredFilters ?? {}),
+  };
+  const cleanStructured = Object.fromEntries(
+    Object.entries(structured).filter(([, v]) => v != null && v !== "")
+  ) as Record<string, string>;
+
+  const materialName = structuredFilters?.material ?? parsed.material;
+
+  const rag = await backendApi.ragSearch(query, documentId, cleanStructured).catch(() => null);
+  const partial = buildSearchResultFromRag(query, parsed, rag);
+  onRagComplete?.(partial);
+
+  const enrichment = await loadSearchEnrichment(
+    query,
+    documentId,
+    cleanStructured,
+    materialName
+  );
+
+  return mergeSearchEnrichment(partial, enrichment);
 }
 
 function buildNarrative(

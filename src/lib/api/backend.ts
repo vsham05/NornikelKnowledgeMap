@@ -367,6 +367,28 @@ export const backendApi = {
       `/api/v1/graph/search?q=${encodeURIComponent(q)}&limit=${limit}`
     ),
 
+  browseEntities: (
+    entityType: string,
+    q?: string,
+    limit = 100,
+    offset = 0
+  ) => {
+    const params = new URLSearchParams({
+      entity_type: entityType,
+      limit: String(limit),
+      offset: String(offset),
+    });
+    if (q?.trim()) params.set("q", q.trim());
+    return backendFetch<{
+      items: Array<{ id: string; label: string; type: string }>;
+      total: number;
+      limit: number;
+      offset: number;
+      entity_label: string;
+      has_more: boolean;
+    }>(`/api/v1/graph/entities?${params.toString()}`);
+  },
+
   experimentsByMaterial: (material: string, regimeType?: string) => {
     const params = new URLSearchParams({ material });
     if (regimeType) params.set("regime_type", regimeType);
@@ -436,6 +458,11 @@ export const backendApi = {
 
   ingestStatus: (taskId: string) =>
     backendFetch<IngestTaskStatus>(`/api/v1/ingest/status/${taskId}`),
+
+  ingestActive: () =>
+    backendFetch<{ active: boolean; count: number; message: string }>(
+      "/api/v1/ingest/active"
+    ),
 
   listDocuments: () =>
     backendFetch<Array<{ id: string; title: string; file_path?: string; chunks_count?: number }>>(

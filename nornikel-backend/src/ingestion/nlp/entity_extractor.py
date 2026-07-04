@@ -153,7 +153,10 @@ class EntityExtractor:
             regime_params_text = "\n".join(regime_params_list)
         
         prompt = f"""
-Извлеки из научного текста сущности в формате JSON.
+Извлеки из научно-технического текста сущности в формате JSON.
+Документ может относиться к любой области: геология, геотехника, горное дело, металлургия, материаловедение,
+химия, экология, численное моделирование (FEM/CFD), физика, гидрология и т.д.
+Извлекай только то, что явно есть в тексте — не подставляй сущности из других предметных областей.
 
 {material_taxonomy_text}
 
@@ -210,19 +213,24 @@ class EntityExtractor:
 
 ВАЖНО:
 - material_class и state: ровно одно значение из списка (не через |)
-- name: конкретное вещество (никель, медь, гипс) — НЕ категории ore/concentrate/intermediate/metal/alloy
+- name: конкретное вещество или материал (гранит, глина, сталь, никель, серная кислота) — НЕ общие категории ore/concentrate/rock/soil (их — в material_class)
 - каждый материал — отдельный объект в массиве materials
 - Используй canonical names свойств из списка выше
 - Если свойство не в списке, но явно упомянуто — используй snake_case
 - Указывай source_text — точную цитату из текста
 - Для диапазонных значений используй value_min и value_max
 - Если значение зависит от условий — укажи conditions
+- experiments: лабораторные/полевые испытания И вычислительные исследования (FEM, моделирование) — regime_type other при отсутствии термо/хим. режима
+- Каждая строка [TABLE] с числами — отдельный experiment (зона/материал = material_name, колонки = measured_properties)
 - Если в тексте нет материалов или экспериментов — верни пустые списки
-- Перечисли каждый отдельный материал и эксперимент из текста; без дубликатов
-- Извлеки ВСЕ материалы и эксперименты из текста — полнота важнее краткого JSON
+- Перечисли каждый отдельный материал и эксперимент/расчёт из текста; без дубликатов
+- Извлеки ВСЕ материалы, эксперименты и численные результаты из текста — полнота важнее краткого JSON
 - Извлекай промышленную/мировую статистику (global production, annual output, market size) как properties материалов или reagents (например sulfuric/sulphuric acid) с canonical names global_production, annual_production — unit: million tonnes, Mt, t/y
 - Reagents и химикаты (sulfuric acid, H2SO4, ammonia, …) — отдельные materials с properties при наличии чисел
 - Блоки [TABLE]…[/TABLE] — markdown-таблицы: каждая строка = отдельная запись; не смешивай значения из разных колонок/групп; сохраняй заголовки колонок в source_text или conditions
+- ЧИСЛЕННАЯ ТОЧНОСТЬ: сохраняй все числа, единицы (MPa, GPa, kPa, Pa, %, °C), формулы и коэффициенты (E, ν, σ, μ) дословно в value и source_text
+- FEM/геотехника/моделирование: elastic_modulus, young_modulus, poisson_ratio, shear_modulus, density, cohesion, friction_angle — отдельные properties с value+unit
+- Диапазоны и «±» — value_min/value_max или conditions; не округляй и не усредняй без явного указания в тексте
 - JSON компактный: только сущности из текста, без пояснений
 - {extraction_language_instruction(resolve_extraction_language(text, self.settings.extraction_language))}
 - Ключи свойств в properties/measured_properties — snake_case на английском (nickel_content, density)

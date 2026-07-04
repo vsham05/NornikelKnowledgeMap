@@ -35,10 +35,18 @@ def resolve_context_tokens(settings: Settings) -> int:
         if info:
             return info.context_tokens
         return settings.llm_context_tokens
-    return context_tokens_for_local_model(
+
+    from infra.local_models import get_local_model_info
+
+    ctx = context_tokens_for_local_model(
         get_local_model(),
         fallback=settings.llm_context_tokens,
     )
+    info = get_local_model_info(get_local_model())
+    # Ollama often runs 8k num_ctx unless tuned — keep RAG inside a safe window.
+    if info and info.tier in ("standard", "light"):
+        ctx = min(ctx, 8192)
+    return ctx
 
 
 def resolve_rag_max_chars(settings: Settings) -> int:

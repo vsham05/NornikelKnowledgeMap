@@ -22,13 +22,15 @@ def get_llm_provider() -> LLMProvider:
 
 
 def get_effective_llm_provider() -> LLMProvider:
-    """Global provider, or per-document override set during ingest."""
+    """Global provider, per-document ingest override, or local when Yandex is down."""
     from infra.ingest_context import get_ingest_provider
+    from infra.yandex_health import yandex_usable_cached
 
     override = get_ingest_provider()
-    if override is not None:
-        return override
-    return get_llm_provider()
+    provider = override if override is not None else get_llm_provider()
+    if provider == "yandex" and not yandex_usable_cached():
+        return "local"
+    return provider
 
 
 def get_yandex_model() -> str:

@@ -63,6 +63,11 @@ class TaskStatus(BaseModel):
 _tasks: dict[str, TaskStatus] = {}
 
 
+def has_active_ingest() -> bool:
+    """True while any upload/URL ingest task is queued or running."""
+    return any(t.status in ("pending", "processing") for t in _tasks.values())
+
+
 # ================== Request/Response Models ==================
 
 class IngestUrlRequest(BaseModel):
@@ -177,6 +182,17 @@ async def ingest_url(
         status="pending",
         message=f"Processing started for {url}"
     )
+
+
+@router.get("/active")
+async def ingest_active():
+    """Whether document ingestion is in progress (blocks Q&A)."""
+    active_tasks = [t for t in _tasks.values() if t.status in ("pending", "processing")]
+    return {
+        "active": bool(active_tasks),
+        "count": len(active_tasks),
+        "message": active_tasks[0].message if active_tasks else "",
+    }
 
 
 @router.get("/status/{task_id}", response_model=TaskStatus)

@@ -1,10 +1,11 @@
 # One-command full stack — Docker only (no separate Ollama install).
 #
-#   copy .env.example .env.docker
-#   .\start-docker.bat
+#   cp .env.example .env.docker
+#   ./start-docker.sh          # Linux / macOS
+#   start-docker.bat           # Windows
 #
 # First run downloads Ollama models (~10 GB) via ollama-pull — may take 10–30 min.
-# GPU (optional): docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml --env-file .env.docker up -d --build
+# Ollama requires NVIDIA GPU (see start-docker.sh / start-docker.bat).
 
 services:
   neo4j:
@@ -62,8 +63,16 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: skg-ollama
+    gpus: all
     ports:
       - "11434:11434"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      # Offload every layer to GPU — no CPU inference fallback
+      OLLAMA_NUM_GPU: "999"
+      OLLAMA_FLASH_ATTENTION: "1"
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
@@ -76,14 +85,20 @@ services:
   ollama-pull:
     image: ollama/ollama:latest
     container_name: skg-ollama-pull
+    gpus: all
     depends_on:
       ollama:
         condition: service_healthy
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       OLLAMA_HOST: http://ollama:11434
-      OLLAMA_PULL_MODELS: ${OLLAMA_PULL_MODELS:-qwen2.5:7b-instruct,mxbai-embed-large,minicpm-v}
+      OLLAMA_PULL_MODELS: ${OLLAMA_PULL_MODELS:-qwen3:8b,mxbai-embed-large,minicpm-v}
     volumes:
       - ./scripts/docker-pull-ollama-models.sh:/pull.sh:ro
+      - ./scripts/patch-ollama-models-gpu.sh:/patch-gpu.sh:ro
+      - ./scripts/verify-ollama-gpu.sh:/verify-gpu.sh:ro
     entrypoint: ["/bin/sh", "/pull.sh"]
     restart: "no"
 

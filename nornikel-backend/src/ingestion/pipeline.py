@@ -22,7 +22,7 @@ from ingestion.parsers.pdf_table_vlm import (
     merge_table_into_chunk,
     render_region_from_file,
 )
-from ingestion.parsers.docx_parser import DOCXParser
+from ingestion.parsers.docx_parser import DOCXParser, peek_docx_page_estimate
 from ingestion.vision.vlm_analyzer import VLMAnalyzer
 from ingestion.nlp.document_enricher import DocumentEnricher
 from ingestion.nlp.material_process_linker import build_material_process_links
@@ -48,6 +48,7 @@ from infra.llm_runtime import (
     get_local_model,
     get_yandex_model,
 )
+from infra.yandex_health import check_yandex_api, yandex_credentials_configured
 from ingestion.nlp.extraction_language import resolve_extraction_language
 
 logger = logging.getLogger(__name__)
@@ -107,14 +108,15 @@ class IngestionPipeline:
         on_progress: IngestProgressCallback | None = None,
     ) -> IngestResult:
         suffix = file_path.suffix.lower()
-        page_hint = (
-            await asyncio.to_thread(peek_pdf_page_count, file_path)
-            if suffix == ".pdf"
-            else 0
-        )
+        if suffix == ".pdf":
+            page_hint = await asyncio.to_thread(peek_pdf_page_count, file_path)
+        elif suffix == ".docx":
+            page_hint = await asyncio.to_thread(peek_docx_page_estimate, file_path)
+        else:
+            page_hint = 0
         early_route_meta: dict | None = None
         if page_hint > 0:
-            ingest_provider, route_reason = self._resolve_ingest_provider(
+            ingest_provider, route_reason = await self._resolve_ingest_provider(
                 pages=page_hint,
                 chunks=0,
             )
@@ -154,6 +156,12 @@ class IngestionPipeline:
         )
         document.file_hash = file_hash
         document.file_path = original_filename or file_path.name
+        if original_filename:
+            from ingestion.upload_naming import humanize_upload_title
+
+            upload_title = humanize_upload_title(original_filename)
+            if upload_title:
+                document.title = upload_title
         document.content_hash = hash_document_text(document)
 
         decision = self.dedup.decide_for_file(file_hash, document, self.vector_db)
@@ -215,7 +223,7 @@ class IngestionPipeline:
         on_progress: IngestProgressCallback | None = None,
         source_file: Path | None = None,
     ) -> None:
-        ingest_provider, route_reason = self._resolve_ingest_provider(document)
+        ingest_provider, route_reason = await self._resolve_ingest_provider(document)
         provider_token = set_ingest_provider(ingest_provider)
         yandex_token = None
         if ingest_provider == "yandex":
@@ -259,16 +267,18 @@ class IngestionPipeline:
                 reset_ingest_yandex_only(yandex_token)
             reset_ingest_provider(provider_token)
 
-    def _resolve_ingest_provider(
+    async def _resolve_ingest_provider(
         self,
         document: DocumentDTO | None = None,
         *,
         pages: int | None = None,
         chunks: int | None = None,
     ) -> tuple[LLMProvider, str]:
-        """Pick local 7B for short PDFs, Yandex API for long ones (hybrid mode)."""
+        """Pick local for short documents, Yandex for long ones when API is usable."""
         if not self.settings.ingest_hybrid_routing:
             provider = get_llm_provider()
+            if provider == "yandex" and not await check_yandex_api(self.settings):
+                return "local", "global Yandex selected but API unavailable"
             return provider, f"global provider ({provider})"
 
         if pages is None:
@@ -276,7 +286,6 @@ class IngestionPipeline:
         if chunks is None:
             chunks = len(document.chunks) if document else 0
         max_pages = self.settings.ingest_local_max_pages
-        yandex_ready = bool(self.settings.yandex_api_key and self.settings.yandex_folder_id)
 
         is_long = (
             pages > max_pages
@@ -284,10 +293,19 @@ class IngestionPipeline:
             or chunks > max_pages * 2
         )
         if is_long:
-            if yandex_ready:
+            if yandex_credentials_configured(self.settings):
+                if await check_yandex_api(self.settings):
+                    return (
+                        "yandex",
+                        f"long document ({pages} pages, {chunks} chunks > {max_pages} page local limit)",
+                    )
+                logger.warning(
+                    "Long document (%s pages) but Yandex API unreachable; using local LLM",
+                    pages,
+                )
                 return (
-                    "yandex",
-                    f"long document ({pages} pages, {chunks} chunks > {max_pages} page local limit)",
+                    "local",
+                    f"long document ({pages} pages; Yandex API unavailable)",
                 )
             logger.warning(
                 "Long document (%s pages, %s chunks) but Yandex not configured; using local LLM",
@@ -296,7 +314,7 @@ class IngestionPipeline:
             )
             return (
                 "local",
-                f"long document ({pages} pages; Yandex unavailable)",
+                f"long document ({pages} pages; Yandex not configured)",
             )
 
         return "local", f"short document ({pages} pages ≤ {max_pages})"
@@ -385,6 +403,41 @@ class IngestionPipeline:
             if str(exp.id) not in seen_exp_ids:
                 resolved_experiments.append(exp)
                 seen_exp_ids.add(str(exp.id))
+
+        content_lang = self._document_content_language(document)
+        mat_list = list(resolved_materials.values())
+        resolved_experiments = self.document_enricher.backfill_experiments_from_document(
+            resolved_experiments,
+            document,
+            mat_list,
+            content_lang,
+        )
+        for mat in mat_list:
+            key = self._material_key(mat.name)
+            if key not in resolved_materials:
+                resolved_materials[key] = mat
+
+        reclassified, extra_procs, extra_eq, extra_facs = (
+            self.document_enricher.reclassify_mislabeled_material_dtos(
+                list(resolved_materials.values())
+            )
+        )
+        resolved_materials = {
+            self._material_key(m.name): m for m in reclassified
+        }
+        if extra_procs:
+            enrichment.setdefault("processes", []).extend(extra_procs)
+        if extra_eq:
+            enrichment.setdefault("equipment", []).extend(extra_eq)
+        if extra_facs:
+            enrichment.setdefault("facilities", []).extend(extra_facs)
+
+        enrichment["processes"] = self.document_enricher.backfill_processes_from_experiments(
+            enrichment.get("processes") or [],
+            resolved_experiments,
+            str(document.id),
+            content_lang,
+        )
 
         self._save_to_graph(resolved_materials, resolved_experiments, document)
         report(0.72, "Saving figures and enrichment links…")
@@ -497,10 +550,14 @@ class IngestionPipeline:
 
         hb = asyncio.create_task(heartbeat())
         try:
-            enrichment, (materials, experiments) = await asyncio.gather(
-                run_enrich(),
-                run_extract(),
-            )
+            if effective_provider == "local" and self.settings.ingest_local_llm_serial:
+                enrichment = await run_enrich()
+                materials, experiments = await run_extract()
+            else:
+                enrichment, (materials, experiments) = await asyncio.gather(
+                    run_enrich(),
+                    run_extract(),
+                )
         finally:
             hb.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -518,9 +575,27 @@ class IngestionPipeline:
 
     @staticmethod
     def _page_count(document: DocumentDTO) -> int:
-        if not document.chunks:
-            return 0
-        return max((c.page_number or 0) for c in document.chunks)
+        if document.chunks:
+            explicit = max((c.page_number or 0) for c in document.chunks)
+            if explicit > 0:
+                return explicit
+        return document.estimated_page_count or 0
+
+    @staticmethod
+    def _sync_title_from_upload_filename(document: DocumentDTO) -> None:
+        """Prefer the uploaded filename when the stored title is an org/header misfire."""
+        from ingestion.parsers.title_slide_extract import looks_like_organization_name
+        from ingestion.upload_naming import humanize_upload_title
+
+        source = (document.file_path or "").strip()
+        if not source or Path(source).suffix.lower() not in (".pdf", ".docx"):
+            return
+        upload_title = humanize_upload_title(source)
+        if not upload_title:
+            return
+        current = (document.title or "").strip()
+        if not current or looks_like_organization_name(current):
+            document.title = upload_title
 
     def _use_fast_ingest(self, document: DocumentDTO) -> bool:
         threshold = self.settings.ingest_fast_page_threshold
@@ -535,9 +610,16 @@ class IngestionPipeline:
                 cap = min(24, max(cap, pages // 15))
             return cap
 
-        # 0 = no batch thinning (local full-coverage mode only)
+        # 0 = no batch thinning (local full-coverage for long docs only)
         if self.settings.llm_extraction_max_batches <= 0:
             if self.settings.ingest_local_full_coverage:
+                short_cap = int(self.settings.ingest_local_max_extraction_batches or 0)
+                if (
+                    short_cap > 0
+                    and get_effective_llm_provider() == "local"
+                    and pages <= self.settings.ingest_local_max_pages
+                ):
+                    return short_cap
                 return 0
             return 0
         if not fast:
@@ -557,14 +639,21 @@ class IngestionPipeline:
         self, document_id: str, *, force: bool = False
     ) -> dict:
         """Backfill graph entities for a document already in Neo4j."""
-        if not force and self.graph_db.document_has_entities(document_id):
-            return {"document_id": document_id, "status": "skipped", "reason": "already_enriched"}
-
         document = self.graph_db.load_document_dto(document_id)
         if not document:
             return {"document_id": document_id, "status": "not_found"}
 
-        ingest_provider, route_reason = self._resolve_ingest_provider(document)
+        title_before = document.title
+        self._sync_title_from_upload_filename(document)
+        if document.title != title_before:
+            self.graph_db.save_document(
+                document, content_language=self._document_content_language(document)
+            )
+
+        if not force and self.graph_db.document_has_entities(document_id):
+            return {"document_id": document_id, "status": "skipped", "reason": "already_enriched"}
+
+        ingest_provider, route_reason = await self._resolve_ingest_provider(document)
         provider_token = set_ingest_provider(ingest_provider)
         yandex_token = None
         if ingest_provider == "yandex":
@@ -589,11 +678,29 @@ class IngestionPipeline:
             enrichment["materials"],
             resolved_materials,
         )
+        content_lang = self._document_content_language(document)
+        mat_list = list(resolved_materials.values())
+        resolved_experiments = self.document_enricher.backfill_experiments_from_document(
+            resolved_experiments,
+            document,
+            mat_list,
+            content_lang,
+        )
+        for mat in mat_list:
+            key = self._material_key(mat.name)
+            if key not in resolved_materials:
+                resolved_materials[key] = mat
         for material in resolved_materials.values():
             self.graph_db.save_material(material)
             self.graph_db.link_document_material(document_id, str(material.id))
         for experiment in resolved_experiments:
             self.graph_db.save_experiment(experiment)
+        enrichment["processes"] = self.document_enricher.backfill_processes_from_experiments(
+            enrichment.get("processes") or [],
+            resolved_experiments,
+            document_id,
+            content_lang,
+        )
         self._save_enrichment(document, enrichment, resolved_materials)
         self._link_enriched_experiments(resolved_experiments)
 
@@ -771,11 +878,14 @@ class IngestionPipeline:
         )
 
         sem = asyncio.Semaphore(
-            min(self.settings.ingest_llm_concurrency, 8)
-            if get_effective_llm_provider() == "yandex"
-            else local_extraction_concurrency(
-                get_local_model(),
-                configured=self.settings.ingest_llm_concurrency,
+            1
+            if get_effective_llm_provider() == "local" and self.settings.ingest_local_llm_serial
+            else min(
+                self.settings.ingest_llm_concurrency,
+                8 if get_effective_llm_provider() == "yandex" else local_extraction_concurrency(
+                    get_local_model(),
+                    configured=self.settings.ingest_llm_concurrency,
+                ),
             )
         )
         completed = 0

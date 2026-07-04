@@ -7,6 +7,7 @@ import { figureImageUrl } from "@/lib/api/backend";
 import type { NodeConnection } from "@/lib/graphConnections";
 import type { GraphNode } from "@/lib/types";
 import { PropertyMeasurementsList } from "@/components/PropertyMeasurementsList";
+import { SearchableEntityList } from "@/components/SearchableEntityList";
 import { useI18n } from "@/lib/i18n/I18nProvider";
 import { X, FileText, ExternalLink, Minimize2, ArrowLeft } from "lucide-react";
 
@@ -113,26 +114,17 @@ export function EntityPanel({
             <div className="text-xs font-medium uppercase tracking-wide text-slate-500">
               {t("entityPanel.groupMembers", { count: memberCount })}
             </div>
-            {groupMembersLoading && (
-              <p className="mt-2 text-xs text-slate-500">{t("entityPanel.loadingMembers")}</p>
-            )}
-            {!groupMembersLoading && (groupMembers?.length ?? 0) === 0 ? (
-              <p className="mt-2 text-xs text-slate-500">{t("entityPanel.noGroupMembers")}</p>
-            ) : (
-              <ul className="mt-2 max-h-[360px] space-y-1.5 overflow-y-auto pr-1">
-                {(groupMembers ?? []).map((member) => (
-                  <li key={member.id}>
-                    <button
-                      type="button"
-                      onClick={() => onGroupMemberClick?.(member.id)}
-                      className="w-full rounded-lg border border-slate-700/60 bg-slate-800/40 px-3 py-2 text-left transition hover:border-slate-600 hover:bg-slate-800/70"
-                    >
-                      <span className="block truncate text-sm text-slate-200">{member.name}</span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
+            <SearchableEntityList
+              items={(groupMembers ?? []).map((member) => ({
+                id: member.id,
+                name: member.name,
+                type: member.type,
+              }))}
+              total={memberCount}
+              loading={groupMembersLoading}
+              emptyLabel={t("entityPanel.noGroupMembers")}
+              onItemClick={onGroupMemberClick}
+            />
           </div>
         )}
 
@@ -157,36 +149,18 @@ export function EntityPanel({
                   </button>
                 )}
             </div>
-            {connections.length === 0 ? (
-              <p className="mt-2 text-xs text-slate-500">{t("entityPanel.noConnections")}</p>
-            ) : (
-              <ul className="mt-2 max-h-[280px] space-y-1.5 overflow-y-auto pr-1">
-                {connections.map((conn) => (
-                  <li key={`${conn.node.id}-${conn.relation}-${conn.direction}`}>
-                    <button
-                      type="button"
-                      onClick={() => onConnectionClick?.(conn.node.id)}
-                      className="w-full rounded-lg border border-slate-700/60 bg-slate-800/40 px-3 py-2 text-left transition hover:border-slate-600 hover:bg-slate-800/70"
-                    >
-                      <div className="flex min-w-0 items-center gap-2">
-                        <span
-                          className="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wider text-white"
-                          style={{ backgroundColor: getEntityColor(conn.node.type) }}
-                        >
-                          {getEntityLabel(conn.node.type, locale)}
-                        </span>
-                        <span className="truncate text-sm text-slate-200">
-                          {conn.node.name}
-                        </span>
-                      </div>
-                      <div className="mt-0.5 text-[10px] text-slate-500">
-                        {relationLabel(conn.relation, locale)}
-                      </div>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
+            <SearchableEntityList
+              items={connections.map((conn) => ({
+                id: conn.node.id,
+                name: conn.node.name,
+                type: conn.node.type,
+                subtitle: relationLabel(conn.relation, locale),
+              }))}
+              total={connections.length}
+              emptyLabel={t("entityPanel.noConnections")}
+              onItemClick={onConnectionClick}
+              maxHeightClass="max-h-[280px]"
+            />
           </div>
         )}
 

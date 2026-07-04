@@ -42,6 +42,8 @@ export interface GraphSearchFocus {
   visibleIds: string[];
   primaryIds: string[];
   documentIds: string[];
+  /** Edges along shortest paths between primary hits (for Q&A chain view). */
+  chainLinks: GraphEdge[];
 }
 
 function linkEndpoints(link: GraphEdge): [string, string] {
@@ -219,7 +221,7 @@ function bridgePrimarySeeds(
   nodes: GraphNode[],
   adj: Map<string, Set<string>>,
   scores: Map<string, number>
-): Set<string> {
+): { visible: Set<string>; paths: string[][] } {
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const allowed = new Set<string>();
   for (const node of nodes) {
@@ -231,12 +233,14 @@ function bridgePrimarySeeds(
 
   const bridged = new Set<string>(primary);
   const primaryList = [...primary];
+  const paths: string[][] = [];
 
   for (let i = 0; i < primaryList.length; i++) {
     for (let j = i + 1; j < primaryList.length; j++) {
       const path = shortestPath(primaryList[i], primaryList[j], adj, allowed);
       if (!path) continue;
-      if (path.length > 4) continue;
+      if (path.length > 6) continue;
+      paths.push(path);
       for (const id of path) {
         const node = byId.get(id);
         if (!node) continue;
@@ -246,7 +250,99 @@ function bridgePrimarySeeds(
     }
   }
 
-  return bridged;
+  return { visible: bridged, paths };
+}
+
+function linkKey(a: string, b: string): string {
+  return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+function linksAlongPaths(paths: string[][]): GraphEdge[] {
+  const seen = new Set<string>();
+  const out: GraphEdge[] = [];
+  for (const path of paths) {
+    for (let i = 0; i < path.length - 1; i++) {
+      const a = path[i];
+      const b = path[i + 1];
+      const key = linkKey(a, b);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        id: `focus-path-${a}-${b}`,
+        source: a,
+        target: b,
+        relation: "references",
+      });
+    }
+  }
+  return out;
+}
+
+function directLinksBetween(
+  links: GraphEdge[],
+  visible: Set<string>,
+  nodes: GraphNode[]
+): GraphEdge[] {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const seen = new Set<string>();
+  const out: GraphEdge[] = [];
+  for (const link of links) {
+    const [a, b] = linkEndpoints(link);
+    if (!visible.has(a) || !visible.has(b)) continue;
+    const na = byId.get(a);
+    const nb = byId.get(b);
+    if (!na || !nb) continue;
+    if (na.type === "article" || nb.type === "article") continue;
+    const key = linkKey(a, b);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(link);
+  }
+  return out;
+}
+
+function fallbackPrimaryChain(
+  primaryIds: string[],
+  visible: Set<string>
+): GraphEdge[] {
+  const ordered = primaryIds.filter((id) => visible.has(id));
+  if (ordered.length < 2) return [];
+  const out: GraphEdge[] = [];
+  for (let i = 0; i < ordered.length - 1; i++) {
+    const a = ordered[i];
+    const b = ordered[i + 1];
+    out.push({
+      id: `focus-fallback-${a}-${b}`,
+      source: a,
+      target: b,
+      relation: "references",
+    });
+  }
+  return out;
+}
+
+export function mergeFocusChainLinks(
+  paths: string[][],
+  allLinks: GraphEdge[],
+  visible: Set<string>,
+  primaryIds: string[],
+  nodes: GraphNode[]
+): GraphEdge[] {
+  const seen = new Set<string>();
+  const merged: GraphEdge[] = [];
+  const push = (link: GraphEdge) => {
+    const [a, b] = linkEndpoints(link);
+    const key = linkKey(a, b);
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(link);
+  };
+  for (const link of linksAlongPaths(paths)) push(link);
+  for (const link of directLinksBetween(allLinks, visible, nodes)) push(link);
+  if (merged.length === 0) {
+    for (const link of fallbackPrimaryChain(primaryIds, visible)) push(link);
+  }
+  return merged;
 }
 
 function capByScore(ids: Set<string>, scores: Map<string, number>, limit: number): string[] {
@@ -328,20 +424,27 @@ export function computeSearchFocus(
 
   const primary = new Set(primaryIds);
   const adj = buildAdjacency(links);
-  let visible = bridgePrimarySeeds(primary, nodes, adj, scores);
+  const { visible: bridged, paths } = bridgePrimarySeeds(primary, nodes, adj, scores);
 
-  if (visible.size < primary.size) {
-    for (const id of primary) visible.add(id);
+  if (bridged.size < primary.size) {
+    for (const id of primary) bridged.add(id);
   }
 
-  const visibleIds = capByScore(visible, scores, MAX_VISIBLE);
+  const visibleIds = capByScore(bridged, scores, MAX_VISIBLE);
   const visibleSet = new Set(visibleIds);
   const documentIds = documentIdsForNodes(nodes, links, visibleSet);
+  const chainLinks = mergeFocusChainLinks(paths, links, visibleSet, primaryIds, nodes).filter(
+    (link) => {
+      const [a, b] = linkEndpoints(link);
+      return visibleSet.has(a) && visibleSet.has(b);
+    }
+  );
 
   return {
     visibleIds,
     primaryIds: primaryIds.filter((id) => visibleSet.has(id)),
     documentIds,
+    chainLinks,
   };
 }
 

@@ -1,4 +1,4 @@
-"""Extract knowledge-graph entities for mining & metallurgy R&D documents."""
+"""Extract knowledge-graph entities from scientific and engineering R&D documents."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from domain.enums import DOCUMENT_RELIABILITY, DocumentType, MaterialClass, Mate
 from domain.material_taxonomy import get_material_taxonomy, is_valid_material_name
 from domain.entity_glossary import (
     FACILITY_GLOSSARY_KEYS,
-    PROCESS_GLOSSARY_KEYS,
     canonical_entity_key,
     find_glossary_terms_in_text,
 )
@@ -24,6 +23,7 @@ from ingestion.parsers.title_slide_extract import (
     extract_authors_from_text,
     extract_authors_from_document_chunks,
     extract_listed_experts_from_text,
+    extract_all_people_from_document,
     extract_organizations_from_text,
     looks_like_author_name,
     looks_like_affiliation_name,
@@ -31,7 +31,18 @@ from ingestion.parsers.title_slide_extract import (
     merge_unique_names,
     normalize_person_name,
 )
+from ingestion.nlp.experiment_text_scan import (
+    experiments_from_section_titles,
+    experiments_from_table_blocks,
+    experiments_from_text_phrases,
+    merge_experiments,
+)
 from ingestion.nlp.material_process_linker import build_material_process_links
+from ingestion.nlp.process_text_scan import (
+    append_process_record,
+    find_process_phrases_in_text,
+    looks_like_process_label,
+)
 from ingestion.nlp.extraction_validate import (
     is_blocklisted_entity_name,
     is_llm_template_string,
@@ -39,6 +50,8 @@ from ingestion.nlp.extraction_validate import (
     is_placeholder_expert_field,
     is_placeholder_process,
     is_placeholder_topic,
+    looks_like_concept_not_material,
+    classify_non_material_entity,
     looks_like_section_heading,
     normalize_entity_name,
     pick_monolingual_label,
@@ -146,7 +159,9 @@ class DocumentEnricher:
             get_local_model(),
             configured=int(self.settings.ingest_local_enricher_concurrency or 0),
         )
-        if get_effective_llm_provider() == "yandex":
+        if get_effective_llm_provider() == "local" and self.settings.ingest_local_llm_serial:
+            concurrency = 1
+        elif get_effective_llm_provider() == "yandex":
             concurrency = min(8, max(concurrency, 4))
 
         sem = asyncio.Semaphore(concurrency)
@@ -182,7 +197,21 @@ class DocumentEnricher:
 
         max_chars = self._enricher_sample_max_chars(fast_mode=fast_mode)
         total = sum(len(c.text or "") for c in chunks)
+        if total <= max_chars:
+            return 1
         passes = max(1, math.ceil(total / max(1, max_chars)))
+
+        if get_effective_llm_provider() == "local":
+            configured_cap = int(self.settings.ingest_local_max_enricher_passes or 0)
+            pages = self._document_page_count(document)
+            if pages <= self.settings.ingest_local_max_pages or len(chunks) <= 20:
+                passes = min(passes, configured_cap if configured_cap > 0 else 2)
+            tier = local_ingest_profile(get_local_model()).get("tier", "light")
+            tier_cap = 3 if tier == "premium" else 2 if tier == "standard" else 2
+            if configured_cap > 0:
+                tier_cap = min(tier_cap, configured_cap)
+            passes = min(passes, tier_cap)
+
         return min(len(chunks), passes)
 
     @staticmethod
@@ -266,6 +295,12 @@ class DocumentEnricher:
         processes = self._backfill_processes_from_text(
             processes, full_text, document.id, target_lang
         )
+        processes = self._backfill_processes_from_raw_findings(
+            processes, raw.get("findings") or [], document.id, target_lang
+        )
+        processes = self._backfill_processes_from_section_titles(
+            processes, document.chunks, document.id, target_lang
+        )
         material_process_links = build_material_process_links(
             materials, processes, text
         )
@@ -285,6 +320,13 @@ class DocumentEnricher:
             extra_members=raw_team_members,
             blocklist=entity_blocklist,
         )
+        experts = self.backfill_experts_from_document(
+            experts,
+            document,
+            teams,
+            entity_blocklist,
+            raw_team_members,
+        )
         self._link_experts_to_team(experts, teams)
         self._sync_team_members(teams, experts)
         topics = [
@@ -303,6 +345,12 @@ class DocumentEnricher:
             document.id,
             materials,
             process_by_name,
+        )
+        experiments = self.backfill_experiments_from_document(
+            experiments,
+            document,
+            materials,
+            target_lang,
         )
         for topic in extra_topics:
             if topic not in topics and not is_placeholder_topic(topic):
@@ -362,6 +410,9 @@ class DocumentEnricher:
     def _sample_text(self, document: DocumentDTO, *, fast_mode: bool = False) -> str:
         max_chars = self._enricher_sample_max_chars(fast_mode=fast_mode)
         chunks = [c for c in document.chunks if (c.text or "").strip()]
+        total_chars = sum(len(c.text or "") for c in chunks)
+        if total_chars <= max_chars:
+            return self._full_document_text(document, max_chars=max_chars)
         pages = self._document_page_count(document)
         profile = local_ingest_profile(get_local_model())
         if pages >= 200:
@@ -424,27 +475,194 @@ class DocumentEnricher:
     ) -> list[dict]:
         if not text.strip():
             return processes
-        seen = {str(p.get("canonical_key") or "").lower() for p in processes}
         added = 0
-        for key, ru, en in find_glossary_terms_in_text(text, PROCESS_GLOSSARY_KEYS):
+        for key, display, source in find_process_phrases_in_text(text, target_lang):
+            if append_process_record(
+                processes,
+                name=display,
+                document_id=str(document_id),
+                canonical_key=key,
+                source=source,
+            ):
+                added += 1
+        if added:
+            logger.info("Process text scan: added %s processes from document text", added)
+        return processes
+
+    @staticmethod
+    def _backfill_processes_from_raw_findings(
+        processes: list[dict],
+        raw_findings: list,
+        document_id: UUID,
+        target_lang: str,
+    ) -> list[dict]:
+        added = 0
+        for item in raw_findings:
+            if not isinstance(item, dict):
+                continue
+            for field in ("process", "title", "topic"):
+                name = str(item.get(field) or "").strip()
+                if not name or not looks_like_process_label(name):
+                    continue
+                if append_process_record(
+                    processes,
+                    name=name,
+                    document_id=str(document_id),
+                    source=f"finding:{field}",
+                ):
+                    added += 1
+        if added:
+            logger.info("Findings backfill: added %s processes", added)
+        return processes
+
+    @staticmethod
+    def backfill_processes_from_experiments(
+        processes: list[dict],
+        experiments: list,
+        document_id: str,
+        target_lang: str,
+    ) -> list[dict]:
+        added = 0
+        for exp in experiments:
+            regime = getattr(exp, "regime", None)
+            if not regime:
+                continue
+            for candidate in (
+                getattr(regime, "name", None),
+                getattr(regime, "description", None),
+            ):
+                name = str(candidate or "").strip()
+                if not name or not looks_like_process_label(name):
+                    continue
+                if append_process_record(
+                    processes,
+                    name=name,
+                    document_id=document_id,
+                    source="experiment_regime",
+                ):
+                    added += 1
+            for conclusion in getattr(exp, "conclusions", None) or []:
+                text = str(conclusion or "").strip()
+                for key, display, _ in find_process_phrases_in_text(text, target_lang):
+                    if append_process_record(
+                        processes,
+                        name=display,
+                        document_id=document_id,
+                        canonical_key=key,
+                        source="experiment_conclusion",
+                    ):
+                        added += 1
+        if added:
+            logger.info("Experiment backfill: added %s processes", added)
+        return processes
+
+    @staticmethod
+    def _backfill_processes_from_section_titles(
+        processes: list[dict],
+        chunks: list,
+        document_id: UUID,
+        target_lang: str,
+    ) -> list[dict]:
+        added = 0
+        seen_titles: set[str] = set()
+        for chunk in chunks:
+            title = str(getattr(chunk, "section_title", None) or "").strip()
+            if not title:
+                continue
+            key = title.lower()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            if not looks_like_process_label(title):
+                continue
+            if append_process_record(
+                processes,
+                name=title,
+                document_id=str(document_id),
+                source="section_title",
+            ):
+                added += 1
+        if added:
+            logger.info("Section-title backfill: added %s processes", added)
+        return processes
+
+    @staticmethod
+    def backfill_experiments_from_document(
+        experiments: list[ExperimentDTO],
+        document: DocumentDTO,
+        materials: list[MaterialDTO],
+        target_lang: str,
+    ) -> list[ExperimentDTO]:
+        """Add experiments from tables, phrases, and section headings (local recall boost)."""
+        full_text = "\n\n".join(
+            (c.text or "").strip() for c in document.chunks if (c.text or "").strip()
+        )
+        working_materials = list(materials)
+        added_items: list[ExperimentDTO] = []
+        added_items.extend(
+            experiments_from_table_blocks(full_text, document.id, working_materials)
+        )
+        added_items.extend(
+            experiments_from_text_phrases(full_text, document.id, working_materials, target_lang)
+        )
+        added_items.extend(
+            experiments_from_section_titles(document.chunks, document.id, working_materials)
+        )
+        before = len(experiments)
+        merged = merge_experiments(experiments, added_items)
+        added = len(merged) - before
+        if added:
+            logger.info("Experiment backfill: added %s experiments (tables/phrases/sections)", added)
+        if len(working_materials) > len(materials):
+            materials.extend(working_materials[len(materials) :])
+        return merged
+
+    def backfill_experts_from_document(
+        self,
+        experts: list[dict],
+        document: DocumentDTO,
+        teams: list[dict],
+        blocklist: set[str],
+        extra_members: list[str] | None = None,
+    ) -> list[dict]:
+        """Ensure title-page authors and rosters become Expert nodes even when LLM returns []."""
+        seen = {self._person_identity_key(e["name"]) for e in experts if e.get("name")}
+        candidates = extract_all_people_from_document(document.chunks, document.authors)
+        for member in self._split_person_names(extra_members or []):
+            if member not in candidates:
+                candidates.append(member)
+        for team in teams:
+            for member in team.get("members") or []:
+                if member not in candidates:
+                    candidates.append(str(member))
+
+        added = 0
+        for name in candidates:
+            cleaned = normalize_entity_name(normalize_person_name(name))
+            if not cleaned or is_llm_template_string(cleaned):
+                continue
+            if self._should_reject_expert_name(cleaned, blocklist):
+                if self._is_strong_org_name(cleaned):
+                    self._promote_org_to_team(teams, cleaned, document)
+                continue
+            if not self._looks_like_person(cleaned):
+                continue
+            key = self._person_identity_key(cleaned)
             if key in seen:
                 continue
-            display = en if target_lang == "en" else ru
-            if not display:
-                display = en or ru
             seen.add(key)
-            processes.append({
+            experts.append({
                 "id": str(uuid4()),
-                "name": display,
-                "canonical_key": key,
-                "aliases": [],
-                "materials": [],
-                "document_id": str(document_id),
+                "name": cleaned,
+                "field": None,
+                "team_id": None,
             })
             added += 1
+
         if added:
-            logger.info("Glossary backfill: added %s processes from text scan", added)
-        return processes
+            logger.info("Expert backfill: added %s experts from document text/rosters", added)
+        self._link_experts_to_team(experts, teams)
+        return experts
 
     def _backfill_facilities_from_text(
         self,
@@ -490,13 +708,13 @@ class DocumentEnricher:
 
     def _augment_document_provenance(self, document: DocumentDTO) -> None:
         """Merge authors/orgs from document text into the DTO."""
-        slide_text = self._full_document_text(document)
+        document.authors = extract_all_people_from_document(
+            document.chunks,
+            document.authors,
+        )
 
+        slide_text = self._full_document_text(document)
         if slide_text:
-            document.authors = merge_unique_names(
-                document.authors,
-                extract_authors_from_text(slide_text, len(slide_text) or 2_000_000),
-            )
             document.authors = merge_unique_names(
                 document.authors,
                 extract_listed_experts_from_text(slide_text, len(slide_text) or 2_000_000),
@@ -509,11 +727,6 @@ class DocumentEnricher:
                         document.chunks,
                         max_authors=0,
                     ),
-                )
-            else:
-                document.authors = merge_unique_names(
-                    document.authors,
-                    extract_authors_from_document_chunks(document.chunks),
                 )
             document.organizations = merge_unique_names(
                 document.organizations,
@@ -554,18 +767,27 @@ class DocumentEnricher:
             )
         proceedings = self._is_proceedings_volume(document)
         findings_rule = (
-            "- findings: extract EVERY distinct experiment, operating condition set, and numeric result in the sampled section"
+            "- findings: extract EVERY distinct experiment, field study, simulation run, operating condition set, and numeric result in the sampled section"
             if proceedings
-            else "- findings: extract every experiment, operating condition, and confirmed conclusion with numeric parameters"
+            else "- findings: extract every experiment, survey, computational study, operating condition, and confirmed conclusion with numeric parameters"
         )
         recall_rule = ""
         if get_effective_llm_provider() == "local":
             recall_rule = (
                 "\n- LOCAL RECALL MODE: list every material, process, facility, equipment, expert, "
                 "team, and finding visible in the text — prefer completeness over short JSON"
+                "\n- processes: include EVERY distinct method — FEM/MКЭ, numerical modeling, field/lab "
+                "tests, calibration, static/dynamic analysis, simulation workflows, metallurgical steps — "
+                "as separate JSON objects (not merged into one generic 'modeling' entry)"
+                "\n- findings: one entry per simulation run, verification case, lab/field test, and each "
+                "table row with distinct numeric parameters (zones, materials, conditions)"
+                "\n- experts: include EVERY named person — authors, исполнители, научные руководители, "
+                "reviewers, and roster entries from title page or numbered lists"
             )
-        return f"""Analyze this mining/metallurgy R&D document and extract a knowledge graph as JSON.
-Domain: hydrometallurgy, pyrometallurgy, electrowinning, leaching, flotation, ecology, waste recycling.
+        return f"""Analyze this scientific or engineering R&D document and extract a knowledge graph as JSON.
+The paper may be from any domain: geology, geotechnics, mining, metallurgy, materials science, chemistry,
+physics, ecology, simulation/FEM, civil engineering, hydrology, energy, etc. Extract what the text actually
+contains — do not invent metallurgy-only entities when the topic is different.
 Russian or English text.
 
 {taxonomy}
@@ -589,30 +811,36 @@ Each array item when present:
 - materials: {{"name": "...", "aliases": [], "material_class": "<taxonomy id>"}}
 - processes: {{"name": "...", "aliases": [], "materials": ["<material names handled in this process>"]}}
 - equipment: {{"name": "..."}}
-- facilities: {{"name": "...", "country": "...", "facility_type": "plant|mine|smelter|refinery|laboratory|site"}}
+- facilities: {{"name": "...", "country": "...", "facility_type": "plant|mine|smelter|refinery|laboratory|field_site|site"}}
 - experts: {{"name": "...", "field": "..."}}
 - teams: {{"name": "<institute/company>", "members": ["..."]}}
 - findings: {{"title": "...", "topic": "...", "process": "...", "summary": "...", "status": "completed|ongoing|planned", "parameters": {{}}}}
 
 Rules:
-- materials: list EVERY distinct substance mentioned (nickel, copper matte, gypsum, catholyte, matte, slag…)
-- name = specific chemical/material name only — NOT category words (ore, concentrate, intermediate, metal, alloy go in material_class)
+- materials: list EVERY distinct substance, rock type, soil, alloy, chemical, reagent, or engineered material
+  (e.g. granite, clay, steel, polymer, nickel, sulfuric acid, concrete) — use material_class from taxonomy when it fits; otherwise other
+- name = specific substance or material name only — NOT broad category words (ore, concentrate, rock, soil go in material_class when applicable)
 - one material per JSON object — never join names with | or /
-- material_class: exactly one value from the allowed list
-- processes: technological operations only (not material names)
-- for each process, list material names that are inputs/outputs/intermediates of that process in materials[]
+- material_class: exactly one value from the allowed list (use other when no class fits)
+- processes: methods, operations, treatments, or workflows (lab experiment, FEM simulation, drilling, leaching, flotation, sampling, calibration…) — not material names
+- for each process, list related material names in materials[] when stated
+- equipment: instruments, machines, software tools used as apparatus (drill rig, spectrometer, ANSYS, centrifuge…)
+- topics: main research themes / keywords from the paper (e.g. slope stability, nickel electrowinning, permafrost)
 - teams: REQUIRED when authors or affiliation appear — research lab / institute / company name (not a person name)
 - team.members: all author names from the document
 - experts: ONLY individual human names (authors / researchers) in "First Last" or "Last First Patronymic" form
 - For conference proceedings volumes: prefer expert roster / title-slide authors; still include paper authors when clearly named in the sampled section
 - NEVER put organizations, materials, processes, equipment, or facilities in experts — use teams/materials/processes/equipment/facilities instead
-- facilities: specific plants, mines, smelters, or laboratories (named site + country) — NOT generic "plant or laboratory" and NOT process topics like "mine water treatment"
-- facility_type: plant | mine | smelter | refinery | laboratory | site
+- facilities: named sites — plants, mines, labs, field areas, test sites, deposits (site + country when known) — NOT generic placeholders
+- facility_type: plant | mine | smelter | refinery | laboratory | field_site | site
+- findings: lab/field experiments, measurements, surveys, AND computational studies (FEM, CFD, modeling) with numeric results in parameters
+- findings.parameters: every numeric constant, modulus, coefficient, stress, strain, and unit from the text (elastic_modulus, young_modulus, poisson_ratio, density, …)
+- Preserve exact numbers, units, and formulas from [TABLE] blocks — one finding or material property per table row when values differ
 {findings_rule}
-- Be exhaustive: list every distinct material, process, facility, equipment, and finding mentioned in the sampled text{recall_rule}
+- Be exhaustive: list every distinct material, process, facility, equipment, topic, and finding mentioned in the sampled text{recall_rule}
 - Keep JSON compact: no duplicate entities, no prose outside JSON
 - {extraction_language_instruction(target_lang)}
-- Property keys in parameters stay English snake_case (nickel_content, recovery_rate)
+- Property keys in parameters stay English snake_case (density, yield_strength, recovery_rate, factor_of_safety)
 - geography.scope: domestic | international | global — only if clearly stated; otherwise null
 - If a field is not mentioned in the document, return an empty array [] or null — never copy example or placeholder text
 
@@ -767,20 +995,138 @@ Text:
                 )
         return materials
 
+    @staticmethod
+    def reclassify_mislabeled_material_dtos(
+        materials: list[MaterialDTO],
+    ) -> tuple[list[MaterialDTO], list[dict], list[dict], list[dict]]:
+        """Move apparatus/operations mislabeled as MaterialDTO to enrichment buckets."""
+        kept: list[MaterialDTO] = []
+        extra_processes: list[dict] = []
+        extra_equipment: list[dict] = []
+        extra_facilities: list[dict] = []
+        seen_proc: set[str] = set()
+        seen_eq: set[str] = set()
+        seen_fac: set[str] = set()
+
+        for mat in materials:
+            kind = classify_non_material_entity(mat.name)
+            if not kind and looks_like_concept_not_material(mat.name):
+                kind = "process"
+            if kind in ("organization", "person", "temporal", "parameter"):
+                continue
+            key = canonical_entity_key(mat.name) or mat.name.lower()
+            if kind == "process":
+                if key not in seen_proc:
+                    seen_proc.add(key)
+                    extra_processes.append({
+                        "id": str(uuid4()),
+                        "name": mat.name,
+                        "aliases": list(mat.aliases or []),
+                        "materials": [],
+                        "canonical_key": key,
+                        "source": "reclassify",
+                    })
+                continue
+            if kind == "equipment":
+                if key not in seen_eq:
+                    seen_eq.add(key)
+                    extra_equipment.append({
+                        "id": str(uuid4()),
+                        "name": mat.name,
+                        "source": "reclassify",
+                    })
+                continue
+            if kind == "facility":
+                if key not in seen_fac:
+                    seen_fac.add(key)
+                    extra_facilities.append({
+                        "id": str(uuid4()),
+                        "name": mat.name,
+                        "facility_type": "site",
+                        "source": "reclassify",
+                    })
+                continue
+            kept.append(mat)
+
+        moved = len(materials) - len(kept)
+        if moved > 0:
+            logger.info(
+                "Reclassified %s mislabeled MaterialDTO entries → process/equipment/facility",
+                moved,
+            )
+        return kept, extra_processes, extra_equipment, extra_facilities
+
     def _reclassify_mislabeled_entities(self, raw: dict) -> dict:
-        """Move section headings / process labels wrongly placed in experts[] to correct buckets."""
+        """Move mislabeled experts and materials into processes/topics/equipment."""
         if not isinstance(raw, dict):
             return raw
 
         processes = list(raw.get("processes") or [])
         facilities = list(raw.get("facilities") or [])
         equipment = list(raw.get("equipment") or [])
+        topics = list(raw.get("topics") or [])
+        kept_materials: list = []
         kept_experts: list = []
 
         def item_name(item) -> str:
             if isinstance(item, dict):
                 return str(item.get("name") or "").strip()
             return str(item or "").strip()
+
+        process_keys = {
+            canonical_entity_key(item_name(p)) or item_name(p).lower()
+            for p in processes
+            if item_name(p)
+        }
+
+        def add_process(name: str, item) -> None:
+            key = canonical_entity_key(name) or name.lower()
+            if not key or key in process_keys:
+                return
+            process_keys.add(key)
+            if isinstance(item, dict) and item.get("name"):
+                processes.append(item)
+            else:
+                processes.append({"name": name, "aliases": [], "materials": []})
+
+        for item in raw.get("materials") or []:
+            name = item_name(item)
+            if not name or is_llm_template_string(name):
+                continue
+            kind = classify_non_material_entity(name)
+            if kind in ("organization", "person", "temporal", "parameter"):
+                continue
+            if kind == "process" or (
+                not kind and looks_like_concept_not_material(name)
+            ):
+                add_process(name, item)
+                topic = str(item.get("topic") or name).strip() if isinstance(item, dict) else name
+                if topic and not is_placeholder_topic(topic) and topic not in topics:
+                    topics.append(topic)
+                continue
+            if kind == "equipment":
+                equipment.append(item if isinstance(item, dict) else {"name": name})
+                continue
+            if kind == "facility":
+                fac = item if isinstance(item, dict) else {"name": name}
+                facilities.append({
+                    "name": name,
+                    "country": fac.get("country") if isinstance(fac, dict) else None,
+                    "facility_type": (
+                        fac.get("facility_type") if isinstance(fac, dict) else None
+                    ) or "site",
+                })
+                continue
+            kept_materials.append(item)
+
+        moved_materials = len(raw.get("materials") or []) - len(kept_materials)
+        if moved_materials > 0:
+            logger.info(
+                "Reclassified %s mislabeled material entries → processes/equipment/facilities/topics",
+                moved_materials,
+            )
+        raw["materials"] = kept_materials
+        raw["topics"] = topics
 
         for item in raw.get("experts") or []:
             name = item_name(item)
@@ -1274,7 +1620,7 @@ Text:
             if material_id is None:
                 continue
 
-            process_name = str(item.get("process") or topic or "").strip()
+            process_name = str(item.get("process") or "").strip()
             linked_process_id = None
             if process_name:
                 linked_process_id = (

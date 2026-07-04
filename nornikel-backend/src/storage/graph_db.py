@@ -1452,6 +1452,51 @@ class GraphDB:
             """, {"offset": offset, "limit": limit})
             
             return [dict(record) for record in result]
+
+    _BROWSE_ENTITY_LABELS = frozenset(VISUAL_NODE_LABELS)
+
+    def list_entities_by_label(
+        self,
+        label: str,
+        *,
+        q: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        """Paginated entity browse with optional name search (stats bar / type browser)."""
+        if label not in self._BROWSE_ENTITY_LABELS:
+            raise ValueError(f"Unsupported entity label: {label}")
+
+        terms = extract_search_terms(q or "", limit=8) if (q or "").strip() else []
+        params: dict = {"offset": offset, "limit": limit, "terms": terms}
+        filter_clause = ""
+        if terms:
+            filter_clause = """
+                AND any(t IN $terms WHERE toLower(coalesce(
+                    n.name, n.title, n.regime_name, n.canonical_name, ''
+                )) CONTAINS t)
+            """
+
+        count_cypher = f"MATCH (n:{label}) WHERE true {filter_clause} RETURN count(n) AS total"
+        list_cypher = f"""
+            MATCH (n:{label})
+            WHERE true {filter_clause}
+            WITH n, coalesce(n.name, n.title, n.regime_name, n.canonical_name, n.id) AS sort_name
+            ORDER BY toLower(sort_name)
+            SKIP $offset LIMIT $limit
+            RETURN n.id AS id, sort_name AS label, labels(n)[0] AS type
+        """
+        with self.driver.session() as session:
+            total = int(session.run(count_cypher, params).single()["total"])
+            items = [dict(r) for r in session.run(list_cypher, params)]
+            return {
+                "items": items,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "entity_label": label,
+                "has_more": offset + len(items) < total,
+            }
     
     def get_experiment_details(self, experiment_id: str) -> dict | None:
         """Детали эксперимента."""

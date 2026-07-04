@@ -46,7 +46,10 @@ class Settings(BaseSettings):
     # Hybrid ingest: short PDFs → local 7B, longer → Yandex (when API keys configured)
     ingest_hybrid_routing: bool = True
     ingest_local_max_pages: int = 28
-    ingest_local_full_coverage: bool = True  # local: every page batch + auto multipass enricher
+    ingest_local_full_coverage: bool = True  # long local docs: more batches; short docs auto-capped
+    ingest_local_max_enricher_passes: int = 2  # cap multipass on Ollama (1 GPU serializes anyway)
+    ingest_local_max_extraction_batches: int = 4  # short docs ≤28 pages — backfills cover the rest
+    ingest_local_llm_serial: bool = True  # enrich then extract (avoid Ollama GPU queue thrashing)
     ingest_local_enricher_concurrency: int = 0  # 0 = tier default (2 light / 3 standard / 4 premium)
     # Long PDFs (≥ threshold pages): parallel enricher + batched extraction
     ingest_fast_page_threshold: int = 35

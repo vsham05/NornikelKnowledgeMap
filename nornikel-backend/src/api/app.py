@@ -32,6 +32,14 @@ async def lifespan(app: FastAPI):
         cleanup = cleanup_duplicate_documents(db, VectorDB(settings))
         if cleanup["removed_count"]:
             print(f"Removed {cleanup['removed_count']} duplicate document(s) on startup")
+
+        from infra.yandex_health import check_yandex_api, yandex_credentials_configured, yandex_unusable_reason
+
+        if yandex_credentials_configured(settings):
+            if await check_yandex_api(settings, force=True):
+                print("Yandex API probe OK")
+            else:
+                print(f"Yandex API unavailable — using local LLM ({yandex_unusable_reason()})")
     except Exception as e:
         print(f"Neo4j connection failed: {e}")
     

@@ -51,7 +51,7 @@ export const NODE_RADIUS_SCALE = 5;
 /** Minimum gap between node circles (~1 cm at typical screen DPI when zoomed to fit). */
 export const NODE_GAP_PX = 38;
 
-/** Layout val for expanded entity nodes — keep in sync with ForceGraphCanvas ENTITY_NODE_VAL. */
+/** Layout val for expanded entity nodes — keep in sync with GraphView ENTITY_NODE_VAL. */
 export const LAYOUT_ENTITY_VAL = 2.2;
 
 export function graphNodeRadius(val: number = 4): number {

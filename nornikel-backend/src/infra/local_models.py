@@ -37,7 +37,6 @@ LOCAL_MODELS: tuple[LocalModelInfo, ...] = (
         enricher_multipass=0,
         extraction_batches=0,
         notes="~85–90% of Yandex Qwen3-235B on long PDFs; needs 24GB+ VRAM.",
-        recommended=True,
     ),
     LocalModelInfo(
         id="qwen3:32b",
@@ -60,6 +59,18 @@ LOCAL_MODELS: tuple[LocalModelInfo, ...] = (
         enricher_multipass=0,
         extraction_batches=0,
         notes="Reasoning-heavy; slightly smaller safe context window.",
+    ),
+    LocalModelInfo(
+        id="qwen3:8b",
+        label="Qwen3 8B (8 GB VRAM sweet spot)",
+        tier="standard",
+        context_tokens=32_768,
+        extraction_chars=20_000,
+        max_output_tokens=10_240,
+        enricher_multipass=0,
+        extraction_batches=0,
+        notes="Best default for RTX 3070/8GB — general science + JSON extraction.",
+        recommended=True,
     ),
     LocalModelInfo(
         id="qwen2.5:14b-instruct",
@@ -96,7 +107,7 @@ LOCAL_MODELS: tuple[LocalModelInfo, ...] = (
     ),
 )
 
-_DEFAULT_LOCAL_MODEL = "qwen2.5:14b-instruct"
+_DEFAULT_LOCAL_MODEL = "qwen3:8b"
 _BY_ID: dict[str, LocalModelInfo] = {m.id: m for m in LOCAL_MODELS}
 _TIER_BILINEAR = re.compile(r"(\d+)\s*b", re.IGNORECASE)
 

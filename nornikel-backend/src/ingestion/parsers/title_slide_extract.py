@@ -32,7 +32,7 @@ _GENERAL_ORG_HINTS = (
     "center", "centre", "foundation", "company", "corporation", "consortium",
     "институт", "университет", "лаборатор", "академ", "департамент",
     "факультет", "центр", "завод", "фгбу", "комбинат",
-    "llc", "ltd", "inc", "corp", "gmbh", "ооо", "пао", "ао", "гмк",
+    "llc", "ltd", "inc", "corp", "gmbh", "ооо", "пао", "ао", "гмк", "рао",
 )
 
 # Latin: Julia Gershteyn, Dmitry V. Lyapinov
@@ -79,6 +79,11 @@ _EXPERT_SECTION_HEADING = re.compile(
     r"|Team\s+members?"
     r"|Команда(?:\s+проекта)?"
     r"|Участники(?:\s+проекта)?"
+    r"|Исполнител(?:ь|и)"
+    r"|Составител(?:ь|и)"
+    r"|Ответственный\s+исполнитель"
+    r"|Научный\s+руководитель"
+    r"|Руководитель\s+(?:работ|проекта)"
     r")\s*[:：]?\s*(?:\n|$)",
     re.IGNORECASE | re.UNICODE,
 )
@@ -168,6 +173,14 @@ def looks_like_person_name(name: str) -> bool:
 _AUTHOR_INITIALS_LATIN = re.compile(
     r"^[A-Z]\.\s*(?:[A-Z]\.\s*)?[A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']+)?$"
 )
+_CYRILLIC_SURNAME_INITIALS = re.compile(
+    r"^[А-ЯЁ][а-яё\-]+\s+[А-ЯЁ]\.\s*[А-ЯЁ]\.?$",
+    re.UNICODE,
+)
+_CYRILLIC_INITIALS_BEFORE_SURNAME = re.compile(
+    r"^[А-ЯЁ]\.\s*[А-ЯЁ]\.\s*[А-ЯЁ][а-яё\-]+(?:-[А-ЯЁ][а-яё\-]+)?$",
+    re.UNICODE,
+)
 _LAST_COMMA_FIRST = re.compile(
     r"^[A-Z][a-zA-Z\-']+,\s+[A-Z][a-zA-Z\-'.]+(?:\s+[A-Z][a-zA-Z\-'.]+)?$"
 )
@@ -209,7 +222,12 @@ def looks_like_author_name(name: str) -> bool:
         return False
     if looks_like_job_title(cleaned):
         return False
-    return bool(_AUTHOR_INITIALS_LATIN.match(cleaned) or _CYRILLIC_PERSON.match(cleaned))
+    return bool(
+        _AUTHOR_INITIALS_LATIN.match(cleaned)
+        or _CYRILLIC_PERSON.match(cleaned)
+        or _CYRILLIC_SURNAME_INITIALS.match(cleaned)
+        or _CYRILLIC_INITIALS_BEFORE_SURNAME.match(cleaned)
+    )
 
 
 def looks_like_affiliation_name(name: str) -> bool:
@@ -311,7 +329,7 @@ def extract_authors_from_page_header(text: str, *, header_chars: int = 1_400) ->
                 add(part)
 
     lines = [ln.strip() for ln in sample.splitlines() if ln.strip()]
-    for i, line in enumerate(lines[:8]):
+    for i, line in enumerate(lines[:12]):
         if len(line) > 100 or _PAGE_HEADER_SKIP.match(line):
             continue
         if looks_like_section_heading(line):
@@ -320,6 +338,18 @@ def extract_authors_from_page_header(text: str, *, header_chars: int = 1_400) ->
             continue
         if re.search(r"\d{4}", line) and len(line) < 50:
             continue
+        # Single author line (common on RU paper title pages)
+        if 2 <= len(line.split()) <= 5 and looks_like_author_name(line):
+            if not looks_like_affiliation_name(line) and not looks_like_organization_name(line):
+                next_line = lines[i + 1] if i + 1 < len(lines) else ""
+                if (
+                    not next_line
+                    or looks_like_affiliation_name(next_line)
+                    or looks_like_organization_name(next_line)
+                    or len(next_line) > 60
+                ):
+                    add(line)
+                    continue
         # Single author line followed by affiliation (common in proceedings)
         if 2 <= len(line.split()) <= 4 and looks_like_author_name(line):
             next_line = lines[i + 1] if i + 1 < len(lines) else ""
@@ -332,7 +362,55 @@ def extract_authors_from_page_header(text: str, *, header_chars: int = 1_400) ->
         for part in split_person_name_line(line):
             add(part)
 
-    return authors[:6]
+    return authors[:24]
+
+
+def extract_numbered_people_from_text(text: str, limit: int = 25_000) -> list[str]:
+    """Numbered name rosters with or without an explicit Experts heading."""
+    sample = (text or "")[:limit]
+    if not sample.strip():
+        return []
+
+    seen: set[str] = set()
+    people: list[str] = []
+
+    def add(name: str) -> None:
+        cleaned = normalize_person_name(name)
+        if not looks_like_author_name(cleaned):
+            return
+        key = cleaned.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        people.append(cleaned)
+
+    for match in _EXPERT_LIST_ITEM.finditer(sample):
+        add(match.group(1))
+
+    for match in _NUMBERED_PERSON_LINE.finditer(sample):
+        add(match.group(1))
+
+    return people[:80]
+
+
+def extract_all_people_from_document(chunks: list, existing_authors: list[str] | None = None) -> list[str]:
+    """Aggressive author/expert harvest for title pages and rosters (local LLM backfill)."""
+    found = list(existing_authors or [])
+    if not chunks:
+        return found
+
+    front_parts = [(getattr(c, "text", None) or str(c))[:4000] for c in chunks[:6]]
+    front = "\n".join(p for p in front_parts if p.strip())
+    full = "\n".join((getattr(c, "text", None) or str(c)) for c in chunks if getattr(c, "text", None))
+
+    found = merge_unique_names(found, extract_authors_from_text(front, min(len(front), 25_000)))
+    if full and full != front:
+        found = merge_unique_names(found, extract_authors_from_text(full, min(len(full), 120_000)))
+    for piece in front_parts[:5]:
+        found = merge_unique_names(found, extract_authors_from_page_header(piece, header_chars=3500))
+    found = merge_unique_names(found, extract_listed_experts_from_text(full or front, 200_000))
+    found = merge_unique_names(found, extract_numbered_people_from_text(front, 25_000))
+    return found[:80]
 
 
 def extract_authors_from_document_chunks(
@@ -380,8 +458,11 @@ def extract_authors_from_text(text: str, limit: int = 4000) -> list[str]:
     for pattern in (
         r"(?:Авторы?|Authors?|Докладчик(?:и)?|Presenter(?:s)?)\s*:?\s*([^\n]+)",
         r"(?:Подготовил[аи]?|Prepared by)\s*:?\s*([^\n]+)",
+        r"(?:Исполнител(?:ь|и)|Составител(?:ь|и)|Разработал(?:и)?|Developed by)\s*:?\s*([^\n]+)",
+        r"(?:Ответственный\s+исполнитель|Научный\s+руководитель|Руководитель\s+(?:работ|проекта))\s*:?\s*([^\n]+)",
+        r"(?:Corresponding\s+author|Contact\s+author)\s*:?\s*([^\n]+)",
     ):
-        for match in re.finditer(pattern, sample, re.IGNORECASE):
+        for match in re.finditer(pattern, sample, re.IGNORECASE | re.UNICODE):
             for part in split_person_name_line(match.group(1)):
                 add(part)
 

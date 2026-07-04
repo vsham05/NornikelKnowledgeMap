@@ -36,6 +36,10 @@ class DocumentDTO(BaseModel):
     file_hash: str | None = Field(None, description="SHA-256 of raw file bytes")
     chunks: list[DocumentChunkDTO] = Field(default_factory=list)
     images: list["ImageDTO"] = Field(default_factory=list)
+    estimated_page_count: int | None = Field(
+        None,
+        description="Estimated pages for DOCX or when page_number is unavailable",
+    )
     created_at: datetime = Field(default_factory=datetime.now)
     
     class Config:

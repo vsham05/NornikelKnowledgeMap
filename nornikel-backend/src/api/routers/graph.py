@@ -9,7 +9,7 @@ from api.deps import get_graph_db, get_ingestion_pipeline
 from domain.dto.query import StructuredFiltersDTO
 from domain.material_taxonomy import get_material_taxonomy
 from ingestion.pipeline import IngestionPipeline
-from storage.graph_db import GraphDB
+from storage.graph_db import GraphDB, VISUAL_NODE_LABELS
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/graph", tags=["graph"])
 
@@ -85,6 +85,40 @@ async def document_entity_summary(
     (Bloom-style capsules) without loading thousands of nodes.
     """
     return graph_db.get_document_entity_summary(document_id)
+
+
+_ENTITY_TYPE_TO_LABEL = {
+    "article": "Document",
+    "material": "Material",
+    "experiment": "Experiment",
+    "process": "Process",
+    "team": "Team",
+    "equipment": "Equipment",
+    "facility": "Facility",
+    "expert": "Expert",
+    "figures": "FigureGallery",
+}
+
+
+@router.get("/entities")
+async def browse_entities(
+    entity_type: str = Query(
+        ...,
+        description="Frontend entity type: material, experiment, process, team, article, …",
+    ),
+    q: str | None = Query(None, description="Optional name filter"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    graph_db: GraphDB = Depends(get_graph_db),
+):
+    """Paginated browse + search for stats-bar type pickers."""
+    label = _ENTITY_TYPE_TO_LABEL.get(entity_type.strip().lower())
+    if not label or label not in VISUAL_NODE_LABELS:
+        raise HTTPException(status_code=400, detail=f"Unsupported entity_type: {entity_type}")
+    try:
+        return graph_db.list_entities_by_label(label, q=q, limit=limit, offset=offset)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/documents/{document_id}/entities")

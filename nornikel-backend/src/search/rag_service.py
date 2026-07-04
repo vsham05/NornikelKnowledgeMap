@@ -1,4 +1,4 @@
-"""RAG orchestration: query rewrite → hybrid retrieve → compress → cited answers."""
+"""RAG: embedding retrieval (Qdrant) + keyword search → LLM cited answer."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from domain.dto.query import (
     UserQueryDTO,
 )
 from infra.embedding_client import EmbeddingClient
-from infra.llm_client import LLMClient
+from infra.llm_client import LLMClient, is_context_overflow
 from search.citations import (
     build_answer_system,
     build_index_to_document,
@@ -21,11 +21,8 @@ from search.citations import (
     citation_coverage,
     enforce_citation_document_isolation,
     extract_person_facts_from_chunks,
-    extract_technical_facts_with_llm,
-    facts_address_question,
     format_grounded_answer,
     is_name_question,
-    is_technical_quantitative_question,
     prune_unsupported_heading_bullets,
     validate_facts,
 )
@@ -40,8 +37,10 @@ from search.document_scope import (
     resolve_document_scope,
     scope_instruction,
 )
+from search.extractive_answer import extractive_answer_from_chunks
 from search.query_processing import (
     answer_language_instruction,
+    is_technical_quantitative_question,
     requests_experiment_list,
     resolve_answer_language,
     significant_terms,
@@ -62,7 +61,7 @@ MAX_AGGREGATE_DOCS = 12
 
 
 class RAGService:
-    """Production-style RAG: rewrite → hybrid multi-query retrieve → answer with citations."""
+    """Embed query → hybrid retrieve (dense + keyword) → LLM answer with citations."""
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -89,6 +88,8 @@ class RAGService:
 
         rewritten = await rewrite_query_for_retrieval(self.llm_client, retrieval_question)
         aux = [] if is_name_question(question) else auxiliary_retrieval_queries(rewritten)
+        if len(aux) > 1:
+            aux = aux[:1]
 
         all_documents = self.graph_db.list_documents()
         answer_lang = resolve_answer_language(question)
@@ -140,15 +141,36 @@ class RAGService:
         if not context_chunks:
             return self._empty_result(answer_lang, retrieval_scope)
 
-        full_context = self._assemble_context(context_chunks, scope)
-        answer, used_grounded = await self._generate_answer(
-            question,
-            full_context,
-            context_chunks,
-            answer_lang,
-            scope,
-            filter_payload=filter_payload,
+        vector_hits = sum(
+            1 for c in context_chunks if "vector" in (c.get("retrieval_sources") or [])
         )
+        logger.info(
+            "Retrieved %s chunks (%s via embeddings, %s keyword/page only)",
+            len(context_chunks),
+            vector_hits,
+            len(context_chunks) - vector_hits,
+        )
+
+        full_context = self._assemble_context(context_chunks, scope)
+        used_extractive = False
+        try:
+            answer, used_grounded = await self._generate_answer(
+                question,
+                full_context,
+                context_chunks,
+                answer_lang,
+                scope,
+                filter_payload=filter_payload,
+            )
+        except Exception as exc:
+            logger.warning("LLM synthesis failed (%s); using embedding retrieval excerpts", exc)
+            answer = extractive_answer_from_chunks(
+                question, context_chunks, answer_lang=answer_lang
+            )
+            if not answer.strip():
+                raise
+            used_grounded = True
+            used_extractive = True
 
         index_to_doc = build_index_to_document(context_chunks)
         answer, had_cross_doc = enforce_citation_document_isolation(answer, index_to_doc)
@@ -167,6 +189,8 @@ class RAGService:
         })
 
         confidence = compute_confidence(context_chunks, "hybrid", answer)
+        if used_extractive:
+            confidence = round(min(confidence, 0.62), 3)
         coverage = citation_coverage(answer, len(context_chunks))
         if coverage > 0:
             confidence = round(min(1.0, confidence * 0.65 + coverage * 0.35), 3)
@@ -206,6 +230,8 @@ class RAGService:
         if forced_doc_id:
             return None
         if structured_document_ids:
+            return None
+        if len(all_documents) <= 3:
             return None
         if query_requests_comparison(question) or query_requests_aggregate(question):
             return None
@@ -488,6 +514,13 @@ class RAGService:
             return probe, scope, retrieval_scope
 
         if scope.mode in ("single", "explicit") and scope.primary_document_id:
+            doc_id = scope.primary_document_id
+            probe_for_doc = [
+                chunk for chunk in probe if str(chunk.document_id) == doc_id
+            ]
+            if len(probe_for_doc) >= max(4, retrieval_limit // 2):
+                return probe_for_doc[:retrieval_limit], scope, retrieval_scope
+
             focused = await self.retriever.retrieve(
                 question,
                 limit=retrieval_limit,
@@ -538,19 +571,6 @@ class RAGService:
             if facts:
                 return format_grounded_answer(facts, lang=answer_lang), True
 
-        if is_technical_quantitative_question(question):
-            facts = validate_facts(
-                await extract_technical_facts_with_llm(
-                    self.llm_client,
-                    question,
-                    context,
-                    answer_lang=answer_lang,
-                ),
-                num_sources,
-            )
-            if facts and facts_address_question(question, facts):
-                return format_grounded_answer(facts, lang=answer_lang), True
-
         answer = await self._generate_direct_answer(
             question, context, answer_lang, scope, filter_payload=filter_payload or {},
             context_chunks=context_chunks,
@@ -594,26 +614,45 @@ Do not list bare section or process titles — write full factual sentences with
                 user_message=user_message,
                 system_message=build_answer_system(answer_lang),
                 temperature=0.0,
+                max_tokens=2048,
             )
         except Exception as exc:
-            if not self.llm_client.is_context_overflow(exc) or not context_chunks:
-                raise
-            logger.warning(
-                "Answer generation exceeded context window; retrying with tighter excerpts"
-            )
-            trimmed = fit_chunks_to_context_budget(
-                context_chunks,
-                question,
-                max_total_chars=resolve_rag_max_chars(self.settings) // 2,
-                settings=self.settings,
-            )
-            retry_context = self._assemble_context(trimmed, scope)
-            retry_message = user_message.replace(context, retry_context)
-            return await self.llm_client.chat(
-                user_message=retry_message,
-                system_message=build_answer_system(answer_lang),
-                temperature=0.0,
-            )
+            trimmed: list[dict] | None = None
+            if is_context_overflow(exc) and context_chunks:
+                logger.warning(
+                    "Answer generation exceeded context window; retrying with tighter excerpts"
+                )
+                trimmed = fit_chunks_to_context_budget(
+                    context_chunks,
+                    question,
+                    max_total_chars=max(4000, resolve_rag_max_chars(self.settings) // 3),
+                    settings=self.settings,
+                )
+                retry_context = self._assemble_context(trimmed, scope)
+                retry_message = user_message.replace(context, retry_context)
+                try:
+                    return await self.llm_client.chat(
+                        user_message=retry_message,
+                        system_message=build_answer_system(answer_lang),
+                        temperature=0.0,
+                        max_tokens=1536,
+                    )
+                except Exception as retry_exc:
+                    logger.warning(
+                        "LLM retry failed (%s); falling back to embedding excerpts",
+                        retry_exc,
+                    )
+                    exc = retry_exc
+
+            if context_chunks:
+                fallback = extractive_answer_from_chunks(
+                    question,
+                    trimmed or context_chunks,
+                    answer_lang=answer_lang,
+                )
+                if fallback.strip():
+                    return fallback
+            raise exc
 
     def _assemble_context(
         self,

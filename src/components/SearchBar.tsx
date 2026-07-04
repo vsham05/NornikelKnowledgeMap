@@ -8,9 +8,10 @@ interface SearchBarProps {
   onSearch: (query: string) => void;
   loading?: boolean;
   disabled?: boolean;
+  placeholder?: string;
 }
 
-export function SearchBar({ onSearch, loading, disabled }: SearchBarProps) {
+export function SearchBar({ onSearch, loading, disabled, placeholder }: SearchBarProps) {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
 
@@ -30,7 +31,7 @@ export function SearchBar({ onSearch, loading, disabled }: SearchBarProps) {
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         disabled={disabled}
-        placeholder={t("search.placeholder")}
+        placeholder={placeholder ?? t("search.placeholder")}
         className="w-full rounded-xl border border-slate-700/80 bg-slate-900/80 py-4 pl-12 pr-32 text-slate-100 placeholder:text-slate-500 shadow-lg shadow-black/20 backdrop-blur focus:border-cyan-500/60 focus:outline-none focus:ring-2 focus:ring-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
       />
       <button

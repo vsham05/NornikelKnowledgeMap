@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from api.deps import clear_service_caches
 from infra.llm_runtime import (
+    get_effective_llm_provider,
     get_llm_provider,
     get_local_model,
     get_yandex_model,
@@ -22,9 +23,15 @@ from infra.local_models import (
     resolve_local_model_tier,
 )
 from infra.yandex_models import default_yandex_extraction_model, get_yandex_model_info, list_yandex_models
+from infra.yandex_health import (
+    check_yandex_api,
+    yandex_credentials_configured,
+    yandex_unusable_reason,
+)
 from settings import get_settings
 
 router = APIRouter(prefix="/config", tags=["config"])
+logger = logging.getLogger(__name__)
 
 
 class LLMProviderRequest(BaseModel):
@@ -43,17 +50,20 @@ class LocalModelRequest(BaseModel):
 async def get_llm_config():
     settings = get_settings()
     provider = get_llm_provider()
-    yandex_ready = bool(settings.yandex_api_key and settings.yandex_folder_id)
+    effective_provider = get_effective_llm_provider()
+    yandex_configured = yandex_credentials_configured(settings)
+    yandex_usable = await check_yandex_api(settings) if yandex_configured else False
     yandex_model = get_yandex_model()
     model_info = get_yandex_model_info(yandex_model)
     local_profile = local_ingest_profile(get_local_model())
     extraction_chars = (
         model_info.extraction_chars
-        if model_info and provider == "yandex"
+        if model_info and effective_provider == "yandex"
         else local_profile["extraction_chars"]
     )
     return {
         "provider": provider,
+        "effective_provider": effective_provider,
         "local_model": get_local_model(),
         "local_tier": local_profile["tier"],
         "local_models": list_local_models(),
@@ -62,7 +72,10 @@ async def get_llm_config():
         "yandex_model": yandex_model,
         "yandex_models": list_yandex_models(),
         "yandex_recommended": default_yandex_extraction_model(),
-        "yandex_ready": yandex_ready,
+        "yandex_ready": yandex_configured,
+        "yandex_usable": yandex_usable,
+        "yandex_unusable_reason": yandex_unusable_reason() if not yandex_usable else "",
+        "yandex_fallback_local": settings.llm_yandex_fallback_local,
         "hybrid_routing": settings.ingest_hybrid_routing,
         "local_max_pages": settings.ingest_local_max_pages,
         "local_full_coverage": settings.ingest_local_full_coverage,
@@ -73,7 +86,7 @@ async def get_llm_config():
         "extraction_max_chars": extraction_chars,
         "effective_model": (
             f"gpt://{settings.yandex_folder_id}/{yandex_model}"
-            if provider == "yandex" and yandex_ready
+            if effective_provider == "yandex" and yandex_usable
             else get_local_model()
         ),
     }
@@ -87,11 +100,17 @@ async def update_llm_provider(body: LLMProviderRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if provider == "yandex" and not (settings.yandex_api_key and settings.yandex_folder_id):
+    if provider == "yandex" and not yandex_credentials_configured(settings):
         set_llm_provider("local")
         raise HTTPException(
             status_code=400,
             detail="Yandex API is not configured. Set YANDEX_API_KEY and YANDEX_FOLDER_ID in backend .env.",
+        )
+
+    if provider == "yandex" and not await check_yandex_api(settings, force=True):
+        logger.warning(
+            "Yandex selected but API probe failed (%s); requests will use local LLM",
+            yandex_unusable_reason(),
         )
 
     clear_service_caches()

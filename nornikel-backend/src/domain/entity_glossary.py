@@ -59,6 +59,21 @@ _ENTRIES: dict[str, tuple[str, str]] = {
     "coral_bay": ("coral bay", "Coral Bay"),
     "zinc_removal": ("удаление цинка", "zinc removal"),
     "de_zn": ("de-zn", "De-Zn"),
+    "finite_element_method": ("метод конечных элементов", "finite element method"),
+    "finite_stiffness_links": ("связи конечной жесткости", "finite stiffness links"),
+    "numerical_modeling": ("численное моделирование", "numerical modeling"),
+    "geotechnical_modeling": ("геотехническое моделирование", "geotechnical modeling"),
+    "verification_modeling": ("верификационное моделирование", "verification modeling"),
+    "cfd_simulation": ("CFD-моделирование", "CFD simulation"),
+    "field_testing": ("полевые испытания", "field testing"),
+    "laboratory_testing": ("лабораторные испытания", "laboratory testing"),
+    "geotechnical_analysis": ("геотехнический анализ", "geotechnical analysis"),
+    "model_calibration": ("калибровка модели", "model calibration"),
+    "static_analysis": ("статический расчет", "static analysis"),
+    "dynamic_analysis": ("динамический расчет", "dynamic analysis"),
+    "fem_simulation": ("МКЭ-моделирование", "FEM simulation"),
+    "structural_analysis": ("расчет конструкций", "structural analysis"),
+    "rock_mechanics_testing": ("испытания механики горных пород", "rock mechanics testing"),
 }
 
 _LOOKUP: dict[str, str] = {}
@@ -135,6 +150,21 @@ PROCESS_GLOSSARY_KEYS: frozenset[str] = frozenset({
     "autoclave_oxidation",
     "zinc_removal",
     "de_zn",
+    "finite_element_method",
+    "finite_stiffness_links",
+    "numerical_modeling",
+    "geotechnical_modeling",
+    "verification_modeling",
+    "cfd_simulation",
+    "field_testing",
+    "laboratory_testing",
+    "geotechnical_analysis",
+    "model_calibration",
+    "static_analysis",
+    "dynamic_analysis",
+    "fem_simulation",
+    "structural_analysis",
+    "rock_mechanics_testing",
 })
 
 FACILITY_GLOSSARY_KEYS: frozenset[str] = frozenset({

@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Form
+from fastapi import APIRouter, Form, HTTPException
 import logging
 
 from domain.dto.query import UserQueryDTO
+from infra.llm_client import is_context_overflow
 from search.rag_service import RAGService
 from settings import get_settings
 
@@ -23,7 +24,21 @@ def _result_payload(query: str, result) -> dict:
     }
 
 
+def _block_search_during_ingest() -> None:
+    from api.routers.ingestion import has_active_ingest
+
+    if has_active_ingest():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Document ingestion is in progress. Wait until processing finishes "
+                "before asking questions — the LLM is reserved for indexing."
+            ),
+        )
+
+
 async def _run_rag(query: UserQueryDTO):
+    _block_search_during_ingest()
     settings = get_settings()
     rag_service = RAGService(settings)
     try:
@@ -31,16 +46,40 @@ async def _run_rag(query: UserQueryDTO):
     except Exception as exc:
         logger.exception("RAG search failed: %s", exc)
         lang = "ru" if any("\u0400" <= c <= "\u04FF" for c in (query.text or "")) else "en"
-        if lang == "ru":
-            answer = (
-                "Не удалось сформировать ответ — контекст модели переполнен или LLM недоступен. "
-                "Попробуйте сузить запрос или переключитесь на модель с большим контекстом."
-            )
+        msg = str(exc).lower()
+        if is_context_overflow(exc):
+            if lang == "ru":
+                answer = (
+                    "Контекст модели переполнен. Сузьте запрос, выберите один документ "
+                    "в фильтре или переключитесь на модель с большим контекстом."
+                )
+            else:
+                answer = (
+                    "The model context window was exceeded. Try a narrower query, "
+                    "select one document in the filter, or switch to a larger-context model."
+                )
+        elif "timeout" in msg or "timed out" in msg or "connection" in msg:
+            if lang == "ru":
+                answer = (
+                    "LLM не ответил вовремя. Проверьте, что Ollama запущен, "
+                    "или переключитесь на Yandex Cloud в переключателе модели."
+                )
+            else:
+                answer = (
+                    "The LLM timed out. Check that Ollama is running, "
+                    "or switch to Yandex Cloud in the model switcher."
+                )
         else:
-            answer = (
-                "Could not generate an answer — the model context was exceeded or the LLM is unavailable. "
-                "Try a narrower query or switch to a model with a larger context window."
-            )
+            if lang == "ru":
+                answer = (
+                    "Не удалось сформировать ответ. Проверьте LLM (Ollama/Yandex) "
+                    "и попробуйте сузить запрос или выбрать один документ."
+                )
+            else:
+                answer = (
+                    "Could not generate an answer. Check that the LLM (Ollama/Yandex) "
+                    "is running, then try a narrower query or pick one document."
+                )
         return {
             "query": query.text or "",
             "answer": answer,

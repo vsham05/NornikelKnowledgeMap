@@ -40,7 +40,7 @@ export function ModelSwitcher() {
       setYandexModel(cfg.yandex_model);
       setYandexModels(cfg.yandex_models ?? []);
       setModerationRisk(Boolean(cfg.yandex_moderation_risk));
-      if (!cfg.yandex_ready) {
+      if (!cfg.yandex_ready && cfg.provider === "yandex") {
         setError(t("model.yandexNotConfigured"));
       } else {
         setError(null);
