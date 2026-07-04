@@ -99,6 +99,12 @@ class WebScraper:
         
         # 4. Извлекаем основной текст с структурой
         chunks = self._extract_text_chunks(parser, url)
+        if not chunks:
+            raise RuntimeError(
+                f"No readable text extracted from {url}. "
+                "The page may be JavaScript-only, paywalled, or use an unsupported layout — "
+                "try Upload PDF/DOCX or enable Playwright (use_playwright=true)."
+            )
         
         # 5. Извлекаем изображения
         images = self._extract_images(parser, url)
@@ -137,7 +143,7 @@ class WebScraper:
         except httpx.RequestError as exc:
             raise RuntimeError(f"Could not reach {url}: {exc}") from exc
 
-        if response.status_code in (301, 302, 303, 307, 308):
+        if response.status_code in (300, 301, 302, 303, 307, 308):
             location = response.headers.get("location", "")
             if location and _is_auth_redirect(location):
                 raise PaywalledContentError(_paywall_message(url))
@@ -291,9 +297,10 @@ class WebScraper:
         for elem in parser.css("script, style, nav, footer, header, aside, .ads, .sidebar"):
             elem.decompose()
         
-        # Ищем основной контент
+        # Ищем основной контент (prefer article body over full-page <main> wrappers)
         main_content = (
             parser.css_first("article") or
+            parser.css_first("#abs, .abstract-content, [itemprop='articleBody']") or
             parser.css_first("main") or
             parser.css_first('[role="main"]') or
             parser.css_first(".content, .post, .entry") or
@@ -303,13 +310,27 @@ class WebScraper:
         if not main_content:
             logger.warning("Could not find main content")
             return chunks
-        
+
+        # Academic pages: pull abstract early so sidebar noise does not bury it
+        abstract_text = self._extract_abstract_text(parser)
+        if abstract_text:
+            chunks.append(
+                DocumentChunkDTO(
+                    id=uuid4(),
+                    document_id=uuid4(),
+                    text=abstract_text,
+                    chunk_index=0,
+                    section_title="Abstract",
+                )
+            )
+            chunk_index = 1
+
         # Обходим элементы
         current_text = []
-        
+
         for elem in main_content.css("h1, h2, h3, h4, h5, h6, p, li, table, blockquote"):
             tag = elem.tag
-            
+
             # Заголовки — начинаем новый чанк
             if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
                 # Сохраняем предыдущий чанк
@@ -324,21 +345,23 @@ class WebScraper:
                     chunks.append(chunk)
                     chunk_index += 1
                     current_text = []
-                
+
                 current_section = elem.text(strip=True)
-            
-            # Параграфы и списки
+
+            # Параграфы, списки и цитаты (arXiv abstract, pull quotes)
             elif tag in ("p", "li", "blockquote"):
                 text = elem.text(strip=True)
                 if text:
+                    if abstract_text and tag == "blockquote" and text == abstract_text:
+                        continue
                     current_text.append(text)
-            
+
             # Таблицы
             elif tag == "table":
                 table_text = self._extract_table_text(elem)
                 if table_text:
                     current_text.append(table_text)
-            
+
             # Разбиваем на чанки по ~5 параграфов
             if len(current_text) >= 5:
                 chunk = DocumentChunkDTO(
@@ -351,7 +374,7 @@ class WebScraper:
                 chunks.append(chunk)
                 chunk_index += 1
                 current_text = []
-        
+
         # Последний чанк
         if current_text:
             chunk = DocumentChunkDTO(
@@ -362,8 +385,30 @@ class WebScraper:
                 section_title=current_section
             )
             chunks.append(chunk)
-        
+
         return chunks
+
+    @staticmethod
+    def _extract_abstract_text(parser: HTMLParser) -> str | None:
+        """Best-effort abstract for scholarly pages (arXiv, publishers, meta tags)."""
+        for selector in (
+            "blockquote.abstract",
+            "#abs blockquote",
+            ".abstract",
+            "[itemprop='description']",
+            'meta[name="description"]',
+            'meta[property="og:description"]',
+        ):
+            node = parser.css_first(selector)
+            if not node:
+                continue
+            if node.tag == "meta":
+                text = (node.attributes.get("content") or "").strip()
+            else:
+                text = node.text(strip=True)
+            if len(text) >= 80:
+                return text
+        return None
     
     def _extract_table_text(self, table_elem) -> str:
         """Извлекает текст из HTML таблицы."""

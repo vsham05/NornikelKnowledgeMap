@@ -208,7 +208,7 @@ class IngestionPipeline:
             await self._ingest_parsed_document(
                 document,
                 on_progress=on_progress,
-                source_file=file_path,
+                source_file=None,
             )
         except Exception:
             self._rollback_failed_ingest(str(document.id))
